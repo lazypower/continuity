@@ -1,13 +1,13 @@
 package cli
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
-	"time"
 
-	"github.com/lazypower/continuity/internal/engine"
 	"github.com/lazypower/continuity/internal/hooks"
 	"github.com/lazypower/continuity/internal/store"
 	"github.com/spf13/cobra"
@@ -106,7 +106,7 @@ var (
 var searchCmd = &cobra.Command{
 	Use:   "search [query]",
 	Short: "Search memories",
-	Long:  "Search the memory tree using vector similarity. Use --smart for LLM-assisted search.",
+	Long:  "Search the memory tree via the continuity server. Use --smart for LLM-assisted search. Requires a running server (continuity serve).",
 	Args:  cobra.MinimumNArgs(1),
 	RunE:  runSearch,
 }
@@ -114,50 +114,56 @@ var searchCmd = &cobra.Command{
 func runSearch(cmd *cobra.Command, args []string) error {
 	query := strings.Join(args, " ")
 
-	db, err := openDB()
-	if err != nil {
-		return fmt.Errorf("open db: %w", err)
-	}
-	defer db.Close()
-
-	// Build TF-IDF embedder (Ollama detection is server-side only)
-	embedder, err := engine.NewTFIDFEmbedder(db, 512)
-	if err != nil {
-		return fmt.Errorf("create embedder: %w", err)
+	client := hooks.NewClient()
+	if !client.Healthy() {
+		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	opts := engine.SearchOpts{
-		Limit:    searchLimit,
-		Category: searchCategory,
+	// Build query params
+	params := url.Values{}
+	params.Set("q", query)
+	params.Set("limit", strconv.Itoa(searchLimit))
+	if searchCategory != "" {
+		params.Set("category", searchCategory)
 	}
-
-	var results []engine.SearchResult
 	if searchSmart {
-		// LLM-assisted search requires a client — for CLI, not available
-		// Fall back to Find()
-		fmt.Fprintf(os.Stderr, "note: --smart requires the server; using fast search\n")
-		results, err = engine.Find(ctx, db, embedder, query, opts)
-	} else {
-		results, err = engine.Find(ctx, db, embedder, query, opts)
+		params.Set("mode", "search")
 	}
+
+	data, err := client.Get("/api/search?" + params.Encode())
 	if err != nil {
 		return fmt.Errorf("search: %w", err)
 	}
 
-	if len(results) == 0 {
+	var resp struct {
+		Query   string `json:"query"`
+		Mode    string `json:"mode"`
+		Count   int    `json:"count"`
+		Results []struct {
+			URI        string  `json:"uri"`
+			Category   string  `json:"category"`
+			L0Abstract string  `json:"l0_abstract"`
+			L1Overview string  `json:"l1_overview"`
+			Score      float64 `json:"score"`
+			Similarity float64 `json:"similarity"`
+			Relevance  float64 `json:"relevance"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("parse response: %w", err)
+	}
+
+	if resp.Count == 0 {
 		fmt.Println("No results found.")
 		return nil
 	}
 
-	for i, r := range results {
-		fmt.Printf("%d. [%.3f] %s\n", i+1, r.Score, r.Node.URI)
-		fmt.Printf("   %s [%s]\n", r.Node.L0Abstract, r.Node.Category)
-		if r.Node.L1Overview != "" {
+	for i, r := range resp.Results {
+		fmt.Printf("%d. [%.3f] %s\n", i+1, r.Score, r.URI)
+		fmt.Printf("   %s [%s]\n", r.L0Abstract, r.Category)
+		if r.L1Overview != "" {
 			// Show first 200 chars of L1
-			overview := r.Node.L1Overview
+			overview := r.L1Overview
 			if len(overview) > 200 {
 				overview = overview[:200] + "..."
 			}
