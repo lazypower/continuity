@@ -1,0 +1,11 @@
+{
+  "packages": [
+    "go@1.24",
+    "sqlite@latest"
+  ],
+  "shell": {
+    "init_hook": [
+      "echo 'continuity-go dev environment ready'"
+    ]
+  }
+}
