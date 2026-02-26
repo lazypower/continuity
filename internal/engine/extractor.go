@@ -141,6 +141,12 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 		return fmt.Errorf("parse extraction response: %w", err)
 	}
 
+	// Hard cap: even if the LLM returns more, only keep the first 3
+	if len(candidates) > 3 {
+		log.Printf("extraction: capping %d candidates to 3 for %s", len(candidates), sessionID)
+		candidates = candidates[:3]
+	}
+
 	// Persist each candidate
 	for _, c := range candidates {
 		vc, err := validateCandidate(c)

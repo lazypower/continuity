@@ -11,43 +11,56 @@ const InternalSentinel = "[continuity-internal]"
 
 // ExtractionPrompt generates the prompt for memory extraction from a session transcript.
 func ExtractionPrompt(condensed string) string {
-	return fmt.Sprintf(`%s You are a memory extraction system. Analyze this session transcript and extract structured memories.
+	return fmt.Sprintf(`%s You are a memory extraction system. Analyze this session transcript and extract ONLY high-signal memories that would cause the agent to make mistakes or miss context without them.
 
 TRANSCRIPT:
 %s
 
-Extract memories into these categories:
-- profile: User identity, skills, coding style (e.g., "Prefers Go with minimal dependencies")
-- preferences: Tools, workflows, changeable choices (e.g., "Uses devbox for development")
-- entities: People, projects, services mentioned (e.g., "Project: continuity-go, a Go CLI tool")
-- events: Actions with timestamps (e.g., "Deployed v2.1 to production")
-- patterns: Reusable techniques, solutions (e.g., "Uses SQLite WAL mode for concurrent reads")
-- cases: Problem→solution pairs (e.g., "Fixed: memory leak in worker pool by adding context cancellation")
+Categories:
+- profile: Who the user IS — identity, skills, non-negotiable preferences (e.g., "Senior Go developer, requires spec-first workflow")
+- preferences: Tools, workflows, changeable choices (e.g., "Uses devbox for all development")
+- entities: People, projects, services that will be referenced again (e.g., "Fiona: companion AI agent at /Users/chuck/Code/habitat/")
+- events: Significant decisions or milestones (e.g., "Deployed v2.1 to production") — NOT routine coding actions
+- patterns: Reusable techniques the user has validated (e.g., "Embed Svelte SPA via go:embed for single-binary distribution")
+- cases: Non-obvious problem→solution pairs worth remembering (e.g., "SQLite UNIQUE constraint on session init: query first, reactivate if exists")
 
 URI scheme: mem://{owner}/{category}/{slug}
 - owner is "user" for profile, preferences, entities, events
 - owner is "agent" for patterns, cases
 
+BUDGET: Maximum 3 memories per session. Most sessions produce 0-1.
+
+Extraction bar — only extract if ALL of these are true:
+1. The agent would get something WRONG or MISS important context without this
+2. The knowledge persists beyond this session (not a one-time fix)
+3. It cannot be trivially re-derived from the codebase itself
+4. It is NOT a restatement of something already obvious from project files (CLAUDE.md, README, etc.)
+
+Anti-patterns — do NOT extract:
+- "User prefers X" when X is already in project config files
+- Routine bug fixes unless the root cause was surprising
+- Session-specific details ("we worked on file X today")
+- Vague observations ("user is experienced with Go")
+- Things that are true of most developers ("writes tests", "uses version control")
+
 Rules:
-- Only extract genuinely useful, persistent knowledge
-- Skip trivial or session-specific details
-- l0 should be ~100 tokens (search surface)
-- l1 should be ~500 tokens (context injection summary)
-- l2 should be full content
-- For merge_target, specify an existing URI if this updates known information
+- l0: One sentence, ~50-80 tokens. Specific enough to deduplicate against.
+- l1: ~200-400 tokens. Structured, concrete, actionable.
+- l2: Full content with context.
+- merge_target: existing URI if this updates/refines known information
 - Return ONLY a JSON array, no other text
 
 Return a JSON array:
 [{
   "category": "profile|preferences|entities|events|patterns|cases",
   "uri_hint": "slug-name",
-  "l0": "~100 token abstract",
-  "l1": "~500 token overview",
+  "l0": "single sentence abstract",
+  "l1": "structured overview",
   "l2": "full content",
   "merge_target": "mem://... or empty"
 }]
 
-If nothing worth extracting, return: []`, InternalSentinel, condensed)
+If nothing meets the extraction bar, return: []`, InternalSentinel, condensed)
 }
 
 // RelationalPrompt generates the prompt for relational profile extraction.

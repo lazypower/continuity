@@ -3,10 +3,14 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/lazypower/continuity/internal/store"
 )
 
 func (s *Server) handleGetContext(w http.ResponseWriter, r *http.Request) {
@@ -33,53 +37,63 @@ func (s *Server) buildContext(currentSessionID string) string {
 		b.WriteString("\n")
 	}
 
-	// User profile + preferences
-	profileNodes, _ := s.db.FindByCategory("profile")
-	prefNodes, _ := s.db.FindByCategory("preferences")
-	userNodes := append(profileNodes, prefNodes...)
-	// Filter out the relational profile (already shown above)
-	var filtered []struct{ l0, uri string }
-	for _, n := range userNodes {
-		if n.URI == "mem://user/profile/communication" {
-			continue
-		}
-		if n.L0Abstract != "" {
-			filtered = append(filtered, struct{ l0, uri string }{n.L0Abstract, n.URI})
-		}
-	}
-	if len(filtered) > 0 {
-		b.WriteString("\n### Your Profile\n")
-		for _, n := range filtered {
-			b.WriteString(fmt.Sprintf("- %s\n", n.l0))
-		}
-	}
+	// Collect all non-relational leaves, rank by signal strength, cap at 15 total.
+	// This prevents the context wall-of-text problem.
+	const maxContextItems = 15
 
-	// Recent memories (patterns, events, cases)
-	var recentMemories []struct {
+	type rankedItem struct {
 		category string
 		l0       string
+		score    float64
 	}
-	for _, cat := range []string{"patterns", "events", "cases", "entities"} {
+	var items []rankedItem
+
+	for _, cat := range []string{"profile", "preferences", "patterns", "events", "cases", "entities"} {
 		nodes, err := s.db.FindByCategory(cat)
 		if err != nil {
 			continue
 		}
 		for _, n := range nodes {
-			if n.L0Abstract != "" && n.Relevance >= 0.3 {
-				recentMemories = append(recentMemories, struct {
-					category string
-					l0       string
-				}{cat, n.L0Abstract})
+			if n.URI == "mem://user/profile/communication" {
+				continue // already shown above
 			}
+			if n.L0Abstract == "" || n.Relevance < 0.3 {
+				continue
+			}
+			// Score: relevance weighted by access frequency
+			score := nodeScore(n)
+			items = append(items, rankedItem{cat, n.L0Abstract, score})
 		}
 	}
-	if len(recentMemories) > 0 {
-		b.WriteString("\n### Recent Memories\n")
-		limit := 10
-		if len(recentMemories) < limit {
-			limit = len(recentMemories)
+
+	// Sort by score descending
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].score > items[j].score
+	})
+	if len(items) > maxContextItems {
+		items = items[:maxContextItems]
+	}
+
+	// Split into profile/prefs vs other for display
+	var profileItems, memoryItems []rankedItem
+	for _, it := range items {
+		if it.category == "profile" || it.category == "preferences" {
+			profileItems = append(profileItems, it)
+		} else {
+			memoryItems = append(memoryItems, it)
 		}
-		for _, m := range recentMemories[:limit] {
+	}
+
+	if len(profileItems) > 0 {
+		b.WriteString("\n### Your Profile\n")
+		for _, n := range profileItems {
+			b.WriteString(fmt.Sprintf("- %s\n", n.l0))
+		}
+	}
+
+	if len(memoryItems) > 0 {
+		b.WriteString("\n### Recent Memories\n")
+		for _, m := range memoryItems {
 			b.WriteString(fmt.Sprintf("- [%s] %s\n", m.category, m.l0))
 		}
 	}
@@ -113,4 +127,16 @@ func (s *Server) buildContext(currentSessionID string) string {
 
 	b.WriteString("</context>")
 	return b.String()
+}
+
+// nodeScore ranks a memory node for context injection priority.
+// Higher = more important to include. Combines relevance (decay-adjusted)
+// with access frequency (memories the agent actually uses stay prominent).
+func nodeScore(n store.MemNode) float64 {
+	accessBoost := 1.0
+	if n.AccessCount > 0 {
+		// Diminishing returns: log2(access+1) gives 1→1.0, 2→1.58, 4→2.32, 8→3.17
+		accessBoost = 1.0 + math.Log2(float64(n.AccessCount))
+	}
+	return n.Relevance * accessBoost
 }

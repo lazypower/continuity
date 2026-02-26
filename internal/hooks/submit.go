@@ -15,12 +15,13 @@ import (
 const internalSentinel = "[continuity-internal]"
 
 // signalTriggers are phrases that indicate the user wants something remembered immediately.
+// Keep this list tight — only explicit memory requests and strong decision signals.
+// Broad phrases like "this pattern" or "the trick is" fire on normal conversation.
 var signalTriggers = []string{
 	"remember this", "don't forget",
 	"always use", "never use", "always do", "never do",
-	"architecture decision", "we decided",
-	"this pattern", "the trick is",
-	"bug was", "root cause", "the fix was",
+	"architecture decision",
+	"root cause was", "the fix was",
 }
 
 // isInternalPrompt returns true if the prompt is a Continuity extraction prompt,
