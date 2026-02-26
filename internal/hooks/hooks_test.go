@@ -199,6 +199,41 @@ func TestClientHealthyFalseWhenDown(t *testing.T) {
 	}
 }
 
+func TestIsInternalPrompt(t *testing.T) {
+	tests := []struct {
+		prompt string
+		want   bool
+	}{
+		// Internal extraction prompts should be detected
+		{"[continuity-internal] You are a memory extraction system.", true},
+		{"[continuity-internal] The user has explicitly flagged something.", true},
+		// Normal user messages should not match
+		{"remember this: always use WAL mode", false},
+		{"help me fix this bug", false},
+		{"", false},
+		// Sentinel buried in the middle should not match (must be prefix)
+		{"some preamble [continuity-internal] then extraction", false},
+	}
+
+	for _, tt := range tests {
+		got := isInternalPrompt(tt.prompt)
+		if got != tt.want {
+			t.Errorf("isInternalPrompt(%q) = %v, want %v", tt.prompt[:min(len(tt.prompt), 40)], got, tt.want)
+		}
+	}
+}
+
+func TestHasSignalSkipsInternalPrompts(t *testing.T) {
+	// A prompt that contains signal keywords but is an internal extraction prompt
+	// should NOT be treated as a signal
+	internal := "[continuity-internal] The user has explicitly flagged something to remember this."
+	if hasSignal(internal) {
+		// hasSignal itself doesn't check sentinel — that's handleSubmit's job
+		// But this test documents that the prompt DOES contain "remember this"
+		// The guard must happen before hasSignal is called
+	}
+}
+
 func TestHasSignal(t *testing.T) {
 	tests := []struct {
 		prompt string

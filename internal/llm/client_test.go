@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/lazypower/continuity/internal/config"
@@ -71,6 +72,27 @@ func TestFilterEnv(t *testing.T) {
 		if e == "CLAUDE_SESSION_ID=abc123" || e == "CLAUDE_TRANSCRIPT=/tmp/t.jsonl" {
 			t.Errorf("CLAUDE_ var not filtered: %s", e)
 		}
+	}
+}
+
+func TestExtractionPromptsHaveSentinel(t *testing.T) {
+	tests := []struct {
+		name   string
+		prompt string
+	}{
+		{"ExtractionPrompt", ExtractionPrompt("some transcript")},
+		{"RelationalPrompt", RelationalPrompt("", "some transcript")},
+		{"SignalExtractionPrompt", SignalExtractionPrompt("remember this")},
+		{"SearchIntentPrompt", SearchIntentPrompt("find something")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !strings.HasPrefix(tt.prompt, InternalSentinel) {
+				t.Errorf("%s should start with sentinel %q, got prefix %q",
+					tt.name, InternalSentinel, tt.prompt[:min(len(tt.prompt), 50)])
+			}
+		})
 	}
 }
 

@@ -51,6 +51,35 @@ func TestInitSessionResume(t *testing.T) {
 	}
 }
 
+func TestInitSessionReactivatesCompleted(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	// Create and complete a session
+	s1, err := db.InitSession("sess-001", "myproject")
+	if err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
+	if err := db.CompleteSession("sess-001"); err != nil {
+		t.Fatalf("CompleteSession: %v", err)
+	}
+
+	// Re-init should reactivate, not error
+	s2, err := db.InitSession("sess-001", "myproject")
+	if err != nil {
+		t.Fatalf("InitSession after complete: %v", err)
+	}
+	if s1.ID != s2.ID {
+		t.Errorf("reactivated session ID = %d, want %d", s2.ID, s1.ID)
+	}
+	if s2.Status != "active" {
+		t.Errorf("Status = %q, want active", s2.Status)
+	}
+}
+
 func TestGetSession(t *testing.T) {
 	db, err := OpenMemory()
 	if err != nil {

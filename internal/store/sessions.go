@@ -21,17 +21,24 @@ type Session struct {
 }
 
 // InitSession creates or resumes a session. If the session_id already exists
-// and is active, it returns the existing session.
+// (in any status), it re-activates and returns it. This handles the case where
+// a Stop hook fires mid-conversation (marking it completed) but the user
+// continues sending messages in the same session.
 func (db *DB) InitSession(sessionID, project string) (*Session, error) {
 	now := time.Now().UnixMilli()
 
-	// Try to find existing active session
+	// Try to find existing session in any status
 	var s Session
 	err := db.QueryRow(`
 		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at
-		FROM sessions WHERE session_id = ? AND status = 'active'
+		FROM sessions WHERE session_id = ?
 	`, sessionID).Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt)
 	if err == nil {
+		// Re-activate if not already active
+		if s.Status != "active" {
+			db.Exec(`UPDATE sessions SET status = 'active' WHERE id = ?`, s.ID)
+			s.Status = "active"
+		}
 		return &s, nil
 	}
 	if err != sql.ErrNoRows {
