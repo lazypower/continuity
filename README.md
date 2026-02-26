@@ -66,19 +66,19 @@ Drop this in `~/.claude/settings.json`:
 {
   "hooks": {
     "SessionStart": [
-      { "type": "command", "command": "continuity hook start", "timeout": 10 }
+      { "hooks": [{ "type": "command", "command": "continuity hook start", "timeout": 10 }] }
     ],
     "UserPromptSubmit": [
-      { "type": "command", "command": "continuity hook submit", "timeout": 10 }
+      { "hooks": [{ "type": "command", "command": "continuity hook submit", "timeout": 10 }] }
     ],
     "PostToolUse": [
-      { "type": "command", "command": "continuity hook tool", "timeout": 10 }
+      { "hooks": [{ "type": "command", "command": "continuity hook tool", "timeout": 10 }] }
     ],
     "Stop": [
-      { "type": "command", "command": "continuity hook stop --transcript=${CLAUDE_TRANSCRIPT}", "timeout": 120 }
+      { "hooks": [{ "type": "command", "command": "continuity hook stop", "timeout": 120 }] }
     ],
     "SessionEnd": [
-      { "type": "command", "command": "continuity hook end", "timeout": 10 }
+      { "hooks": [{ "type": "command", "command": "continuity hook end", "timeout": 10 }] }
     ]
   }
 }

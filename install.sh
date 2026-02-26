@@ -67,9 +67,9 @@ echo "  continuity version     # Verify installation"
 echo ""
 echo "Add hooks to Claude Code (~/.claude/settings.json):"
 echo '  "hooks": {'
-echo '    "SessionStart": [{"type":"command","command":"continuity hook start"}],'
-echo '    "UserPromptSubmit": [{"type":"command","command":"continuity hook submit"}],'
-echo '    "PostToolUse": [{"type":"command","command":"continuity hook tool"}],'
-echo '    "Stop": [{"type":"command","command":"continuity hook stop --transcript=\${CLAUDE_TRANSCRIPT}"}],'
-echo '    "SessionEnd": [{"type":"command","command":"continuity hook end"}]'
+echo '    "SessionStart":      [{"hooks":[{"type":"command","command":"continuity hook start"}]}],'
+echo '    "UserPromptSubmit":  [{"hooks":[{"type":"command","command":"continuity hook submit"}]}],'
+echo '    "PostToolUse":       [{"hooks":[{"type":"command","command":"continuity hook tool"}]}],'
+echo '    "Stop":              [{"hooks":[{"type":"command","command":"continuity hook stop"}]}],'
+echo '    "SessionEnd":        [{"hooks":[{"type":"command","command":"continuity hook end"}]}]'
 echo '  }'

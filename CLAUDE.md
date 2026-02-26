@@ -48,11 +48,21 @@ Continuity integrates via Claude Code's hook system. Hook scripts are one-liners
 ```json
 {
   "hooks": {
-    "SessionStart": [{ "type": "command", "command": "continuity hook start" }],
-    "UserPromptSubmit": [{ "type": "command", "command": "continuity hook submit" }],
-    "PostToolUse": [{ "type": "command", "command": "continuity hook tool" }],
-    "Stop": [{ "type": "command", "command": "continuity hook stop --transcript=${CLAUDE_TRANSCRIPT}" }],
-    "SessionEnd": [{ "type": "command", "command": "continuity hook end" }]
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "continuity hook start" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "continuity hook submit" }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "continuity hook tool" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "continuity hook stop" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "continuity hook end" }] }
+    ]
   }
 }
 ```
