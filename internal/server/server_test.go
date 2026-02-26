@@ -16,7 +16,7 @@ func testServer(t *testing.T) *Server {
 		t.Fatalf("OpenMemory: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	return New(db, "test-version")
+	return New(db, nil, "test-version")
 }
 
 func TestHealthEndpoint(t *testing.T) {

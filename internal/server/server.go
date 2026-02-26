@@ -7,21 +7,25 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/lazypower/continuity/internal/engine"
 	"github.com/lazypower/continuity/internal/store"
 )
 
 // Server is the continuity HTTP API server.
 type Server struct {
 	db      *store.DB
+	engine  *engine.Engine
 	router  chi.Router
 	version string
 	started time.Time
 }
 
-// New creates a new Server with the given database and version string.
-func New(db *store.DB, version string) *Server {
+// New creates a new Server with the given database, engine, and version string.
+// Engine may be nil (e.g., in tests or when LLM is not configured).
+func New(db *store.DB, eng *engine.Engine, version string) *Server {
 	s := &Server{
 		db:      db,
+		engine:  eng,
 		version: version,
 		started: time.Now(),
 	}
@@ -42,12 +46,15 @@ func (s *Server) routes() {
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", s.handleHealth)
 
-		// Phase 1: session + observation + context routes
+		// Session + observation + context routes
 		r.Post("/sessions/init", s.handleSessionInit)
 		r.Post("/sessions/{sessionID}/observations", s.handleAddObservation)
 		r.Post("/sessions/{sessionID}/complete", s.handleCompleteSession)
 		r.Post("/sessions/{sessionID}/end", s.handleEndSession)
 		r.Get("/context", s.handleGetContext)
+
+		// Phase 2: extraction
+		r.Post("/sessions/{sessionID}/extract", s.handleExtractSession)
 
 		// Stub routes — return 501 until implemented
 		r.Get("/search", stub("search"))

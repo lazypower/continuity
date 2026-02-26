@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/lazypower/continuity/internal/config"
+	"github.com/lazypower/continuity/internal/engine"
+	"github.com/lazypower/continuity/internal/llm"
 	"github.com/lazypower/continuity/internal/server"
 	"github.com/lazypower/continuity/internal/store"
 	"github.com/spf13/cobra"
@@ -23,6 +25,12 @@ var serveCmd = &cobra.Command{
 
 func runServe(cmd *cobra.Command, args []string) error {
 	cfg := config.Default()
+
+	// Check for ANTHROPIC_API_KEY env override
+	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+		cfg.LLM.Provider = "anthropic"
+		cfg.LLM.AnthropicKey = key
+	}
 
 	// Resolve database path
 	dbPath := cfg.Database.Path
@@ -40,7 +48,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	srv := server.New(db, VersionString())
+	// Create LLM client and engine
+	var eng *engine.Engine
+	llmClient, err := llm.NewClient(cfg.LLM)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: LLM not configured (%v), extraction disabled\n", err)
+	} else {
+		eng = engine.New(db, llmClient)
+		eng.StartDecayTimer()
+		defer eng.Stop()
+		fmt.Fprintf(os.Stderr, "  llm: %s (%s)\n", cfg.LLM.Provider, cfg.LLM.Model)
+	}
+
+	srv := server.New(db, eng, VersionString())
 	addr := cfg.ListenAddr()
 
 	httpServer := &http.Server{

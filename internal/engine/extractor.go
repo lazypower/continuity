@@ -1,0 +1,155 @@
+package engine
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/lazypower/continuity/internal/llm"
+	"github.com/lazypower/continuity/internal/store"
+	"github.com/lazypower/continuity/internal/transcript"
+)
+
+// memoryCandidate is the JSON structure returned by the extraction LLM.
+type memoryCandidate struct {
+	Category    string `json:"category"`
+	URIHint     string `json:"uri_hint"`
+	L0          string `json:"l0"`
+	L1          string `json:"l1"`
+	L2          string `json:"l2"`
+	MergeTarget string `json:"merge_target"`
+}
+
+// ownerForCategory returns the URI owner for a given category.
+func ownerForCategory(category string) string {
+	switch category {
+	case "patterns", "cases":
+		return "agent"
+	default:
+		return "user"
+	}
+}
+
+// validCategories defines the allowed memory categories.
+var validCategories = map[string]bool{
+	"profile": true, "preferences": true, "entities": true,
+	"events": true, "patterns": true, "cases": true,
+}
+
+// extractMemories parses a transcript, condenses it, calls the LLM for extraction,
+// and persists the resulting memory candidates.
+func extractMemories(db *store.DB, client llm.Client, sessionID, transcriptPath string) error {
+	entries, err := transcript.ParseFile(transcriptPath)
+	if err != nil {
+		return fmt.Errorf("parse transcript: %w", err)
+	}
+
+	// Guard: skip if < 3 user messages
+	if transcript.CountUserMessages(entries) < 3 {
+		log.Printf("extraction: skipping %s — fewer than 3 user messages", sessionID)
+		return nil
+	}
+
+	condensed := transcript.Condense(entries)
+
+	// Guard: skip if < 100 chars condensed
+	if len(condensed) < 100 {
+		log.Printf("extraction: skipping %s — condensed too short (%d chars)", sessionID, len(condensed))
+		return nil
+	}
+
+	prompt := llm.ExtractionPrompt(condensed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	resp, err := client.Complete(ctx, prompt)
+	if err != nil {
+		return fmt.Errorf("llm extraction: %w", err)
+	}
+
+	// Guard: skip if < 20 chars response
+	if len(resp.Content) < 20 {
+		log.Printf("extraction: skipping %s — LLM response too short (%d chars)", sessionID, len(resp.Content))
+		return nil
+	}
+
+	// Parse JSON response — extract array from response
+	candidates, err := parseExtractionResponse(resp.Content)
+	if err != nil {
+		return fmt.Errorf("parse extraction response: %w", err)
+	}
+
+	// Persist each candidate
+	for _, c := range candidates {
+		if !validCategories[c.Category] {
+			log.Printf("extraction: skipping invalid category %q", c.Category)
+			continue
+		}
+		if c.URIHint == "" || c.L0 == "" {
+			continue
+		}
+
+		owner := ownerForCategory(c.Category)
+		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
+
+		// If merge_target is specified and valid, use it
+		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
+			uri = c.MergeTarget
+		}
+
+		node := &store.MemNode{
+			URI:           uri,
+			NodeType:      "leaf",
+			Category:      c.Category,
+			L0Abstract:    c.L0,
+			L1Overview:    c.L1,
+			L2Content:     c.L2,
+			SourceSession: sessionID,
+		}
+
+		if err := db.UpsertNode(node); err != nil {
+			log.Printf("extraction: failed to upsert %s: %v", uri, err)
+			continue
+		}
+		log.Printf("extraction: stored %s [%s]", uri, c.Category)
+	}
+
+	return nil
+}
+
+// parseExtractionResponse extracts a JSON array from the LLM response.
+// The response might contain markdown code fences or other wrapper text.
+func parseExtractionResponse(content string) ([]memoryCandidate, error) {
+	content = strings.TrimSpace(content)
+
+	// Strip markdown code fences if present
+	if strings.HasPrefix(content, "```") {
+		lines := strings.Split(content, "\n")
+		// Remove first and last lines (```json and ```)
+		if len(lines) > 2 {
+			content = strings.Join(lines[1:len(lines)-1], "\n")
+		}
+	}
+
+	content = strings.TrimSpace(content)
+
+	// Find the JSON array
+	start := strings.Index(content, "[")
+	end := strings.LastIndex(content, "]")
+	if start < 0 || end < 0 || end <= start {
+		return nil, fmt.Errorf("no JSON array found in response")
+	}
+
+	jsonStr := content[start : end+1]
+
+	var candidates []memoryCandidate
+	if err := json.Unmarshal([]byte(jsonStr), &candidates); err != nil {
+		return nil, fmt.Errorf("unmarshal candidates: %w", err)
+	}
+
+	return candidates, nil
+}
