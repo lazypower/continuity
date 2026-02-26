@@ -1,0 +1,23 @@
+# Binary
+continuity
+continuity-*
+
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (never commit user data)
+*.db
+*.db-shm
+*.db-wal
