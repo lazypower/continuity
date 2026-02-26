@@ -42,13 +42,19 @@ func (s *Server) routes() {
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", s.handleHealth)
 
+		// Phase 1: session + observation + context routes
+		r.Post("/sessions/init", s.handleSessionInit)
+		r.Post("/sessions/{sessionID}/observations", s.handleAddObservation)
+		r.Post("/sessions/{sessionID}/complete", s.handleCompleteSession)
+		r.Post("/sessions/{sessionID}/end", s.handleEndSession)
+		r.Get("/context", s.handleGetContext)
+
 		// Stub routes — return 501 until implemented
 		r.Get("/search", stub("search"))
-		r.Get("/context/{sessionID}", stub("context"))
 		r.Get("/profile", stub("profile"))
 		r.Get("/tree", stub("tree"))
 		r.Get("/sessions", stub("sessions"))
-		r.Get("/sessions/{id}", stub("session"))
+		r.Get("/sessions/{sessionID}", stub("session detail"))
 		r.Post("/memories", stub("memories"))
 	})
 

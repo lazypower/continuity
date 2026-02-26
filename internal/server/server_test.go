@@ -54,7 +54,6 @@ func TestStubRoutes(t *testing.T) {
 		path   string
 	}{
 		{"GET", "/api/search?q=test"},
-		{"GET", "/api/context/abc123"},
 		{"GET", "/api/profile"},
 		{"GET", "/api/tree"},
 		{"GET", "/api/sessions"},

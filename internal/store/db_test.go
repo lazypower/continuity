@@ -27,8 +27,8 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 2 {
-		t.Errorf("SchemaVersion = %d, want 2", v)
+	if v != 3 {
+		t.Errorf("SchemaVersion = %d, want 3", v)
 	}
 }
 
@@ -39,7 +39,7 @@ func TestTablesExist(t *testing.T) {
 	}
 	defer db.Close()
 
-	tables := []string{"schema_versions", "mem_nodes", "sessions"}
+	tables := []string{"schema_versions", "mem_nodes", "sessions", "observations"}
 	for _, table := range tables {
 		var name string
 		err := db.QueryRow(
@@ -128,8 +128,8 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 2 {
-		t.Errorf("SchemaVersion after re-migrate = %d, want 2", v)
+	if v != 3 {
+		t.Errorf("SchemaVersion after re-migrate = %d, want 3", v)
 	}
 }
 

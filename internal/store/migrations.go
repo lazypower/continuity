@@ -72,6 +72,23 @@ CREATE INDEX idx_sessions_started_at ON sessions(started_at DESC);
 CREATE INDEX idx_sessions_project    ON sessions(project);
 `,
 	},
+	{
+		Version:     3,
+		Description: "observations: tool use tracking per session",
+		SQL: `
+CREATE TABLE observations (
+    id             INTEGER PRIMARY KEY,
+    session_id     TEXT NOT NULL,
+    tool_name      TEXT,
+    tool_input     TEXT,
+    tool_response  TEXT,
+    created_at     INTEGER NOT NULL
+);
+
+CREATE INDEX idx_obs_session ON observations(session_id);
+CREATE INDEX idx_obs_created ON observations(created_at DESC);
+`,
+	},
 }
 
 func (db *DB) migrate() error {
