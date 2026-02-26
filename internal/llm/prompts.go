@@ -85,3 +85,24 @@ Rules:
 
 Return the profile as structured text with the 4 section headers.`, profileContext, condensed)
 }
+
+// SearchIntentPrompt generates the prompt for decomposing a search query into sub-queries.
+func SearchIntentPrompt(query string) string {
+	return fmt.Sprintf(`You are a search intent decomposition system. Break the user's query into 1-3 focused sub-queries for searching a memory store.
+
+USER QUERY: %s
+
+Each sub-query should target a different aspect of the user's intent. Tag each with a type:
+- MEMORY: factual recall (what happened, what was decided)
+- RESOURCE: tools, services, configurations, entities
+- PATTERN: techniques, solutions, approaches, how-to
+
+Rules:
+- Maximum 3 sub-queries
+- Each sub-query should be a short phrase (3-8 words)
+- If the query is already focused, return just 1 sub-query
+- Return ONLY a JSON array, no other text
+
+Return a JSON array:
+[{"query": "search phrase", "type": "MEMORY|RESOURCE|PATTERN"}]`, query)
+}

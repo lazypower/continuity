@@ -60,6 +60,49 @@ func runServe(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "  llm: %s (%s)\n", cfg.LLM.Provider, cfg.LLM.Model)
 	}
 
+	// Detect and configure embedder
+	{
+		ollamaURL := cfg.LLM.OllamaURL
+		if ollamaURL == "" {
+			ollamaURL = "http://localhost:11434"
+		}
+		embeddingModel := cfg.LLM.EmbeddingModel
+		if embeddingModel == "" {
+			embeddingModel = "nomic-embed-text"
+		}
+
+		if engine.ProbeOllama(ollamaURL, embeddingModel) {
+			emb := engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768)
+			if eng != nil {
+				eng.SetEmbedder(emb)
+			}
+			fmt.Fprintf(os.Stderr, "  embedder: ollama (%s)\n", embeddingModel)
+		} else {
+			emb, tfidfErr := engine.NewTFIDFEmbedder(db, 512)
+			if tfidfErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: tfidf embedder init failed: %v\n", tfidfErr)
+			} else {
+				if eng != nil {
+					eng.SetEmbedder(emb)
+				}
+				fmt.Fprintf(os.Stderr, "  embedder: tfidf (fallback)\n")
+			}
+		}
+
+		// Embed any nodes missing vectors
+		if eng != nil && eng.Embedder != nil {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer cancel()
+				if n, err := eng.EmbedMissing(ctx); err != nil {
+					fmt.Fprintf(os.Stderr, "embed missing: %v\n", err)
+				} else if n > 0 {
+					fmt.Fprintf(os.Stderr, "  embedded %d missing nodes\n", n)
+				}
+			}()
+		}
+	}
+
 	srv := server.New(db, eng, VersionString())
 	addr := cfg.ListenAddr()
 

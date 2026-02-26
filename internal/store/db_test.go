@@ -27,8 +27,8 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 3 {
-		t.Errorf("SchemaVersion = %d, want 3", v)
+	if v != 4 {
+		t.Errorf("SchemaVersion = %d, want 4", v)
 	}
 }
 
@@ -128,8 +128,8 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 3 {
-		t.Errorf("SchemaVersion after re-migrate = %d, want 3", v)
+	if v != 4 {
+		t.Errorf("SchemaVersion after re-migrate = %d, want 4", v)
 	}
 }
 

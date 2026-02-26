@@ -56,10 +56,12 @@ func (s *Server) routes() {
 		// Phase 2: extraction
 		r.Post("/sessions/{sessionID}/extract", s.handleExtractSession)
 
+		// Phase 3: retrieval routes
+		r.Get("/search", s.handleSearch)
+		r.Get("/profile", s.handleProfile)
+		r.Get("/tree", s.handleTree)
+
 		// Stub routes — return 501 until implemented
-		r.Get("/search", stub("search"))
-		r.Get("/profile", stub("profile"))
-		r.Get("/tree", stub("tree"))
 		r.Get("/sessions", stub("sessions"))
 		r.Get("/sessions/{sessionID}", stub("session detail"))
 		r.Post("/memories", stub("memories"))

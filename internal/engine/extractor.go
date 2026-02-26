@@ -40,8 +40,9 @@ var validCategories = map[string]bool{
 }
 
 // extractMemories parses a transcript, condenses it, calls the LLM for extraction,
-// and persists the resulting memory candidates.
-func extractMemories(db *store.DB, client llm.Client, sessionID, transcriptPath string) error {
+// and persists the resulting memory candidates. If embedder is non-nil, newly
+// extracted nodes are embedded immediately.
+func extractMemories(db *store.DB, client llm.Client, embedder Embedder, sessionID, transcriptPath string) error {
 	entries, err := transcript.ParseFile(transcriptPath)
 	if err != nil {
 		return fmt.Errorf("parse transcript: %w", err)
@@ -116,6 +117,22 @@ func extractMemories(db *store.DB, client llm.Client, sessionID, transcriptPath 
 			continue
 		}
 		log.Printf("extraction: stored %s [%s]", uri, c.Category)
+
+		// Embed the new node if embedder is available
+		if embedder != nil && node.L0Abstract != "" {
+			vec, err := embedder.Embed(ctx, node.L0Abstract)
+			if err != nil {
+				log.Printf("extraction: embed %s: %v", uri, err)
+			} else {
+				// Need to look up the node to get its ID (UpsertNode may have merged)
+				stored, err := db.GetNodeByURI(node.URI)
+				if err == nil && stored != nil {
+					if err := db.SaveVector(stored.ID, vec, embedder.Model()); err != nil {
+						log.Printf("extraction: save vector %s: %v", uri, err)
+					}
+				}
+			}
+		}
 	}
 
 	return nil

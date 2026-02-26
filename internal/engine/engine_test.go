@@ -84,7 +84,7 @@ func TestExtractSession(t *testing.T) {
 	engine := New(db, mock)
 
 	// Only test extraction, not relational (mock returns same response for both)
-	err := extractMemories(db, mock, "test-session", transcriptPath)
+	err := extractMemories(db, mock, nil, "test-session", transcriptPath)
 	if err != nil {
 		t.Fatalf("extractMemories: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestExtractSessionSkipsFewMessages(t *testing.T) {
 		{"type": "user", "message": map[string]any{"role": "user", "content": "Goodbye this is another test message"}},
 	})
 
-	err := extractMemories(db, mock, "test-session", path)
+	err := extractMemories(db, mock, nil, "test-session", path)
 	if err != nil {
 		t.Fatalf("extractMemories: %v", err)
 	}

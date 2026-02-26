@@ -89,6 +89,20 @@ CREATE INDEX idx_obs_session ON observations(session_id);
 CREATE INDEX idx_obs_created ON observations(created_at DESC);
 `,
 	},
+	{
+		Version:     4,
+		Description: "mem_vectors: embedding vectors for semantic search",
+		SQL: `
+CREATE TABLE mem_vectors (
+    node_id    INTEGER PRIMARY KEY,
+    embedding  BLOB NOT NULL,
+    model      TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (node_id) REFERENCES mem_nodes(id) ON DELETE CASCADE
+);
+`,
+	},
 }
 
 func (db *DB) migrate() error {

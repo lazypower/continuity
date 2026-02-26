@@ -399,6 +399,113 @@ func parentURIOf(uri string) string {
 	return "mem://" + joinParts(segments[:len(segments)-1])
 }
 
+// GetNodeByID returns a node by its database ID, or nil if not found.
+func (db *DB) GetNodeByID(id int64) (*MemNode, error) {
+	var n MemNode
+	var mergeable int
+	var lastAccess sql.NullInt64
+	var parentURI, l0, l1, l2, mergedFrom, sourceSession sql.NullString
+	err := db.QueryRow(`
+		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
+		FROM mem_nodes WHERE id = ?
+	`, id).Scan(&n.ID, &n.URI, &parentURI, &n.NodeType, &n.Category,
+		&l0, &l1, &l2,
+		&mergeable, &mergedFrom, &n.Relevance, &lastAccess, &n.AccessCount,
+		&sourceSession, &n.CreatedAt, &n.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get node by id: %w", err)
+	}
+	n.ParentURI = parentURI.String
+	n.L0Abstract = l0.String
+	n.L1Overview = l1.String
+	n.L2Content = l2.String
+	n.MergedFrom = mergedFrom.String
+	n.SourceSession = sourceSession.String
+	n.Mergeable = mergeable != 0
+	if lastAccess.Valid {
+		n.LastAccess = &lastAccess.Int64
+	}
+	return &n, nil
+}
+
+// GetChildren returns all direct children of a given parent URI.
+func (db *DB) GetChildren(parentURI string) ([]MemNode, error) {
+	rows, err := db.Query(`
+		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
+		FROM mem_nodes WHERE parent_uri = ?
+		ORDER BY uri
+	`, parentURI)
+	if err != nil {
+		return nil, fmt.Errorf("get children: %w", err)
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+// ListRoots returns all top-level nodes (those with no parent).
+func (db *DB) ListRoots() ([]MemNode, error) {
+	rows, err := db.Query(`
+		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
+		FROM mem_nodes WHERE parent_uri IS NULL
+		ORDER BY uri
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list roots: %w", err)
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+// GetNodesByIDs returns nodes for the given list of IDs.
+func (db *DB) GetNodesByIDs(ids []int64) ([]MemNode, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	// Build placeholder string
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	// Join placeholders with commas
+	ph := ""
+	for i, p := range placeholders {
+		if i > 0 {
+			ph += ","
+		}
+		ph += p
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
+		FROM mem_nodes WHERE id IN (%s)
+	`, ph)
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get nodes by ids: %w", err)
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
+// CountChildren returns the number of direct children for a parent URI.
+func (db *DB) CountChildren(parentURI string) (int, error) {
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM mem_nodes WHERE parent_uri = ?", parentURI).Scan(&count)
+	return count, err
+}
+
 func scanNodes(rows *sql.Rows) ([]MemNode, error) {
 	var nodes []MemNode
 	for rows.Next() {

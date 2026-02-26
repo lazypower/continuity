@@ -21,12 +21,13 @@ type DatabaseConfig struct {
 }
 
 type LLMConfig struct {
-	Provider     string `toml:"provider"`      // "claude-cli", "anthropic", "ollama"
-	Model        string `toml:"model"`         // e.g. "haiku", "sonnet"
-	MergeModel   string `toml:"merge_model"`   // model for merge decisions
-	OllamaURL    string `toml:"ollama_url"`
-	OllamaModel  string `toml:"ollama_model"`  // e.g. "llama3.2"
-	AnthropicKey string `toml:"anthropic_key"`
+	Provider       string `toml:"provider"`        // "claude-cli", "anthropic", "ollama"
+	Model          string `toml:"model"`           // e.g. "haiku", "sonnet"
+	MergeModel     string `toml:"merge_model"`     // model for merge decisions
+	OllamaURL      string `toml:"ollama_url"`
+	OllamaModel    string `toml:"ollama_model"`    // e.g. "llama3.2"
+	EmbeddingModel string `toml:"embedding_model"` // e.g. "nomic-embed-text"
+	AnthropicKey   string `toml:"anthropic_key"`
 }
 
 type HooksConfig struct {
