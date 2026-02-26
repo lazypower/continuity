@@ -339,6 +339,62 @@ Trusts agent with code generation.`
 	}
 }
 
+func TestExtractSignal(t *testing.T) {
+	db := testDB(t)
+
+	signalResponse := `[{
+		"category": "preferences",
+		"uri_hint": "wal-mode",
+		"l0": "Always use WAL mode for SQLite databases",
+		"l1": "SQLite should be configured with WAL (Write-Ahead Logging) mode for concurrent read access and better write performance in production.",
+		"l2": "Full WAL mode details: PRAGMA journal_mode=WAL should be set during database initialization."
+	}]`
+
+	mock := &llm.MockClient{
+		Response: &llm.Response{Content: signalResponse, Provider: "mock"},
+	}
+
+	eng := New(db, mock)
+
+	err := eng.ExtractSignal(context.Background(), "test-session", "remember this: always use WAL mode")
+	if err != nil {
+		t.Fatalf("ExtractSignal: %v", err)
+	}
+
+	// Verify the memory was created
+	node, err := db.GetNodeByURI("mem://user/preferences/wal-mode")
+	if err != nil {
+		t.Fatalf("GetNodeByURI: %v", err)
+	}
+	if node == nil {
+		t.Fatal("expected node to be created")
+	}
+	if !strings.Contains(node.L0Abstract, "WAL mode") {
+		t.Errorf("unexpected L0: %q", node.L0Abstract)
+	}
+	if node.SourceSession != "test-session" {
+		t.Errorf("source_session = %q, want test-session", node.SourceSession)
+	}
+
+	// Verify LLM was called with signal prompt
+	if len(mock.Calls) != 1 {
+		t.Errorf("expected 1 LLM call, got %d", len(mock.Calls))
+	}
+	if len(mock.Calls) > 0 && !strings.Contains(mock.Calls[0], "explicitly flagged") {
+		t.Error("expected signal extraction prompt")
+	}
+}
+
+func TestExtractSignalNoLLM(t *testing.T) {
+	db := testDB(t)
+	eng := New(db, nil)
+
+	err := eng.ExtractSignal(context.Background(), "test-session", "remember this: test")
+	if err == nil {
+		t.Error("expected error when LLM is nil")
+	}
+}
+
 // multiResponseMock returns different responses for successive calls.
 type multiResponseMock struct {
 	responses []*llm.Response

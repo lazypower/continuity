@@ -113,6 +113,44 @@ func TestEndSession(t *testing.T) {
 	}
 }
 
+func TestSignalRouteNoEngine(t *testing.T) {
+	srv := testServer(t) // engine is nil
+
+	body := `{"prompt":"remember this: always use WAL mode"}`
+	req := httptest.NewRequest("POST", "/api/sessions/test-001/signal", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("signal without engine: status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestSignalRouteMissingPrompt(t *testing.T) {
+	srv := testServer(t)
+
+	body := `{}`
+	req := httptest.NewRequest("POST", "/api/sessions/test-001/signal", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("signal without prompt: status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestSignalRouteInvalidJSON(t *testing.T) {
+	srv := testServer(t)
+
+	req := httptest.NewRequest("POST", "/api/sessions/test-001/signal", strings.NewReader("not json"))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("signal with bad json: status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
 func TestGetContext(t *testing.T) {
 	srv := testServer(t)
 

@@ -10,9 +10,14 @@ LDFLAGS := -X $(CLI_PKG).Version=$(VERSION) \
            -X $(CLI_PKG).Commit=$(COMMIT) \
            -X $(CLI_PKG).BuildDate=$(DATE)
 
-.PHONY: build test clean run
+.PHONY: build test clean run ui
 
-build:
+ui:
+	devbox run -- bash -c 'cd ui && npm install && npm run build'
+	rm -rf cmd/continuity/ui
+	cp -r ui/dist cmd/continuity/ui
+
+build: ui
 	devbox run -- go build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/continuity
 
 test:
@@ -20,6 +25,7 @@ test:
 
 clean:
 	rm -f $(BINARY)
+	rm -rf cmd/continuity/ui
 
 run: build
 	./$(BINARY) serve

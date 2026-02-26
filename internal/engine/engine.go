@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/lazypower/continuity/internal/llm"
@@ -117,6 +118,69 @@ func (e *Engine) StartDecayTimer() {
 // Stop shuts down the engine's background goroutines.
 func (e *Engine) Stop() {
 	close(e.stopCh)
+}
+
+// ExtractSignal processes a user-flagged signal prompt and creates a memory immediately.
+// This is designed to be called asynchronously (in a goroutine).
+func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) error {
+	if e.LLM == nil {
+		return fmt.Errorf("LLM not configured")
+	}
+
+	resp, err := e.LLM.Complete(ctx, llm.SignalExtractionPrompt(prompt))
+	if err != nil {
+		return fmt.Errorf("signal extraction LLM: %w", err)
+	}
+
+	candidates, err := parseExtractionResponse(resp.Content)
+	if err != nil {
+		return fmt.Errorf("parse signal response: %w", err)
+	}
+
+	for _, c := range candidates {
+		if !validCategories[c.Category] {
+			log.Printf("signal: skipping invalid category %q", c.Category)
+			continue
+		}
+		if c.URIHint == "" || c.L0 == "" {
+			continue
+		}
+
+		owner := ownerForCategory(c.Category)
+		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
+
+		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
+			uri = c.MergeTarget
+		}
+
+		node := &store.MemNode{
+			URI:           uri,
+			NodeType:      "leaf",
+			Category:      c.Category,
+			L0Abstract:    c.L0,
+			L1Overview:    c.L1,
+			L2Content:     c.L2,
+			SourceSession: sessionID,
+		}
+
+		if err := e.DB.UpsertNode(node); err != nil {
+			log.Printf("signal: failed to upsert %s: %v", uri, err)
+			continue
+		}
+		log.Printf("signal: stored %s [%s]", uri, c.Category)
+
+		// Embed if available
+		if e.Embedder != nil && node.L0Abstract != "" {
+			stored, err := e.DB.GetNodeByURI(node.URI)
+			if err == nil && stored != nil {
+				if vec, err := e.Embedder.Embed(ctx, stored.L0Abstract); err == nil {
+					e.DB.SaveVector(stored.ID, vec, e.Embedder.Model())
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // ExtractSession runs the full extraction pipeline for a completed session.

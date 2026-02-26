@@ -1,12 +1,14 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/lazypower/continuity/internal/engine"
@@ -126,6 +128,42 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"status": "extracting"})
+}
+
+func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "sessionID")
+
+	var req struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Prompt == "" {
+		http.Error(w, `{"error":"prompt required"}`, http.StatusBadRequest)
+		return
+	}
+
+	if s.engine == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+		return
+	}
+
+	// Async extraction — return 202 immediately
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := s.engine.ExtractSignal(ctx, sessionID, req.Prompt); err != nil {
+			log.Printf("signal extraction failed for %s: %v", sessionID, err)
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]string{"status": "processing"})
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {

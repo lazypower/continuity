@@ -1,6 +1,6 @@
 # Binary
-continuity
-continuity-*
+/continuity
+/continuity-*
 
 # Go
 *.exe
@@ -16,6 +16,11 @@ vendor/
 # OS
 .DS_Store
 Thumbs.db
+
+# UI build artifacts
+ui/node_modules/
+ui/dist/
+cmd/continuity/ui/
 
 # Data (never commit user data)
 *.db

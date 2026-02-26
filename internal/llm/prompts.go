@@ -86,6 +86,44 @@ Rules:
 Return the profile as structured text with the 4 section headers.`, profileContext, condensed)
 }
 
+// SignalExtractionPrompt generates the prompt for extracting a memory from a user-flagged signal.
+// This is simpler than full session extraction — the user has explicitly asked for something to be remembered.
+func SignalExtractionPrompt(prompt string) string {
+	return fmt.Sprintf(`The user has explicitly flagged something to remember. Extract ONE structured memory from their message.
+
+USER MESSAGE:
+%s
+
+Categorize into one of:
+- profile: User identity, skills, coding style
+- preferences: Tools, workflows, changeable choices
+- entities: People, projects, services
+- events: Decisions, deployments, actions
+- patterns: Reusable techniques, solutions
+- cases: Problem→solution pairs
+
+URI scheme: mem://{owner}/{category}/{slug}
+- owner is "user" for profile, preferences, entities, events
+- owner is "agent" for patterns, cases
+
+Rules:
+- Extract the SINGLE most important memory from this signal
+- l0 should be ~100 tokens (search surface)
+- l1 should be ~500 tokens (context injection summary)
+- l2 should capture the full detail
+- Return ONLY a JSON array with one element, no other text
+
+Return a JSON array:
+[{
+  "category": "profile|preferences|entities|events|patterns|cases",
+  "uri_hint": "slug-name",
+  "l0": "~100 token abstract",
+  "l1": "~500 token overview",
+  "l2": "full content",
+  "merge_target": "mem://... or empty"
+}]`, prompt)
+}
+
 // SearchIntentPrompt generates the prompt for decomposing a search query into sub-queries.
 func SearchIntentPrompt(query string) string {
 	return fmt.Sprintf(`You are a search intent decomposition system. Break the user's query into 1-3 focused sub-queries for searching a memory store.

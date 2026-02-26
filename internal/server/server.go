@@ -56,6 +56,9 @@ func (s *Server) routes() {
 		// Phase 2: extraction
 		r.Post("/sessions/{sessionID}/extract", s.handleExtractSession)
 
+		// Phase 4: signal keywords
+		r.Post("/sessions/{sessionID}/signal", s.handleSignal)
+
 		// Phase 3: retrieval routes
 		r.Get("/search", s.handleSearch)
 		r.Get("/profile", s.handleProfile)
@@ -66,6 +69,9 @@ func (s *Server) routes() {
 		r.Get("/sessions/{sessionID}", stub("session detail"))
 		r.Post("/memories", stub("memories"))
 	})
+
+	// Serve embedded UI at all non-API paths
+	r.NotFound(spaHandler())
 
 	s.router = r
 }
