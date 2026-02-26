@@ -103,6 +103,11 @@ CREATE TABLE mem_vectors (
 );
 `,
 	},
+	{
+		Version:     5,
+		Description: "sessions: add extracted_at for idempotent extraction",
+		SQL:         `ALTER TABLE sessions ADD COLUMN extracted_at INTEGER;`,
+	},
 }
 
 func (db *DB) migrate() error {

@@ -185,9 +185,20 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 
 // ExtractSession runs the full extraction pipeline for a completed session.
 // This is designed to be called asynchronously (in a goroutine).
+// Idempotent: skips sessions that have already been extracted.
 func (e *Engine) ExtractSession(sessionID, transcriptPath string) error {
 	if transcriptPath == "" {
 		return fmt.Errorf("no transcript path provided")
+	}
+
+	// Idempotency guard: skip if already extracted
+	sess, err := e.DB.GetSession(sessionID)
+	if err != nil {
+		return fmt.Errorf("check session: %w", err)
+	}
+	if sess != nil && sess.ExtractedAt != nil {
+		log.Printf("extraction: skipping %s — already extracted", sessionID)
+		return nil
 	}
 
 	if err := extractMemories(e.DB, e.LLM, e.Embedder, sessionID, transcriptPath); err != nil {
@@ -196,6 +207,11 @@ func (e *Engine) ExtractSession(sessionID, transcriptPath string) error {
 
 	if err := extractRelational(e.DB, e.LLM, sessionID, transcriptPath); err != nil {
 		return fmt.Errorf("relational extraction: %w", err)
+	}
+
+	// Mark as extracted so we don't re-process
+	if err := e.DB.MarkExtracted(sessionID); err != nil {
+		log.Printf("extraction: failed to mark %s as extracted: %v", sessionID, err)
 	}
 
 	return nil
