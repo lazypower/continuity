@@ -199,14 +199,17 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		Category: category,
 	}
 
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
 	var results []engine.SearchResult
 	var err error
 
 	switch mode {
 	case "search":
-		results, err = engine.Search(r.Context(), s.db, s.engine.Embedder, s.engine.LLM, query, opts)
+		results, err = engine.Search(ctx, s.db, s.engine.Embedder, s.engine.LLM, query, opts)
 	default:
-		results, err = engine.Find(r.Context(), s.db, s.engine.Embedder, query, opts)
+		results, err = engine.Find(ctx, s.db, s.engine.Embedder, query, opts)
 	}
 
 	if err != nil {

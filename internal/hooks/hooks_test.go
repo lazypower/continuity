@@ -93,6 +93,8 @@ func TestHandleStartWithServer(t *testing.T) {
 }
 
 func TestHandleStartEmptyOnServerDown(t *testing.T) {
+	// Point at unreachable port so Healthy() returns false
+	t.Setenv("CONTINUITY_URL", "http://127.0.0.1:1")
 	// No server running — should output empty context
 	input := `{"session_id":"test-001","hook_event_name":"SessionStart"}`
 
@@ -190,6 +192,7 @@ func TestSessionStartOutputFormat(t *testing.T) {
 }
 
 func TestClientHealthyFalseWhenDown(t *testing.T) {
+	t.Setenv("CONTINUITY_URL", "http://127.0.0.1:1")
 	client := NewClient()
 	if client.Healthy() {
 		t.Error("expected Healthy() = false when server is not running")
