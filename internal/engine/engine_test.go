@@ -281,7 +281,7 @@ func TestFullPipeline(t *testing.T) {
 	db := testDB(t)
 
 	extractionResp := `[
-		{"category":"preferences","uri_hint":"go-style","l0":"Uses Go with minimal deps","l1":"Prefers Go","l2":"Full"}
+		{"category":"preferences","uri_hint":"go-style","l0":"Uses Go with minimal deps","l1":"Prefers Go with minimal dependencies and clean architecture","l2":"Full"}
 	]`
 	relationalResp := `## 1. FEEDBACK CALIBRATION
 Direct feedback style.

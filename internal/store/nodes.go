@@ -3,8 +3,56 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
+
+// textNearIdentical returns true if two strings are >95% similar by character overlap.
+// Uses a simple normalized edit-distance-like metric: shared bigram ratio.
+// This is intentionally cheap — no embeddings needed at the store layer.
+func textNearIdentical(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == b {
+		return true
+	}
+	if a == "" || b == "" {
+		return false
+	}
+
+	// Bigram overlap as a quick similarity proxy
+	bigramsA := bigrams(a)
+	bigramsB := bigrams(b)
+	if len(bigramsA) == 0 || len(bigramsB) == 0 {
+		return a == b
+	}
+
+	shared := 0
+	for bg := range bigramsA {
+		if bigramsB[bg] {
+			shared++
+		}
+	}
+
+	union := len(bigramsA) + len(bigramsB) - shared
+	if union == 0 {
+		return true
+	}
+
+	similarity := float64(shared) / float64(union) // Jaccard index
+	return similarity > 0.95
+}
+
+func bigrams(s string) map[string]bool {
+	if len(s) < 2 {
+		return nil
+	}
+	m := make(map[string]bool, len(s)-1)
+	for i := 0; i < len(s)-1; i++ {
+		m[s[i:i+2]] = true
+	}
+	return m
+}
 
 // MemNode represents a node in the memory tree.
 type MemNode struct {
@@ -133,6 +181,11 @@ func (db *DB) UpsertNode(node *MemNode) error {
 	}
 
 	if existing.Mergeable {
+		// Skip if new content is near-identical to existing (avoid churn)
+		if textNearIdentical(existing.L1Overview, node.L1Overview) &&
+			textNearIdentical(existing.L0Abstract, node.L0Abstract) {
+			return nil
+		}
 		existing.L0Abstract = node.L0Abstract
 		existing.L1Overview = node.L1Overview
 		existing.L2Content = node.L2Content

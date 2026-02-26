@@ -143,13 +143,12 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 
 	// Persist each candidate
 	for _, c := range candidates {
-		if !validCategories[c.Category] {
-			log.Printf("extraction: skipping invalid category %q", c.Category)
+		vc, err := validateCandidate(c)
+		if err != nil {
+			log.Printf("extraction: rejecting candidate %q: %v", c.URIHint, err)
 			continue
 		}
-		if c.URIHint == "" || c.L0 == "" {
-			continue
-		}
+		c = vc
 
 		owner := ownerForCategory(c.Category)
 		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)

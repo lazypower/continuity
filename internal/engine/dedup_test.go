@@ -185,7 +185,7 @@ func TestExtractMemoriesNoEmbedder(t *testing.T) {
 			"category": "preferences",
 			"uri_hint": "test-pref",
 			"l0": "Test preference with no embedder",
-			"l1": "Details",
+			"l1": "Detailed preference overview for testing purposes",
 			"l2": "Full"
 		}
 	]`

@@ -255,13 +255,12 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 	}
 
 	for _, c := range candidates {
-		if !validCategories[c.Category] {
-			log.Printf("signal: skipping invalid category %q", c.Category)
+		vc, err := validateCandidate(c)
+		if err != nil {
+			log.Printf("signal: rejecting candidate %q: %v", c.URIHint, err)
 			continue
 		}
-		if c.URIHint == "" || c.L0 == "" {
-			continue
-		}
+		c = vc
 
 		owner := ownerForCategory(c.Category)
 		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)

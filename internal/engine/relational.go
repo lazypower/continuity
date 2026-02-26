@@ -63,6 +63,18 @@ func extractRelational(db *store.DB, client llm.Client, sessionID, transcriptPat
 		return nil
 	}
 
+	// Regression guard: reject absurdly short content that would clobber a richer profile
+	if len(content) < 50 {
+		log.Printf("relational: rejecting update for %s — content too short (%d chars)", sessionID, len(content))
+		return nil
+	}
+
+	// Size ceiling: truncate if unreasonably large
+	if len(content) > maxL1Chars {
+		log.Printf("relational: truncating profile content (%d → %d chars)", len(content), maxL1Chars)
+		content = truncateClean(content, maxL1Chars)
+	}
+
 	// Upsert the relational profile node
 	profileNode := &store.MemNode{
 		URI:           relationalURI,
