@@ -63,13 +63,13 @@ body {
 /* Smooth transitions on all themed elements */
 *, *::before, *::after {
   transition-property: background-color, border-color, color, opacity, box-shadow;
-  transition-duration: 150ms;
+  transition-duration: 80ms;
   transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 /* Override for elements that need instant response */
 button, input, select {
-  transition-duration: 100ms;
+  transition-duration: 50ms;
 }
 
 /* Custom scrollbar for dark mode */
