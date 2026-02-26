@@ -136,6 +136,7 @@
                         uri={leaf.uri}
                         category={leaf.category}
                         l0_abstract={leaf.l0_abstract || ''}
+                        l1_overview={leaf.l1_overview}
                       />
                     {/each}
                   </div>
@@ -145,6 +146,7 @@
                   uri={child.uri}
                   category={child.category}
                   l0_abstract={child.l0_abstract || ''}
+                  l1_overview={child.l1_overview}
                 />
               {/if}
             {/each}

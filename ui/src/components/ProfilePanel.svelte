@@ -82,6 +82,7 @@
               uri={node.uri}
               category={node.category}
               l0_abstract={node.l0_abstract}
+              l1_overview={node.l1_overview}
               relevance={node.relevance}
             />
           </div>

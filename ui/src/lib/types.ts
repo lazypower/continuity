@@ -3,6 +3,7 @@ export interface TreeNode {
   node_type: string;
   category: string;
   l0_abstract?: string;
+  l1_overview?: string;
   children?: number;
 }
 
@@ -32,6 +33,7 @@ export interface ProfileNode {
   uri: string;
   category: string;
   l0_abstract: string;
+  l1_overview?: string;
   relevance: number;
 }
 

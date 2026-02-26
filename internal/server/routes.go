@@ -266,6 +266,7 @@ func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 		URI        string  `json:"uri"`
 		Category   string  `json:"category"`
 		L0Abstract string  `json:"l0_abstract"`
+		L1Overview string  `json:"l1_overview,omitempty"`
 		Relevance  float64 `json:"relevance"`
 	}
 
@@ -276,14 +277,14 @@ func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if n.L0Abstract != "" {
-			profileNodes = append(profileNodes, nodeJSON{n.URI, n.Category, n.L0Abstract, n.Relevance})
+			profileNodes = append(profileNodes, nodeJSON{n.URI, n.Category, n.L0Abstract, n.L1Overview, n.Relevance})
 		}
 	}
 
 	prefs, _ := s.db.FindByCategory("preferences")
 	for _, n := range prefs {
 		if n.L0Abstract != "" {
-			profileNodes = append(profileNodes, nodeJSON{n.URI, n.Category, n.L0Abstract, n.Relevance})
+			profileNodes = append(profileNodes, nodeJSON{n.URI, n.Category, n.L0Abstract, n.L1Overview, n.Relevance})
 		}
 	}
 
@@ -302,6 +303,7 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		NodeType   string `json:"node_type"`
 		Category   string `json:"category"`
 		L0Abstract string `json:"l0_abstract,omitempty"`
+		L1Overview string `json:"l1_overview,omitempty"`
 		Children   int    `json:"children,omitempty"`
 	}
 
@@ -336,6 +338,7 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 				NodeType:   c.NodeType,
 				Category:   c.Category,
 				L0Abstract: c.L0Abstract,
+				L1Overview: c.L1Overview,
 			}
 			if c.NodeType == "dir" {
 				count, _ := s.db.CountChildren(c.URI)
