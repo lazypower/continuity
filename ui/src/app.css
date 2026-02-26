@@ -1,35 +1,131 @@
 @import "tailwindcss";
 
 @theme {
-  --color-profile: #3b82f6;
-  --color-preferences: #22c55e;
-  --color-entities: #a855f7;
-  --color-events: #f59e0b;
-  --color-patterns: #14b8a6;
-  --color-cases: #ef4444;
+  /* Category colors — saturated neons matching hero image */
+  --color-profile: #60a5fa;     /* bright blue — top-left branches */
+  --color-preferences: #34d399;  /* emerald green — left branches */
+  --color-entities: #c084fc;     /* vivid purple — right branches */
+  --color-events: #fbbf24;       /* warm amber — lower-left branches */
+  --color-patterns: #2dd4bf;     /* bright teal — top-right branches */
+  --color-cases: #fb7185;        /* rose pink — lower-right branches */
+
+  /* Golden accent — the tree trunk */
+  --color-accent: #d4a843;
+  --color-accent-dim: #b8923a;
 }
 
+/* Dark mode first — matches the cosmic hero image */
 :root {
-  --bg-primary: #ffffff;
-  --bg-secondary: #f9fafb;
-  --bg-card: #ffffff;
-  --text-primary: #111827;
-  --text-secondary: #6b7280;
-  --border: #e5e7eb;
+  --bg-primary: #0a0f1a;
+  --bg-secondary: #111827;
+  --bg-card: #151d2e;
+  --bg-card-hover: #1a2540;
+  --text-primary: #e2e8f0;
+  --text-secondary: #8896b0;
+  --border: #1e2d4a;
+  --border-hover: #2a3f66;
+  --glow-opacity: 0.15;
 }
 
 :root.dark {
-  --bg-primary: #0f172a;
-  --bg-secondary: #1e293b;
-  --bg-card: #1e293b;
-  --text-primary: #f1f5f9;
-  --text-secondary: #94a3b8;
-  --border: #334155;
+  --bg-primary: #0a0f1a;
+  --bg-secondary: #111827;
+  --bg-card: #151d2e;
+  --bg-card-hover: #1a2540;
+  --text-primary: #e2e8f0;
+  --text-secondary: #8896b0;
+  --border: #1e2d4a;
+  --border-hover: #2a3f66;
+  --glow-opacity: 0.15;
+}
+
+:root.light {
+  --bg-primary: #f8fafc;
+  --bg-secondary: #f1f5f9;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f8fafc;
+  --text-primary: #0f172a;
+  --text-secondary: #64748b;
+  --border: #e2e8f0;
+  --border-hover: #cbd5e1;
+  --glow-opacity: 0.08;
 }
 
 body {
   background-color: var(--bg-primary);
   color: var(--text-primary);
-  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
   margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Smooth transitions on all themed elements */
+*, *::before, *::after {
+  transition-property: background-color, border-color, color, opacity, box-shadow;
+  transition-duration: 150ms;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Override for elements that need instant response */
+button, input, select {
+  transition-duration: 100ms;
+}
+
+/* Custom scrollbar for dark mode */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-hover);
+}
+
+/* Utility: category glow effect */
+.glow-profile { box-shadow: 0 0 12px rgba(96, 165, 250, var(--glow-opacity)); }
+.glow-preferences { box-shadow: 0 0 12px rgba(52, 211, 153, var(--glow-opacity)); }
+.glow-entities { box-shadow: 0 0 12px rgba(192, 132, 252, var(--glow-opacity)); }
+.glow-events { box-shadow: 0 0 12px rgba(251, 191, 36, var(--glow-opacity)); }
+.glow-patterns { box-shadow: 0 0 12px rgba(45, 212, 191, var(--glow-opacity)); }
+.glow-cases { box-shadow: 0 0 12px rgba(251, 113, 133, var(--glow-opacity)); }
+
+/* Expand/collapse animation */
+.expand-enter {
+  animation: expandIn 200ms ease-out;
+}
+
+@keyframes expandIn {
+  from {
+    opacity: 0;
+    max-height: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    max-height: 500px;
+    transform: translateY(0);
+  }
+}
+
+/* Fade-in for cards loading */
+.fade-in {
+  animation: fadeIn 300ms ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Relevance bar */
+.relevance-bar {
+  height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--color-accent-dim), var(--color-accent));
 }
