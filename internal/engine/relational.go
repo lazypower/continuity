@@ -57,10 +57,31 @@ func extractRelational(db *store.DB, client llm.Client, sessionID, transcriptPat
 
 	content := strings.TrimSpace(resp.Content)
 
-	// No update signal
-	if content == "NO_UPDATE" || len(content) < 20 {
+	// No update signal — catch both exact match and embedded in a longer response
+	if strings.Contains(content, "NO_UPDATE") {
 		log.Printf("relational: no update for %s", sessionID)
 		return nil
+	}
+	if len(content) < 20 {
+		log.Printf("relational: response too short for %s (%d chars)", sessionID, len(content))
+		return nil
+	}
+
+	// Reject meta-descriptions — if it reads like commentary about the profile
+	// rather than the profile itself, it's not useful
+	metaPhrases := []string{
+		"this transcript reinforces",
+		"the interaction confirms",
+		"no new signal",
+		"already captured in the profile",
+		"introduces no new",
+	}
+	contentLower := strings.ToLower(content)
+	for _, phrase := range metaPhrases {
+		if strings.Contains(contentLower, phrase) {
+			log.Printf("relational: rejecting meta-description for %s", sessionID)
+			return nil
+		}
 	}
 
 	// Regression guard: reject absurdly short content that would clobber a richer profile

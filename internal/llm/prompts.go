@@ -80,7 +80,10 @@ Rules:
 - Maximum 300 words total
 - No project-specific details (no file paths, no function names)
 - Focus on the PERSON, not the code
-- Merge with existing profile — don't duplicate, update
+- Write concrete, specific observations — NOT meta-descriptions about what the profile contains
+- BAD: "The user has a collaborative style and gives feedback casually"
+- GOOD: "Gives feedback as collaborative questions ('wanna do it?') rather than directives. Praises specific results ('That tree is exactly what I had in mind'). Corrects mistakes as questions ('did we hallucinate...?'), not blame."
+- Merge with existing profile: keep observations that are still accurate, add new ones from this session, drop anything contradicted by new evidence
 - If this session adds no new relational signal, return "NO_UPDATE"
 
 Return the profile as structured text with the 4 section headers.`, profileContext, condensed)
