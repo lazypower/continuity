@@ -16,6 +16,16 @@ jobs:
         with:
           go-version: '1.24'
 
+      - name: Build UI (required for embed)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build UI assets
+        run: |
+          cd ui && npm ci && npm run build && cd ..
+          cp -r ui/dist cmd/continuity/ui
+
       - name: Test
         run: go test ./... -v
 
