@@ -316,7 +316,7 @@ var dedupCmd = &cobra.Command{
 }
 
 func init() {
-	dedupCmd.Flags().Float64Var(&dedupThreshold, "threshold", 0.85, "Cosine similarity threshold (0.0-1.0)")
+	dedupCmd.Flags().Float64Var(&dedupThreshold, "threshold", 0.65, "Cosine similarity threshold (0.0-1.0)")
 	dedupCmd.Flags().BoolVar(&dedupDryRun, "dry-run", false, "Show what would be removed without deleting")
 }
 

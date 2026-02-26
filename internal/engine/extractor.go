@@ -15,7 +15,7 @@ import (
 
 // defaultSimilarityThreshold is the cosine similarity threshold for deduplication.
 // Candidates with similarity above this merge into existing nodes.
-const defaultSimilarityThreshold = 0.85
+const defaultSimilarityThreshold = 0.65
 
 // memoryCandidate is the JSON structure returned by the extraction LLM.
 type memoryCandidate struct {
