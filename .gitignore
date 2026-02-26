@@ -17,7 +17,8 @@ vendor/
 .DS_Store
 Thumbs.db
 
-# UI build artifacts
+# Build artifacts
+dist/
 ui/node_modules/
 ui/dist/
 cmd/continuity/ui/

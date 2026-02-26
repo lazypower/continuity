@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build UI
+        run: |
+          cd ui && npm ci && npm run build && cd ..
+          cp -r ui/dist cmd/continuity/ui
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-X github.com/lazypower/continuity/internal/cli.Version=${VERSION}"
+          LDFLAGS="${LDFLAGS} -X github.com/lazypower/continuity/internal/cli.Commit=${COMMIT}"
+          LDFLAGS="${LDFLAGS} -X github.com/lazypower/continuity/internal/cli.BuildDate=${DATE}"
+
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
+
+          go build -ldflags "${LDFLAGS}" -o "continuity-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" ./cmd/continuity
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuity-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: continuity-*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/continuity-*
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Homebrew formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set, skipping Homebrew update"
+            exit 0
+          fi
+          VERSION=${GITHUB_REF_NAME#v}
+          # Download darwin-arm64 to compute sha256
+          gh release download "v${VERSION}" -p "continuity-darwin-arm64" -D /tmp
+          SHA_DARWIN_ARM64=$(sha256sum /tmp/continuity-darwin-arm64 | cut -d' ' -f1)
+          gh release download "v${VERSION}" -p "continuity-darwin-amd64" -D /tmp
+          SHA_DARWIN_AMD64=$(sha256sum /tmp/continuity-darwin-amd64 | cut -d' ' -f1)
+          gh release download "v${VERSION}" -p "continuity-linux-amd64" -D /tmp
+          SHA_LINUX_AMD64=$(sha256sum /tmp/continuity-linux-amd64 | cut -d' ' -f1)
+          gh release download "v${VERSION}" -p "continuity-linux-arm64" -D /tmp
+          SHA_LINUX_ARM64=$(sha256sum /tmp/continuity-linux-arm64 | cut -d' ' -f1)
+          echo "Checksums computed — update your Homebrew tap with these values"
+          echo "darwin-arm64: ${SHA_DARWIN_ARM64}"
+          echo "darwin-amd64: ${SHA_DARWIN_AMD64}"
+          echo "linux-amd64: ${SHA_LINUX_AMD64}"
+          echo "linux-arm64: ${SHA_LINUX_ARM64}"
+        env:
+          GH_TOKEN: ${{ github.token }}
