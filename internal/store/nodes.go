@@ -499,6 +499,34 @@ func (db *DB) GetNodesByIDs(ids []int64) ([]MemNode, error) {
 	return scanNodes(rows)
 }
 
+// DeleteNode removes a node and its associated vector by ID.
+func (db *DB) DeleteNode(id int64) error {
+	if err := db.DeleteVector(id); err != nil {
+		return fmt.Errorf("delete vector for node %d: %w", id, err)
+	}
+	_, err := db.Exec("DELETE FROM mem_nodes WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("delete node %d: %w", id, err)
+	}
+	return nil
+}
+
+// DeleteOrphanDirs removes directory nodes that have no children.
+func (db *DB) DeleteOrphanDirs() (int, error) {
+	result, err := db.Exec(`
+		DELETE FROM mem_nodes WHERE node_type = 'dir'
+		AND id NOT IN (
+			SELECT DISTINCT p.id FROM mem_nodes p
+			JOIN mem_nodes c ON c.parent_uri = p.uri
+		)
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("delete orphan dirs: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
 // CountChildren returns the number of direct children for a parent URI.
 func (db *DB) CountChildren(parentURI string) (int, error) {
 	var count int

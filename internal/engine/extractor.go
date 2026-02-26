@@ -13,6 +13,10 @@ import (
 	"github.com/lazypower/continuity/internal/transcript"
 )
 
+// defaultSimilarityThreshold is the cosine similarity threshold for deduplication.
+// Candidates with similarity above this merge into existing nodes.
+const defaultSimilarityThreshold = 0.85
+
 // memoryCandidate is the JSON structure returned by the extraction LLM.
 type memoryCandidate struct {
 	Category    string `json:"category"`
@@ -37,6 +41,59 @@ func ownerForCategory(category string) string {
 var validCategories = map[string]bool{
 	"profile": true, "preferences": true, "entities": true,
 	"events": true, "patterns": true, "cases": true,
+}
+
+// findSimilarNode searches existing nodes for one semantically similar to the given
+// L0 abstract within the same category. Returns the best match above threshold, or
+// nil if none found. Unlike Find(), this has no side effects (no TouchNode).
+func findSimilarNode(ctx context.Context, db *store.DB, embedder Embedder,
+	l0 string, category string, threshold float64) (*store.MemNode, float64, error) {
+
+	candidateVec, err := embedder.Embed(ctx, l0)
+	if err != nil {
+		return nil, 0, fmt.Errorf("embed candidate: %w", err)
+	}
+
+	vectors, err := db.AllVectors()
+	if err != nil {
+		return nil, 0, fmt.Errorf("load vectors: %w", err)
+	}
+	if len(vectors) == 0 {
+		return nil, 0, nil
+	}
+
+	nodeIDs := make([]int64, len(vectors))
+	for i, v := range vectors {
+		nodeIDs[i] = v.NodeID
+	}
+
+	nodes, err := db.GetNodesByIDs(nodeIDs)
+	if err != nil {
+		return nil, 0, fmt.Errorf("get nodes: %w", err)
+	}
+	nodeMap := make(map[int64]store.MemNode, len(nodes))
+	for _, n := range nodes {
+		nodeMap[n.ID] = n
+	}
+
+	var bestNode *store.MemNode
+	bestSim := 0.0
+
+	for _, v := range vectors {
+		node, ok := nodeMap[v.NodeID]
+		if !ok || node.NodeType != "leaf" || node.Category != category {
+			continue
+		}
+
+		sim := CosineSimilarity(candidateVec, v.Embedding)
+		if sim > bestSim && sim >= threshold {
+			bestSim = sim
+			n := node // avoid capturing loop variable
+			bestNode = &n
+		}
+	}
+
+	return bestNode, bestSim, nil
 }
 
 // extractMemories parses a transcript, condenses it, calls the LLM for extraction,
@@ -100,6 +157,18 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 		// If merge_target is specified and valid, use it
 		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
 			uri = c.MergeTarget
+		}
+
+		// Similarity gate: check if a semantically equivalent node already exists
+		if embedder != nil && c.Category != "" {
+			match, sim, err := findSimilarNode(ctx, db, embedder, c.L0, c.Category, defaultSimilarityThreshold)
+			if err != nil {
+				log.Printf("extraction: similarity check failed: %v", err)
+				// Continue with normal upsert on error — don't block extraction
+			} else if match != nil {
+				log.Printf("extraction: merging %s → %s (similarity: %.3f)", uri, match.URI, sim)
+				uri = match.URI // Redirect to existing node's URI
+			}
 		}
 
 		node := &store.MemNode{

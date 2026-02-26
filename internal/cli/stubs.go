@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -8,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/lazypower/continuity/internal/engine"
 	"github.com/lazypower/continuity/internal/hooks"
 	"github.com/lazypower/continuity/internal/store"
 	"github.com/spf13/cobra"
@@ -295,6 +297,76 @@ func runTree(cmd *cobra.Command, args []string) error {
 		count, _ := db.CountChildren(r.URI)
 		fmt.Printf("  %s (%d children)\n", r.URI, count)
 	}
+
+	return nil
+}
+
+// --- dedup command ---
+
+var (
+	dedupThreshold float64
+	dedupDryRun    bool
+)
+
+var dedupCmd = &cobra.Command{
+	Use:   "dedup",
+	Short: "Deduplicate semantically similar memory nodes",
+	Long:  "Finds and merges duplicate memory nodes using cosine similarity. Requires a running Ollama instance or falls back to TF-IDF.",
+	RunE:  runDedup,
+}
+
+func init() {
+	dedupCmd.Flags().Float64Var(&dedupThreshold, "threshold", 0.85, "Cosine similarity threshold (0.0-1.0)")
+	dedupCmd.Flags().BoolVar(&dedupDryRun, "dry-run", false, "Show what would be removed without deleting")
+}
+
+func runDedup(cmd *cobra.Command, args []string) error {
+	db, err := openDB()
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer db.Close()
+
+	// Count before
+	leavesBefore, err := db.ListLeaves()
+	if err != nil {
+		return fmt.Errorf("list leaves: %w", err)
+	}
+	fmt.Printf("Nodes before: %d\n", len(leavesBefore))
+
+	// Set up embedder
+	var emb engine.Embedder
+	ollamaURL := "http://localhost:11434"
+	embeddingModel := "nomic-embed-text"
+	if engine.ProbeOllama(ollamaURL, embeddingModel) {
+		emb = engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768)
+		fmt.Printf("Embedder: ollama (%s)\n", embeddingModel)
+	} else {
+		emb, err = engine.NewTFIDFEmbedder(db, 512)
+		if err != nil {
+			return fmt.Errorf("init tfidf embedder: %w", err)
+		}
+		fmt.Println("Embedder: tfidf (fallback)")
+	}
+
+	eng := engine.New(db, nil)
+	eng.SetEmbedder(emb)
+
+	if dedupDryRun {
+		fmt.Println("\n[dry-run] Would deduplicate — rerun without --dry-run to apply")
+		return nil
+	}
+
+	ctx := context.Background()
+	removed, err := eng.Dedup(ctx, dedupThreshold)
+	if err != nil {
+		return fmt.Errorf("dedup: %w", err)
+	}
+
+	// Count after
+	leavesAfter, _ := db.ListLeaves()
+	fmt.Printf("Removed: %d duplicates\n", removed)
+	fmt.Printf("Nodes after: %d\n", len(leavesAfter))
 
 	return nil
 }

@@ -120,6 +120,123 @@ func (e *Engine) Stop() {
 	close(e.stopCh)
 }
 
+// Dedup finds semantically duplicate leaf nodes and merges them.
+// For each category, it clusters nodes by cosine similarity above threshold,
+// keeps the most recently updated node per cluster, and deletes the rest.
+// Returns the number of nodes removed.
+func (e *Engine) Dedup(ctx context.Context, threshold float64) (int, error) {
+	if e.Embedder == nil {
+		return 0, fmt.Errorf("no embedder configured")
+	}
+
+	leaves, err := e.DB.ListLeaves()
+	if err != nil {
+		return 0, fmt.Errorf("list leaves: %w", err)
+	}
+
+	// Embed any leaves missing vectors first
+	for i := range leaves {
+		if leaves[i].L0Abstract == "" {
+			continue
+		}
+		existing, _ := e.DB.GetVector(leaves[i].ID)
+		if existing != nil {
+			continue
+		}
+		vec, err := e.Embedder.Embed(ctx, leaves[i].L0Abstract)
+		if err != nil {
+			log.Printf("dedup: embed %s: %v", leaves[i].URI, err)
+			continue
+		}
+		e.DB.SaveVector(leaves[i].ID, vec, e.Embedder.Model())
+	}
+
+	// Load all vectors and build lookup
+	vectors, err := e.DB.AllVectors()
+	if err != nil {
+		return 0, fmt.Errorf("load vectors: %w", err)
+	}
+
+	vecMap := make(map[int64][]float64, len(vectors))
+	for _, v := range vectors {
+		vecMap[v.NodeID] = v.Embedding
+	}
+
+	// Group leaves by category
+	byCategory := make(map[string][]store.MemNode)
+	for _, n := range leaves {
+		byCategory[n.Category] = append(byCategory[n.Category], n)
+	}
+
+	removed := 0
+	for cat, nodes := range byCategory {
+		// Track which nodes are already claimed by a cluster
+		claimed := make(map[int64]bool)
+
+		for i := 0; i < len(nodes); i++ {
+			if claimed[nodes[i].ID] {
+				continue
+			}
+			vecI, ok := vecMap[nodes[i].ID]
+			if !ok {
+				continue
+			}
+
+			// Start a cluster with this node as the initial keeper
+			cluster := []int{i}
+			for j := i + 1; j < len(nodes); j++ {
+				if claimed[nodes[j].ID] {
+					continue
+				}
+				vecJ, ok := vecMap[nodes[j].ID]
+				if !ok {
+					continue
+				}
+
+				sim := CosineSimilarity(vecI, vecJ)
+				if sim >= threshold {
+					cluster = append(cluster, j)
+				}
+			}
+
+			if len(cluster) <= 1 {
+				continue
+			}
+
+			// Find the most recently updated node in the cluster
+			bestIdx := cluster[0]
+			for _, idx := range cluster[1:] {
+				if nodes[idx].UpdatedAt > nodes[bestIdx].UpdatedAt {
+					bestIdx = idx
+				}
+			}
+
+			// Delete all others
+			for _, idx := range cluster {
+				claimed[nodes[idx].ID] = true
+				if idx == bestIdx {
+					continue
+				}
+				log.Printf("dedup: removing %s (duplicate of %s in %s)", nodes[idx].URI, nodes[bestIdx].URI, cat)
+				if err := e.DB.DeleteNode(nodes[idx].ID); err != nil {
+					log.Printf("dedup: delete %s: %v", nodes[idx].URI, err)
+					continue
+				}
+				removed++
+			}
+		}
+	}
+
+	// Clean up orphaned directory nodes
+	if orphans, err := e.DB.DeleteOrphanDirs(); err != nil {
+		log.Printf("dedup: cleanup orphan dirs: %v", err)
+	} else if orphans > 0 {
+		log.Printf("dedup: removed %d orphaned directory nodes", orphans)
+	}
+
+	return removed, nil
+}
+
 // ExtractSignal processes a user-flagged signal prompt and creates a memory immediately.
 // This is designed to be called asynchronously (in a goroutine).
 func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) error {
