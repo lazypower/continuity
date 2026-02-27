@@ -86,7 +86,7 @@ Drop this in `~/.claude/settings.json`:
 
 **3. Use Claude Code normally.** That's it. Continuity captures context in the background and injects it at session start. You'll see `## Continuity — Session Memory` appear in your agent's context.
 
-**4. Say "remember this"** and Continuity captures it immediately. Signal phrases like "always use X", "the bug was", "we decided" trigger instant memory extraction without waiting for session end.
+**4. Say "remember this"** and Continuity captures it immediately. Signal phrases like "always use X", "never do Y", "the fix was" trigger instant memory extraction without waiting for session end.
 
 **5. Browse your memories**
 
@@ -146,7 +146,7 @@ mem://
 
 Every node has three tiers:
 - **L0** (~100 tokens) — Abstract. Used for search and context injection.
-- **L1** (~500 tokens) — Overview. Shown when you expand a memory.
+- **L1** (~2K tokens) — Overview. Shown when you expand a memory.
 - **L2** (full) — Complete content. On-demand.
 
 Agents get shape without weight. The right memories surface at the right time.
