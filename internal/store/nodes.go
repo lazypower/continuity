@@ -291,7 +291,7 @@ func (db *DB) DecayAllNodes() (int, error) {
 		}
 
 		elapsed := float64(now - refTime)
-		if elapsed <= 0 {
+		if elapsed <= 3600000 { // skip anything under 1 hour
 			continue
 		}
 
