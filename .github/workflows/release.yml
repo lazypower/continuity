@@ -88,6 +88,7 @@ jobs:
       - name: Update Homebrew formula
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
             echo "HOMEBREW_TAP_TOKEN not set, skipping Homebrew update"
@@ -108,5 +109,3 @@ jobs:
           echo "darwin-amd64: ${SHA_DARWIN_AMD64}"
           echo "linux-amd64: ${SHA_LINUX_AMD64}"
           echo "linux-arm64: ${SHA_LINUX_ARM64}"
-        env:
-          GH_TOKEN: ${{ github.token }}
