@@ -83,8 +83,6 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - name: Update Homebrew formula
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -94,18 +92,82 @@ jobs:
             echo "HOMEBREW_TAP_TOKEN not set, skipping Homebrew update"
             exit 0
           fi
+
           VERSION=${GITHUB_REF_NAME#v}
-          # Download darwin-arm64 to compute sha256
-          gh release download "v${VERSION}" -p "continuity-darwin-arm64" -D /tmp
+
+          # Download release artifacts and compute checksums
+          gh release download "v${VERSION}" --repo lazypower/continuity -p "continuity-darwin-arm64" -D /tmp
           SHA_DARWIN_ARM64=$(sha256sum /tmp/continuity-darwin-arm64 | cut -d' ' -f1)
-          gh release download "v${VERSION}" -p "continuity-darwin-amd64" -D /tmp
+          gh release download "v${VERSION}" --repo lazypower/continuity -p "continuity-darwin-amd64" -D /tmp
           SHA_DARWIN_AMD64=$(sha256sum /tmp/continuity-darwin-amd64 | cut -d' ' -f1)
-          gh release download "v${VERSION}" -p "continuity-linux-amd64" -D /tmp
+          gh release download "v${VERSION}" --repo lazypower/continuity -p "continuity-linux-amd64" -D /tmp
           SHA_LINUX_AMD64=$(sha256sum /tmp/continuity-linux-amd64 | cut -d' ' -f1)
-          gh release download "v${VERSION}" -p "continuity-linux-arm64" -D /tmp
+          gh release download "v${VERSION}" --repo lazypower/continuity -p "continuity-linux-arm64" -D /tmp
           SHA_LINUX_ARM64=$(sha256sum /tmp/continuity-linux-arm64 | cut -d' ' -f1)
-          echo "Checksums computed — update your Homebrew tap with these values"
-          echo "darwin-arm64: ${SHA_DARWIN_ARM64}"
-          echo "darwin-amd64: ${SHA_DARWIN_AMD64}"
-          echo "linux-amd64: ${SHA_LINUX_AMD64}"
-          echo "linux-arm64: ${SHA_LINUX_ARM64}"
+
+          # Generate the formula
+          cat > /tmp/continuity.rb <<FORMULA
+          class Continuity < Formula
+            desc "Persistent memory for AI coding agents"
+            homepage "https://github.com/lazypower/continuity"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/lazypower/continuity/releases/download/v#{version}/continuity-darwin-arm64"
+                sha256 "${SHA_DARWIN_ARM64}"
+
+                def install
+                  bin.install "continuity-darwin-arm64" => "continuity"
+                end
+              end
+
+              on_intel do
+                url "https://github.com/lazypower/continuity/releases/download/v#{version}/continuity-darwin-amd64"
+                sha256 "${SHA_DARWIN_AMD64}"
+
+                def install
+                  bin.install "continuity-darwin-amd64" => "continuity"
+                end
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/lazypower/continuity/releases/download/v#{version}/continuity-linux-arm64"
+                sha256 "${SHA_LINUX_ARM64}"
+
+                def install
+                  bin.install "continuity-linux-arm64" => "continuity"
+                end
+              end
+
+              on_intel do
+                url "https://github.com/lazypower/continuity/releases/download/v#{version}/continuity-linux-amd64"
+                sha256 "${SHA_LINUX_AMD64}"
+
+                def install
+                  bin.install "continuity-linux-amd64" => "continuity"
+                end
+              end
+            end
+
+            test do
+              assert_match "continuity", shell_output("#{bin}/continuity version")
+            end
+          end
+          FORMULA
+
+          # Strip leading whitespace from heredoc indentation
+          sed -i 's/^          //' /tmp/continuity.rb
+
+          # Clone tap, update formula, push
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/lazypower/homebrew-tap.git" /tmp/tap
+          cp /tmp/continuity.rb /tmp/tap/Formula/continuity.rb
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/continuity.rb
+          git commit -m "continuity ${VERSION}"
+          git push
