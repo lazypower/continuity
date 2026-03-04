@@ -67,7 +67,7 @@ func (s *Server) routes() {
 		// Stub routes — return 501 until implemented
 		r.Get("/sessions", stub("sessions"))
 		r.Get("/sessions/{sessionID}", stub("session detail"))
-		r.Post("/memories", stub("memories"))
+		r.Post("/memories", s.handleRemember)
 	})
 
 	// Serve embedded UI at all non-API paths

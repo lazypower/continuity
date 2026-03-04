@@ -395,6 +395,144 @@ func TestExtractSignalNoLLM(t *testing.T) {
 	}
 }
 
+func TestRemember(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       RememberInput
+		wantURI     string
+		wantCreated bool
+		wantErr     bool
+	}{
+		{
+			name: "happy path creates node",
+			input: RememberInput{
+				Category: "preferences",
+				Name:     "devbox",
+				Summary:  "Always use devbox for development tooling",
+				Body:     "The project uses devbox shell to provide Go, SQLite tools, and other dev dependencies.",
+			},
+			wantURI:     "mem://user/preferences/devbox",
+			wantCreated: true,
+		},
+		{
+			name: "invalid category",
+			input: RememberInput{
+				Category: "bogus",
+				Name:     "test",
+				Summary:  "test summary",
+				Body:     "test body with enough content for validation",
+			},
+			wantErr: true,
+		},
+		{
+			name: "patterns category uses agent owner",
+			input: RememberInput{
+				Category: "patterns",
+				Name:     "wal-mode",
+				Summary:  "Always use WAL mode for SQLite databases",
+				Body:     "SQLite should use WAL for concurrent read access and better performance.",
+			},
+			wantURI:     "mem://agent/patterns/wal-mode",
+			wantCreated: true,
+		},
+		{
+			name: "with session provenance",
+			input: RememberInput{
+				Category:  "preferences",
+				Name:      "testing",
+				Summary:   "Always write table-driven tests",
+				Body:      "Prefer table-driven test patterns for comprehensive coverage in Go.",
+				SessionID: "sess-123",
+			},
+			wantURI:     "mem://user/preferences/testing",
+			wantCreated: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := testDB(t)
+			eng := New(db, nil)
+
+			uri, created, err := eng.Remember(context.Background(), tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Remember() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+
+			if uri != tt.wantURI {
+				t.Errorf("uri = %q, want %q", uri, tt.wantURI)
+			}
+			if created != tt.wantCreated {
+				t.Errorf("created = %v, want %v", created, tt.wantCreated)
+			}
+
+			// Verify stored node
+			node, err := db.GetNodeByURI(uri)
+			if err != nil {
+				t.Fatalf("GetNodeByURI: %v", err)
+			}
+			if node == nil {
+				t.Fatal("expected node to exist")
+			}
+			if node.Category != tt.input.Category {
+				t.Errorf("category = %q, want %q", node.Category, tt.input.Category)
+			}
+			if node.L0Abstract != tt.input.Summary {
+				t.Errorf("L0 = %q, want %q", node.L0Abstract, tt.input.Summary)
+			}
+			if tt.input.SessionID != "" && node.SourceSession != tt.input.SessionID {
+				t.Errorf("source_session = %q, want %q", node.SourceSession, tt.input.SessionID)
+			}
+		})
+	}
+}
+
+func TestRememberMerge(t *testing.T) {
+	db := testDB(t)
+	eng := New(db, nil)
+	ctx := context.Background()
+
+	// Create initial memory
+	uri1, created1, err := eng.Remember(ctx, RememberInput{
+		Category: "preferences",
+		Name:     "devbox",
+		Summary:  "Always use devbox for development tooling",
+		Body:     "The project uses devbox shell to provide Go, SQLite tools, and other dev dependencies.",
+	})
+	if err != nil {
+		t.Fatalf("first Remember: %v", err)
+	}
+	if !created1 {
+		t.Error("first call should be created=true")
+	}
+
+	// Update same category+name → should merge (preferences is mergeable)
+	uri2, created2, err := eng.Remember(ctx, RememberInput{
+		Category: "preferences",
+		Name:     "devbox",
+		Summary:  "Updated: always use devbox for all development tooling",
+		Body:     "Updated body: devbox shell provides Go, SQLite, and additional build dependencies.",
+	})
+	if err != nil {
+		t.Fatalf("second Remember: %v", err)
+	}
+	if uri2 != uri1 {
+		t.Errorf("expected same URI, got %q vs %q", uri2, uri1)
+	}
+	if created2 {
+		t.Error("second call should be created=false")
+	}
+
+	// Verify content was updated
+	node, _ := db.GetNodeByURI(uri1)
+	if !strings.Contains(node.L0Abstract, "Updated") {
+		t.Errorf("expected updated L0, got %q", node.L0Abstract)
+	}
+}
+
 // multiResponseMock returns different responses for successive calls.
 type multiResponseMock struct {
 	responses []*llm.Response

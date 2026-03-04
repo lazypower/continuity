@@ -56,7 +56,6 @@ func TestStubRoutes(t *testing.T) {
 	}{
 		{"GET", "/api/sessions"},
 		{"GET", "/api/sessions/abc123"},
-		{"POST", "/api/memories"},
 	}
 
 	for _, s := range stubs {

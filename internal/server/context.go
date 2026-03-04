@@ -28,6 +28,13 @@ func (s *Server) buildContext(currentSessionID string) string {
 	var b strings.Builder
 
 	b.WriteString("<context>\n## Continuity — Session Memory\n")
+	b.WriteString("\n### How to Use Memory\n")
+	b.WriteString("Do NOT write to MEMORY.md or the auto-memory directory.\n\n")
+	b.WriteString("**Search memory first.** Before grepping the codebase for architecture, prior decisions, patterns, or conventions — run `continuity search \"<query>\"` first. Only fall back to Grep/Glob/Read if memory doesn't have what you need.\n\n")
+	b.WriteString("**Remember what you learn.** When you discover something worth preserving — a user preference, a pattern, an architectural decision, a correction — store it immediately:\n")
+	b.WriteString("```\ncontinuity remember -c <category> -n <name> -s \"summary\" -b \"body\"\n```\n")
+	b.WriteString("Categories: profile, preferences, entities, events, patterns, cases\n\n")
+	b.WriteString("**Other tools**: `continuity search \"<query>\"` · `continuity tree [uri]` · `continuity profile`\n")
 
 	// Relational profile (Working With You)
 	relProfile, err := s.db.GetNodeByURI("mem://user/profile/communication")

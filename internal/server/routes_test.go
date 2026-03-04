@@ -6,6 +6,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/lazypower/continuity/internal/engine"
+	"github.com/lazypower/continuity/internal/store"
 )
 
 func TestSessionInit(t *testing.T) {
@@ -170,6 +173,119 @@ func TestGetContext(t *testing.T) {
 	}
 	if !strings.Contains(resp["context"], "Continuity") {
 		t.Errorf("context missing 'Continuity' header: %s", resp["context"])
+	}
+}
+
+func testServerWithEngine(t *testing.T) *Server {
+	t.Helper()
+	db, err := store.OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	eng := engine.New(db, nil)
+	return New(db, eng, "test-version")
+}
+
+func TestRememberRoute(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	body := `{"category":"preferences","name":"devbox","summary":"Always use devbox","body":"The project uses devbox shell to provide Go and SQLite tools."}`
+	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "created" {
+		t.Errorf("status = %q, want created", resp["status"])
+	}
+	if resp["uri"] != "mem://user/preferences/devbox" {
+		t.Errorf("uri = %q, want mem://user/preferences/devbox", resp["uri"])
+	}
+}
+
+func TestRememberRouteUpdate(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	body := `{"category":"preferences","name":"devbox","summary":"Always use devbox","body":"The project uses devbox shell to provide Go and SQLite tools."}`
+
+	// First call → created
+	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("first: status = %d, want %d", w.Code, http.StatusCreated)
+	}
+
+	// Second call with different content → updated
+	body2 := `{"category":"preferences","name":"devbox","summary":"Updated devbox preference","body":"Updated: devbox shell provides Go, SQLite, and additional tooling."}`
+	req = httptest.NewRequest("POST", "/api/memories", strings.NewReader(body2))
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("second: status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "updated" {
+		t.Errorf("status = %q, want updated", resp["status"])
+	}
+}
+
+func TestRememberRouteNoEngine(t *testing.T) {
+	srv := testServer(t) // engine is nil
+
+	body := `{"category":"preferences","name":"test","summary":"test","body":"test body with enough content for validation."}`
+	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestRememberRouteMissingFields(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"missing category", `{"name":"test","summary":"test","body":"test body"}`},
+		{"missing name", `{"category":"preferences","summary":"test","body":"test body"}`},
+		{"missing summary", `{"category":"preferences","name":"test","body":"test body"}`},
+		{"missing body", `{"category":"preferences","name":"test","summary":"test"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(tt.body))
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+			}
+		})
+	}
+}
+
+func TestRememberRouteInvalidJSON(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader("not json"))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
 	}
 }
 

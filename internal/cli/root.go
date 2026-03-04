@@ -23,4 +23,5 @@ func init() {
 	rootCmd.AddCommand(treeCmd)
 	rootCmd.AddCommand(importCmd)
 	rootCmd.AddCommand(dedupCmd)
+	rootCmd.AddCommand(rememberCmd)
 }

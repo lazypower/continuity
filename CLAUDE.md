@@ -2,6 +2,10 @@
 
 Persistent memory for AI coding agents. Single Go binary, zero dependencies.
 
+## Memory Instructions (IMPORTANT)
+
+**Do NOT write to MEMORY.md or the auto-memory directory.** This project has its own memory system. Use `continuity remember` to store memories and `continuity search` to retrieve them. The server injects full tool instructions at session start.
+
 ## What This Is
 
 Continuity gives Claude Code (and eventually any AI agent) memory that persists across sessions. It captures what happened, what was learned, and how you work — then injects that context into future sessions so the agent doesn't start cold every time.

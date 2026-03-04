@@ -237,6 +237,92 @@ func (e *Engine) Dedup(ctx context.Context, threshold float64) (int, error) {
 	return removed, nil
 }
 
+// RememberInput holds structured memory content for direct storage (no LLM needed).
+type RememberInput struct {
+	Category  string
+	Name      string
+	Summary   string // L0 abstract
+	Body      string // L1 overview
+	Detail    string // L2 content (optional)
+	SessionID string // optional provenance
+}
+
+// Remember stores a structured memory directly — no LLM round-trip needed.
+// Returns the resulting URI, whether the node was newly created, and any error.
+func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, bool, error) {
+	c := memoryCandidate{
+		Category: input.Category,
+		URIHint:  input.Name,
+		L0:       input.Summary,
+		L1:       input.Body,
+		L2:       input.Detail,
+	}
+
+	vc, err := validateCandidate(c)
+	if err != nil {
+		return "", false, fmt.Errorf("validate: %w", err)
+	}
+	c = vc
+
+	owner := ownerForCategory(c.Category)
+	uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
+
+	// For immutable categories, check for near-duplicates via embeddings
+	if e.Embedder != nil && !mergeableCategory(c.Category) {
+		match, sim, err := findSimilarNode(ctx, e.DB, e.Embedder, c.L0, c.Category, defaultSimilarityThreshold)
+		if err != nil {
+			log.Printf("remember: similarity check failed: %v", err)
+		} else if match != nil {
+			log.Printf("remember: merging %s → %s (similarity: %.3f)", uri, match.URI, sim)
+			uri = match.URI
+		}
+	}
+
+	// Check if node already exists to determine created vs updated
+	existing, err := e.DB.GetNodeByURI(uri)
+	if err != nil {
+		return "", false, fmt.Errorf("check existing: %w", err)
+	}
+	created := existing == nil
+
+	node := &store.MemNode{
+		URI:           uri,
+		NodeType:      "leaf",
+		Category:      c.Category,
+		L0Abstract:    c.L0,
+		L1Overview:    c.L1,
+		L2Content:     c.L2,
+		SourceSession: input.SessionID,
+	}
+
+	if err := e.DB.UpsertNode(node); err != nil {
+		return "", false, fmt.Errorf("upsert: %w", err)
+	}
+	log.Printf("remember: stored %s [%s] (created=%v)", uri, c.Category, created)
+
+	// Embed if available
+	if e.Embedder != nil && node.L0Abstract != "" {
+		stored, err := e.DB.GetNodeByURI(uri)
+		if err == nil && stored != nil {
+			if err := e.EmbedNode(ctx, stored); err != nil {
+				log.Printf("remember: embed %s: %v", uri, err)
+			}
+		}
+	}
+
+	return uri, created, nil
+}
+
+// mergeableCategory returns whether the given category supports in-place merging.
+func mergeableCategory(category string) bool {
+	switch category {
+	case "profile", "preferences", "patterns":
+		return true
+	default:
+		return false
+	}
+}
+
 // ExtractSignal processes a user-flagged signal prompt and creates a memory immediately.
 // This is designed to be called asynchronously (in a goroutine).
 func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) error {

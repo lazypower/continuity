@@ -166,6 +166,61 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "processing"})
 }
 
+func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Category  string `json:"category"`
+		Name      string `json:"name"`
+		Summary   string `json:"summary"`
+		Body      string `json:"body"`
+		Detail    string `json:"detail"`
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Category == "" || req.Name == "" || req.Summary == "" || req.Body == "" {
+		http.Error(w, `{"error":"category, name, summary, and body are required"}`, http.StatusBadRequest)
+		return
+	}
+
+	if s.engine == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	uri, created, err := s.engine.Remember(ctx, engine.RememberInput{
+		Category:  req.Category,
+		Name:      req.Name,
+		Summary:   req.Summary,
+		Body:      req.Body,
+		Detail:    req.Detail,
+		SessionID: req.SessionID,
+	})
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	status := "updated"
+	code := http.StatusOK
+	if created {
+		status = "created"
+		code = http.StatusCreated
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"status": status, "uri": uri})
+}
+
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
