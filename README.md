@@ -84,11 +84,21 @@ Drop this in `~/.claude/settings.json`:
 }
 ```
 
-**3. Use Claude Code normally.** That's it. Continuity captures context in the background and injects it at session start. You'll see `## Continuity — Session Memory` appear in your agent's context.
+**3. Initialize memory directives**
 
-**4. Say "remember this"** and Continuity captures it immediately. Signal phrases like "always use X", "never do Y", "the fix was" trigger instant memory extraction without waiting for session end.
+```bash
+continuity init
+# Initialized: /Users/you/.claude/CLAUDE.md
+# Claude Code will now use continuity for memory in all sessions.
+```
 
-**5. Browse your memories**
+This writes behavioral directives to `~/.claude/CLAUDE.md` — the highest-priority instruction layer — telling Claude Code to use continuity instead of its built-in markdown memory system. Idempotent; safe to run again.
+
+**4. Use Claude Code normally.** That's it. Continuity captures context in the background and injects it at session start. You'll see `## Continuity — Session Memory` appear in your agent's context.
+
+**5. Say "remember this"** and Continuity captures it immediately. Signal phrases like "always use X", "never do Y", "the fix was" trigger instant memory extraction without waiting for session end.
+
+**6. Browse your memories**
 
 ```bash
 continuity search "sqlite configuration"
@@ -186,10 +196,13 @@ For embeddings: Ollama with `nomic-embed-text` if available, otherwise falls bac
 
 ```
 continuity serve       Start the HTTP API server
+continuity init        Set up Claude Code integration (~/.claude/CLAUDE.md)
 continuity hook <evt>  Handle Claude Code hook events
 continuity search      Search memories by query
+continuity remember    Store a memory directly (no LLM needed)
 continuity profile     Show relational profile
 continuity tree        Browse the memory tree
+continuity dedup       Deduplicate similar memory nodes
 continuity version     Print version information
 ```
 
