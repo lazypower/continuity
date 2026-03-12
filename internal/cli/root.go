@@ -24,4 +24,5 @@ func init() {
 	rootCmd.AddCommand(importCmd)
 	rootCmd.AddCommand(dedupCmd)
 	rootCmd.AddCommand(rememberCmd)
+	rootCmd.AddCommand(initCmd)
 }
