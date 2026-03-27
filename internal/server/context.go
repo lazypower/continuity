@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"net/http"
 	"path/filepath"
@@ -22,25 +23,49 @@ func (s *Server) handleGetContext(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Context injection budgets.
+// These are defense-in-depth limits — if extraction and validation are working
+// correctly, content should already fit. When these fire, it means upstream
+// limits drifted and we log a warning so the problem is visible.
+const (
+	maxContextTotal       = 4000 // total character budget for entire context block
+	maxRelationalContext  = 1000 // budget for relational profile section
+	maxItemContext        = 200  // budget per L0 memory item
+	maxContextItems       = 15   // max items considered (budget usually cuts off earlier)
+)
+
 // buildContext creates the context markdown for session injection.
-// Phase 2 upgrade: includes relational profile, memory L1s, and session list.
+// Enforces a hard character budget to prevent context bloat.
 func (s *Server) buildContext(currentSessionID string) string {
 	var b strings.Builder
+	budget := maxContextTotal
 
-	b.WriteString("<context>\n## Continuity — Session Memory\n")
+	header := "<context>\n## Continuity — Session Memory\n"
+	b.WriteString(header)
+	budget -= len(header)
 
-	// Relational profile (Working With You)
+	// Relational profile (Working With You) — capped portion of budget
 	relProfile, err := s.db.GetNodeByURI("mem://user/profile/communication")
 	if err == nil && relProfile != nil && relProfile.L1Overview != "" {
-		b.WriteString("\n### Working With You\n")
-		b.WriteString(relProfile.L1Overview)
-		b.WriteString("\n")
+		section := "\n### Working With You\n"
+		content := relProfile.L1Overview
+		if len(content) > maxRelationalContext {
+			log.Printf("context: relational profile truncated at output (%d → %d chars) — extraction may be drifting", len(content), maxRelationalContext)
+			content = truncateAtSentence(content, maxRelationalContext)
+		}
+		section += content + "\n"
+		b.WriteString(section)
+		budget -= len(section)
 	}
 
-	// Collect all non-relational leaves, rank by signal strength, cap at 15 total.
-	// This prevents the context wall-of-text problem.
-	const maxContextItems = 15
+	// Reserve space for session footer (~300 chars for 5 sessions + current)
+	const footerReserve = 400
+	itemBudget := budget - footerReserve
+	if itemBudget < 0 {
+		itemBudget = 0
+	}
 
+	// Collect all non-relational leaves, rank by signal strength
 	type rankedItem struct {
 		category string
 		l0       string
@@ -60,7 +85,6 @@ func (s *Server) buildContext(currentSessionID string) string {
 			if n.L0Abstract == "" || n.Relevance < 0.3 {
 				continue
 			}
-			// Score: relevance weighted by access frequency
 			score := nodeScore(n)
 			items = append(items, rankedItem{cat, n.L0Abstract, score})
 		}
@@ -74,27 +98,49 @@ func (s *Server) buildContext(currentSessionID string) string {
 		items = items[:maxContextItems]
 	}
 
-	// Split into profile/prefs vs other for display
-	var profileItems, memoryItems []rankedItem
+	// Split into profile/prefs vs other, enforcing per-item and total budget
+	var profileLines, memoryLines []string
+	itemsUsed := 0
+
 	for _, it := range items {
+		l0 := it.l0
+		if len(l0) > maxItemContext {
+			log.Printf("context: L0 truncated at output for [%s] (%d → %d chars) — extraction may be drifting", it.category, len(l0), maxItemContext)
+			l0 = truncateAtSentence(l0, maxItemContext)
+		}
+
+		var line string
 		if it.category == "profile" || it.category == "preferences" {
-			profileItems = append(profileItems, it)
+			line = fmt.Sprintf("- %s\n", l0)
 		} else {
-			memoryItems = append(memoryItems, it)
+			line = fmt.Sprintf("- [%s] %s\n", it.category, l0)
+		}
+
+		if itemBudget-len(line) < 0 {
+			log.Printf("context: budget exhausted after %d items (dropped %d)", itemsUsed, len(items)-itemsUsed)
+			break
+		}
+		itemBudget -= len(line)
+		itemsUsed++
+
+		if it.category == "profile" || it.category == "preferences" {
+			profileLines = append(profileLines, line)
+		} else {
+			memoryLines = append(memoryLines, line)
 		}
 	}
 
-	if len(profileItems) > 0 {
+	if len(profileLines) > 0 {
 		b.WriteString("\n### Your Profile\n")
-		for _, n := range profileItems {
-			b.WriteString(fmt.Sprintf("- %s\n", n.l0))
+		for _, line := range profileLines {
+			b.WriteString(line)
 		}
 	}
 
-	if len(memoryItems) > 0 {
+	if len(memoryLines) > 0 {
 		b.WriteString("\n### Recent Memories\n")
-		for _, m := range memoryItems {
-			b.WriteString(fmt.Sprintf("- [%s] %s\n", m.category, m.l0))
+		for _, line := range memoryLines {
+			b.WriteString(line)
 		}
 	}
 
@@ -127,6 +173,26 @@ func (s *Server) buildContext(currentSessionID string) string {
 
 	b.WriteString("</context>")
 	return b.String()
+}
+
+// truncateAtSentence truncates to maxLen, preferring sentence boundaries.
+// Falls back to word boundary if no sentence end is found.
+func truncateAtSentence(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	truncated := s[:maxLen]
+	// Try to find last sentence boundary
+	for _, sep := range []string{". ", ".\n", "! ", "? "} {
+		if idx := strings.LastIndex(truncated, sep); idx > maxLen/2 {
+			return strings.TrimSpace(truncated[:idx+1])
+		}
+	}
+	// Fall back to word boundary
+	if idx := strings.LastIndex(truncated, " "); idx > maxLen-100 {
+		return strings.TrimSpace(truncated[:idx])
+	}
+	return strings.TrimSpace(truncated)
 }
 
 // nodeScore ranks a memory node for context injection priority.

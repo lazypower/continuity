@@ -44,8 +44,8 @@ Anti-patterns — do NOT extract:
 - Things that are true of most developers ("writes tests", "uses version control")
 
 Rules:
-- l0: One sentence, ~50-80 tokens. Specific enough to deduplicate against.
-- l1: ~200-400 tokens. Structured, concrete, actionable.
+- l0: One sentence, MAXIMUM 150 CHARACTERS. This is injected into every session — brevity is critical. Specific enough to deduplicate against.
+- l1: 200-400 words. Structured, concrete, actionable.
 - l2: Full content with context.
 - merge_target: existing URI if this updates/refines known information
 - Return ONLY a JSON array, no other text
@@ -97,7 +97,7 @@ Trust indicators. What has the user allowed without review? What have they prais
 Complexity level they're comfortable delegating. Areas where autonomy has been earned.
 
 Rules:
-- Maximum 300 words total
+- MAXIMUM 800 CHARACTERS total. This is injected into every session — keep it tight.
 - No project-specific details (no file paths, no function names)
 - Focus on the PERSON, not the code
 - Write concrete, specific observations — NOT meta-descriptions about what the profile contains
@@ -131,9 +131,9 @@ URI scheme: mem://{owner}/{category}/{slug}
 
 Rules:
 - Extract the SINGLE most important memory from this signal
-- l0 should be ~100 tokens (search surface)
-- l1 should be ~500 tokens (context injection summary)
-- l2 should capture the full detail
+- l0: One sentence, MAXIMUM 150 CHARACTERS. This is injected into every session — brevity is critical.
+- l1: 200-400 words (context injection summary)
+- l2: Full content with context
 - Return ONLY a JSON array with one element, no other text
 
 Return a JSON array:

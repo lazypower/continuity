@@ -7,11 +7,14 @@ import (
 	"unicode"
 )
 
-// Content size limits (approximate token → char conversion: 1 token ≈ 4 chars).
+// Content size limits.
+// L0 is injected into every session context — it MUST be a single concise sentence.
+// L1 is the primary context injection tier, used on-demand.
+// L2 is full content, stored but rarely retrieved.
 const (
-	maxL0Chars = 800   // ~200 tokens
-	maxL1Chars = 12000 // ~3K tokens
-	maxL2Chars = 40000 // ~10K tokens
+	maxL0Chars = 200   // ~50 tokens — one sentence, atomic fact
+	maxL1Chars = 2000  // ~500 tokens — structured overview
+	maxL2Chars = 40000 // ~10K tokens — full content
 	minL1Chars = 20
 )
 

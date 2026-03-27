@@ -13,6 +13,12 @@ import (
 
 const relationalURI = "mem://user/profile/communication"
 
+// maxRelationalChars caps the stored relational profile.
+// This is separate from maxL1Chars because the relational profile is a structured
+// document with 4 sections, not a typical memory overview. The output budget in
+// buildContext further caps what gets injected into session context.
+const maxRelationalChars = 1200
+
 // extractRelational runs the relational profiling pipeline.
 // It extracts how the user works, communicates, and gives feedback.
 func extractRelational(db *store.DB, client llm.Client, sessionID, transcriptPath string) error {
@@ -91,9 +97,9 @@ func extractRelational(db *store.DB, client llm.Client, sessionID, transcriptPat
 	}
 
 	// Size ceiling: truncate if unreasonably large
-	if len(content) > maxL1Chars {
-		log.Printf("relational: truncating profile content (%d → %d chars)", len(content), maxL1Chars)
-		content = truncateClean(content, maxL1Chars)
+	if len(content) > maxRelationalChars {
+		log.Printf("relational: truncating profile content (%d → %d chars)", len(content), maxRelationalChars)
+		content = truncateClean(content, maxRelationalChars)
 	}
 
 	// Upsert the relational profile node
