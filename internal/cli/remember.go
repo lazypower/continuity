@@ -40,9 +40,9 @@ Example:
 func init() {
 	rememberCmd.Flags().StringVarP(&rememberCategory, "category", "c", "", "Memory category (required: profile, preferences, entities, events, patterns, cases)")
 	rememberCmd.Flags().StringVarP(&rememberName, "name", "n", "", "URI slug name (required)")
-	rememberCmd.Flags().StringVarP(&rememberSummary, "summary", "s", "", "L0 abstract — one sentence summary (required)")
-	rememberCmd.Flags().StringVarP(&rememberBody, "body", "b", "", "L1 overview — main content for context injection (required)")
-	rememberCmd.Flags().StringVarP(&rememberDetail, "detail", "d", "", "L2 extended content (optional)")
+	rememberCmd.Flags().StringVarP(&rememberSummary, "summary", "s", "", "L0 abstract — one sentence, max 200 chars (required)")
+	rememberCmd.Flags().StringVarP(&rememberBody, "body", "b", "", "L1 overview — max 2000 chars, compress detail aggressively (required)")
+	rememberCmd.Flags().StringVarP(&rememberDetail, "detail", "d", "", "L2 full content — max 40000 chars (optional)")
 	rememberCmd.Flags().StringVar(&rememberSession, "session", "", "Session ID for provenance (optional)")
 
 	rememberCmd.MarkFlagRequired("category")

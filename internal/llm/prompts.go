@@ -44,9 +44,9 @@ Anti-patterns — do NOT extract:
 - Things that are true of most developers ("writes tests", "uses version control")
 
 Rules:
-- l0: One sentence, MAXIMUM 150 CHARACTERS. This is injected into every session — brevity is critical. Specific enough to deduplicate against.
-- l1: 200-400 words. Structured, concrete, actionable.
-- l2: Full content with context.
+- l0: One sentence, MAXIMUM 200 CHARACTERS. Injected into every session — brevity is critical. Specific enough to deduplicate against.
+- l1: Structured overview, MAXIMUM 2000 CHARACTERS (~300 words). Concrete and actionable. This is the primary context injection tier — compress aggressively.
+- l2: Full content with all context, MAXIMUM 40000 CHARACTERS. Only retrieved on-demand.
 - merge_target: existing URI if this updates/refines known information
 - Return ONLY a JSON array, no other text
 
@@ -97,7 +97,7 @@ Trust indicators. What has the user allowed without review? What have they prais
 Complexity level they're comfortable delegating. Areas where autonomy has been earned.
 
 Rules:
-- MAXIMUM 800 CHARACTERS total. This is injected into every session — keep it tight.
+- MAXIMUM 1000 CHARACTERS total. This is injected into every session — keep it tight. Compress aggressively.
 - No project-specific details (no file paths, no function names)
 - Focus on the PERSON, not the code
 - Write concrete, specific observations — NOT meta-descriptions about what the profile contains
@@ -131,18 +131,18 @@ URI scheme: mem://{owner}/{category}/{slug}
 
 Rules:
 - Extract the SINGLE most important memory from this signal
-- l0: One sentence, MAXIMUM 150 CHARACTERS. This is injected into every session — brevity is critical.
-- l1: 200-400 words (context injection summary)
-- l2: Full content with context
+- l0: One sentence, MAXIMUM 200 CHARACTERS. Injected into every session — brevity is critical.
+- l1: Structured overview, MAXIMUM 2000 CHARACTERS (~300 words). Concrete and actionable. Compress aggressively.
+- l2: Full content with all context, MAXIMUM 40000 CHARACTERS. Only retrieved on-demand.
 - Return ONLY a JSON array with one element, no other text
 
 Return a JSON array:
 [{
   "category": "profile|preferences|entities|events|patterns|cases",
   "uri_hint": "slug-name",
-  "l0": "~100 token abstract",
-  "l1": "~500 token overview",
-  "l2": "full content",
+  "l0": "single sentence, max 200 chars",
+  "l1": "structured overview, max 2000 chars",
+  "l2": "full content, max 40000 chars",
   "merge_target": "mem://... or empty"
 }]`, InternalSentinel, prompt)
 }

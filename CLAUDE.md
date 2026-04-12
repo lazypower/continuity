@@ -6,6 +6,11 @@ Persistent memory for AI coding agents. Single Go binary, zero dependencies.
 
 **Do NOT write to MEMORY.md or the auto-memory directory.** This project has its own memory system. Use `continuity remember` to store memories and `continuity search` to retrieve them. The server injects full tool instructions at session start.
 
+**Tier character limits — content beyond these is hard-truncated:**
+- **L0 (`-s`)**: Max 200 characters. One sentence. Injected into every session.
+- **L1 (`-b`)**: Max 2000 characters (~300 words). Primary context tier. Compress aggressively.
+- **L2 (`-d`)**: Max 40000 characters. Full content, retrieved on-demand only.
+
 ## What This Is
 
 Continuity gives Claude Code (and eventually any AI agent) memory that persists across sessions. It captures what happened, what was learned, and how you work — then injects that context into future sessions so the agent doesn't start cold every time.
