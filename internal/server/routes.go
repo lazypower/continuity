@@ -304,6 +304,45 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
+	sinceStr := r.URL.Query().Get("since")
+	sinceMs := int64(0)
+	if sinceStr != "" {
+		if n, err := strconv.ParseInt(sinceStr, 10, 64); err == nil {
+			sinceMs = n
+		}
+	}
+	if sinceMs == 0 {
+		// Default: 90 days
+		sinceMs = time.Now().AddDate(0, 0, -90).UnixMilli()
+	}
+
+	sessions, err := s.db.GetSessionsSince(sinceMs)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	type sessionJSON struct {
+		Project   string `json:"project"`
+		StartedAt int64  `json:"started_at"`
+		ToolCount int    `json:"tool_count"`
+		Tone      string `json:"tone,omitempty"`
+	}
+
+	out := make([]sessionJSON, 0, len(sessions))
+	for _, s := range sessions {
+		out = append(out, sessionJSON{
+			Project:   s.Project,
+			StartedAt: s.StartedAt,
+			ToolCount: s.ToolCount,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(out)
+}
+
 func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 	relProfile, err := s.db.GetNodeByURI("mem://user/profile/communication")
 	if err != nil {

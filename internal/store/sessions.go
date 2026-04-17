@@ -133,6 +133,28 @@ func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 	return sessions, rows.Err()
 }
 
+// GetSessionsSince returns all sessions started after the given timestamp, ordered by started_at ASC.
+func (db *DB) GetSessionsSince(sinceMs int64) ([]Session, error) {
+	rows, err := db.Query(`
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at
+		FROM sessions WHERE started_at >= ? ORDER BY started_at ASC
+	`, sinceMs)
+	if err != nil {
+		return nil, fmt.Errorf("get sessions since: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var s Session
+		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt); err != nil {
+			return nil, fmt.Errorf("scan session: %w", err)
+		}
+		sessions = append(sessions, s)
+	}
+	return sessions, rows.Err()
+}
+
 // MarkExtracted sets extracted_at for a session, preventing duplicate extraction.
 func (db *DB) MarkExtracted(sessionID string) error {
 	now := time.Now().UnixMilli()

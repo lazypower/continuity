@@ -221,6 +221,7 @@ For embeddings: Ollama with `nomic-embed-text` if available, otherwise falls bac
 ```
 continuity serve              Start the HTTP API server
 continuity init [--autostart] Set up Claude Code integration + optional autostart
+continuity timeline [--days N] [--project X]  Session clusters, gaps, and rhythm
 continuity install-service    Install as system service (launchd/systemd)
 continuity uninstall-service  Remove system service
 continuity hook <evt>         Handle Claude Code hook events

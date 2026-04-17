@@ -25,6 +25,7 @@ func init() {
 	rootCmd.AddCommand(dedupCmd)
 	rootCmd.AddCommand(rememberCmd)
 	rootCmd.AddCommand(initCmd)
+	rootCmd.AddCommand(timelineCmd)
 	rootCmd.AddCommand(installServiceCmd)
 	rootCmd.AddCommand(uninstallServiceCmd)
 }
