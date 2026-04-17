@@ -29,6 +29,7 @@ Continuity fixes this. It captures what happened, what was learned, and how you 
 - **What you prefer** — tools, workflows, conventions. "Always use devbox." "Never add comments unless asked." Learned once, applied forever.
 - **What happened** — decisions, deployments, architecture choices. Project history that doesn't vanish when a session ends.
 - **How to solve things** — patterns, techniques, bug→fix pairs. Your agent builds institutional knowledge.
+- **What it was like** — relational moments that capture the texture of working together. Small anchors that never decay, so your agent wakes up knowing not just *who you are* but *what it's been like*.
 
 ## Install
 
@@ -125,10 +126,10 @@ open http://localhost:37777    # Visual memory browser
 
 **Session lifecycle:**
 
-1. **SessionStart** — Continuity injects relevant memories, recent session summaries, and the relational profile into Claude's context
+1. **SessionStart** — Continuity injects the current date, relational profile, moments, relevant memories, and recent sessions (with tone) into Claude's context. Flags gaps >7 days since last session.
 2. **UserPromptSubmit** — Signal keywords ("remember this", "always use") trigger immediate memory capture
 3. **PostToolUse** — Tool calls are buffered as observations (file edits, bash commands, etc.)
-4. **Stop** — Session transcript is sent to the LLM for full memory extraction
+4. **Stop** — Session transcript is sent to the LLM for memory extraction, relational profiling, and tone classification
 5. **SessionEnd** — Session finalized, ready for next startup
 
 ## Memory Tree
@@ -145,8 +146,10 @@ mem://
 │   │   └── devbox-tooling   → "Always use devbox for development"
 │   ├── entities/
 │   │   └── continuity-go    → "Go CLI tool for AI agent memory"
-│   └── events/
-│       └── v1-release       → "Released v1.0 with embedded UI"
+│   ├── events/
+│   │   └── v1-release       → "Released v1.0 with embedded UI"
+│   └── moments/
+│       └── first-gift       → "walked me through reflections, then presented a spec"
 └── agent/
     ├── patterns/
     │   └── sqlite-wal-mode  → "Use WAL mode for concurrent SQLite access"
@@ -163,20 +166,25 @@ Agents get shape without weight. The right memories surface at the right time.
 
 ## Architecture
 
-**6 memory categories**, each with merge rules:
+**7 memory categories**, each with merge rules:
 
-| Category | Owner | Mergeable | Example |
-|----------|-------|-----------|---------|
-| `profile` | user | yes | Coding style, skills, identity |
-| `preferences` | user | yes | Tools, workflows, conventions |
-| `entities` | user | no | Projects, people, services |
-| `events` | user | no | Decisions, deployments |
-| `patterns` | agent | yes | Reusable techniques, solutions |
-| `cases` | agent | no | Bug→fix pairs |
+| Category | Owner | Mergeable | Decay | Example |
+|----------|-------|-----------|-------|---------|
+| `profile` | user | yes | yes | Coding style, skills, identity |
+| `preferences` | user | yes | yes | Tools, workflows, conventions |
+| `entities` | user | no | yes | Projects, people, services |
+| `events` | user | no | yes | Decisions, deployments |
+| `patterns` | agent | yes | yes | Reusable techniques, solutions |
+| `cases` | agent | no | yes | Bug→fix pairs |
+| `moments` | user | no | **no** | Relational anchors — texture, not facts |
 
-**Smart decay**: 90-day half-life without access. Retrieval boosts relevance back to 1.0. Stale memories fade but never disappear — floor of 0.1.
+**Smart decay**: 90-day half-life without access. Retrieval boosts relevance back to 1.0. Stale memories fade but never disappear — floor of 0.1. Moments and the relational profile are exempt.
 
 **Relational profiling**: Extracts *how you work* — not what you work on. Feedback calibration, autonomy preferences, corrections given, trust earned. This is the compounding profile that makes your agent better over time.
+
+**Session tone**: Each completed session gets a compressed emotional arc — a 10-20 token fragment like "flow state, sharp pivots" or "grind into breakthrough, late-night clarity." Displayed in session history so the agent reads narrative, not just logs.
+
+**Moments**: Permanent relational anchors that capture *what it was like*, not what happened. Max 10 stored, 2-3 injected per session with diversity sampling (no two from the same emotional register). Pool eviction uses cosine similarity — the most semantically redundant moment gets displaced. Moments must pass a four-part qualification filter: relational, mutual, acknowledged, and counter-expected.
 
 ## LLM Providers
 
