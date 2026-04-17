@@ -40,9 +40,25 @@ func (s *Server) buildContext(currentSessionID string) string {
 	var b strings.Builder
 	budget := maxContextTotal
 
-	header := "<context>\n## Continuity — Session Memory\n"
+	now := time.Now()
+	header := fmt.Sprintf("<context>\n## Continuity — Session Memory\nCurrent: %s\n", now.Format("2006-01-02 15:04 (Mon)"))
 	b.WriteString(header)
 	budget -= len(header)
+
+	// Gap signal: if last session on this project was >7 days ago, flag it
+	if lastSessions, err := s.db.GetRecentSessions(1); err == nil && len(lastSessions) > 0 {
+		last := lastSessions[0]
+		if last.SessionID != currentSessionID {
+			gap := now.Sub(time.UnixMilli(last.StartedAt))
+			if gap.Hours() > 7*24 {
+				gapLine := fmt.Sprintf("Last session: %d days ago (%s)\n",
+					int(gap.Hours()/24),
+					time.UnixMilli(last.StartedAt).Format("Jan 2"))
+				b.WriteString(gapLine)
+				budget -= len(gapLine)
+			}
+		}
+	}
 
 	// Relational profile (Working With You) — capped portion of budget
 	relProfile, err := s.db.GetNodeByURI("mem://user/profile/communication")
@@ -63,6 +79,34 @@ func (s *Server) buildContext(currentSessionID string) string {
 	itemBudget := budget - footerReserve
 	if itemBudget < 0 {
 		itemBudget = 0
+	}
+
+	// Inject moments — small, permanent, high-value relational anchors
+	moments, err := s.db.FindByCategory("moments")
+	if err == nil && len(moments) > 0 {
+		// Sort by access count descending — most validated moments surface first.
+		// FindByCategory orders by relevance, but moments never decay (all 1.0),
+		// so access_count is the meaningful differentiator.
+		sort.Slice(moments, func(i, j int) bool {
+			return moments[i].AccessCount > moments[j].AccessCount
+		})
+		// TODO: diversity sampling — no two from same emotional register, rotation tracking
+		if len(moments) > 3 {
+			moments = moments[:3]
+		}
+		section := "\n### Moments\n"
+		for _, m := range moments {
+			if m.L0Abstract == "" {
+				continue
+			}
+			l0 := m.L0Abstract
+			if len(l0) > maxItemContext {
+				l0 = truncateAtSentence(l0, maxItemContext)
+			}
+			section += fmt.Sprintf("- %s\n", l0)
+		}
+		b.WriteString(section)
+		budget -= len(section)
 	}
 
 	// Collect all non-relational leaves, rank by signal strength
@@ -159,7 +203,11 @@ func (s *Server) buildContext(currentSessionID string) string {
 			} else {
 				project = filepath.Base(project)
 			}
-			b.WriteString(fmt.Sprintf("- [%s] %s: %s (%d tools used)\n", ts, project, sess.Status, sess.ToolCount))
+			toneSuffix := ""
+			if sess.Tone != nil && *sess.Tone != "" {
+				toneSuffix = fmt.Sprintf(" — %s", *sess.Tone)
+			}
+			b.WriteString(fmt.Sprintf("- [%s] %s: %s (%d tools used)%s\n", ts, project, sess.Status, sess.ToolCount, toneSuffix))
 		}
 	}
 

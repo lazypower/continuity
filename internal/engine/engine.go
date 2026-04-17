@@ -9,6 +9,7 @@ import (
 
 	"github.com/lazypower/continuity/internal/llm"
 	"github.com/lazypower/continuity/internal/store"
+	"github.com/lazypower/continuity/internal/transcript"
 )
 
 // Engine orchestrates memory extraction, relational profiling, and decay.
@@ -385,6 +386,45 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 	return nil
 }
 
+// extractTone runs tone extraction for a session and stores the result.
+func extractTone(db *store.DB, client llm.Client, sessionID, transcriptPath string) error {
+	entries, err := transcript.ParseFile(transcriptPath)
+	if err != nil {
+		return fmt.Errorf("parse transcript: %w", err)
+	}
+
+	condensed := transcript.Condense(entries)
+	if len(condensed) < 100 {
+		return nil // too short for meaningful tone
+	}
+
+	prompt := llm.TonePrompt(condensed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	resp, err := client.Complete(ctx, prompt)
+	if err != nil {
+		return fmt.Errorf("llm tone extraction: %w", err)
+	}
+
+	tone := strings.TrimSpace(resp.Content)
+	// Strip quotes if LLM wraps it
+	tone = strings.Trim(tone, "\"'`")
+	tone = strings.TrimSpace(tone)
+
+	if tone == "" || len(tone) > 200 {
+		log.Printf("tone: rejecting for %s — empty or too long (%d chars)", sessionID, len(tone))
+		return nil
+	}
+
+	if err := db.SetSessionTone(sessionID, tone); err != nil {
+		return fmt.Errorf("store tone: %w", err)
+	}
+	log.Printf("tone: %s → %q", sessionID, tone)
+	return nil
+}
+
 // ExtractSession runs the full extraction pipeline for a completed session.
 // This is designed to be called asynchronously (in a goroutine).
 // Idempotent: skips sessions that have already been extracted.
@@ -409,6 +449,10 @@ func (e *Engine) ExtractSession(sessionID, transcriptPath string) error {
 
 	if err := extractRelational(e.DB, e.LLM, sessionID, transcriptPath); err != nil {
 		return fmt.Errorf("relational extraction: %w", err)
+	}
+
+	if err := extractTone(e.DB, e.LLM, sessionID, transcriptPath); err != nil {
+		log.Printf("tone extraction failed (non-fatal): %v", err)
 	}
 
 	// Mark as extracted so we don't re-process

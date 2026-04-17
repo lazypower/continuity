@@ -250,7 +250,9 @@ func (db *DB) DecayAllNodes() (int, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, relevance, last_access, created_at
 		FROM mem_nodes
-		WHERE node_type = 'leaf' AND uri != 'mem://user/profile/communication'
+		WHERE node_type = 'leaf'
+			AND uri != 'mem://user/profile/communication'
+			AND category != 'moments'
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("query decayable nodes: %w", err)

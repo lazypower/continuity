@@ -18,6 +18,7 @@ type Session struct {
 	MessageCount int
 	ToolCount    int
 	ExtractedAt  *int64
+	Tone         *string
 }
 
 // InitSession creates or resumes a session. If the session_id already exists
@@ -30,9 +31,9 @@ func (db *DB) InitSession(sessionID, project string) (*Session, error) {
 	// Try to find existing session in any status
 	var s Session
 	err := db.QueryRow(`
-		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone
 		FROM sessions WHERE session_id = ?
-	`, sessionID).Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt)
+	`, sessionID).Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone)
 	if err == nil {
 		// Re-activate if not already active
 		if s.Status != "active" {
@@ -68,9 +69,9 @@ func (db *DB) InitSession(sessionID, project string) (*Session, error) {
 func (db *DB) GetSession(sessionID string) (*Session, error) {
 	var s Session
 	err := db.QueryRow(`
-		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone
 		FROM sessions WHERE session_id = ?
-	`, sessionID).Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt)
+	`, sessionID).Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -114,7 +115,7 @@ func (db *DB) EndSession(sessionID string) error {
 // GetRecentSessions returns the most recent sessions, ordered by started_at DESC.
 func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 	rows, err := db.Query(`
-		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone
 		FROM sessions ORDER BY started_at DESC LIMIT ?
 	`, limit)
 	if err != nil {
@@ -125,7 +126,7 @@ func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 	var sessions []Session
 	for rows.Next() {
 		var s Session
-		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		sessions = append(sessions, s)
@@ -139,6 +140,15 @@ func (db *DB) MarkExtracted(sessionID string) error {
 	_, err := db.Exec(`UPDATE sessions SET extracted_at = ? WHERE session_id = ?`, now, sessionID)
 	if err != nil {
 		return fmt.Errorf("mark extracted: %w", err)
+	}
+	return nil
+}
+
+// SetSessionTone stores the emotional arc tone for a session.
+func (db *DB) SetSessionTone(sessionID, tone string) error {
+	_, err := db.Exec(`UPDATE sessions SET tone = ? WHERE session_id = ?`, tone, sessionID)
+	if err != nil {
+		return fmt.Errorf("set session tone: %w", err)
 	}
 	return nil
 }

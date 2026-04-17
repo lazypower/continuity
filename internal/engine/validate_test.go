@@ -143,6 +143,22 @@ func TestValidateCandidate_SanitizesURIHint(t *testing.T) {
 	}
 }
 
+func TestValidateCandidate_MomentsCategory(t *testing.T) {
+	c := memoryCandidate{
+		Category: "moments",
+		URIHint:  "first-gift",
+		L0:       "walked me through my own reflections, then presented a spec",
+		L1:       "Context about a relational anchor moment that qualifies on all three criteria.",
+	}
+	vc, err := validateCandidate(c)
+	if err != nil {
+		t.Fatalf("unexpected error for moments category: %v", err)
+	}
+	if vc.Category != "moments" {
+		t.Errorf("Category = %q, want moments", vc.Category)
+	}
+}
+
 func TestTruncateClean(t *testing.T) {
 	s := "hello world this is a test string"
 	result := truncateClean(s, 15)

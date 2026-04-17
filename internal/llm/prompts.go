@@ -147,6 +147,34 @@ Return a JSON array:
 }]`, InternalSentinel, prompt)
 }
 
+// TonePrompt generates the prompt for extracting session emotional arc.
+func TonePrompt(condensed string) string {
+	return fmt.Sprintf(`%s Capture the emotional arc of this session in a compressed fragment — 10-20 tokens.
+
+TRANSCRIPT:
+%s
+
+This is NOT analysis or summary. It's a memory fragment — how the session FELT, not what happened.
+
+GOOD examples:
+- "flow state, sharp pivots, quiet confidence"
+- "grind into breakthrough, late-night clarity"
+- "playful tension, light roasting, steady progress"
+- "reconnection after robotic drift, mutual calibration"
+
+REJECT:
+- "The session was productive and collaborative"
+- "Chuck seemed engaged and happy"
+- Anything that reads like a report or sentiment analysis
+
+Rules:
+- 10-20 tokens MAXIMUM
+- Write as a compressed fragment, not a sentence
+- Capture the arc (how it changed), not just the vibe
+- If the session was routine with no emotional texture, return: "steady"
+- Return ONLY the tone fragment, no quotes, no explanation`, InternalSentinel, condensed)
+}
+
 // SearchIntentPrompt generates the prompt for decomposing a search query into sub-queries.
 func SearchIntentPrompt(query string) string {
 	return fmt.Sprintf(`%s You are a search intent decomposition system. Break the user's query into 1-3 focused sub-queries for searching a memory store.

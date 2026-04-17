@@ -273,6 +273,73 @@ func TestDecayAllNodes(t *testing.T) {
 	}
 }
 
+func TestCreateMomentNode(t *testing.T) {
+	db := testDB(t)
+
+	node := &MemNode{
+		URI:        "mem://user/moments/first-gift",
+		NodeType:   "leaf",
+		Category:   "moments",
+		L0Abstract: "walked me through my own reflections, then presented a spec built from my ask",
+		L1Overview: "Context about the moment and why it matters...",
+	}
+	if err := db.CreateNode(node); err != nil {
+		t.Fatalf("CreateNode moments: %v", err)
+	}
+	if node.Mergeable {
+		t.Error("moments category should not be mergeable")
+	}
+}
+
+func TestDecaySkipsMoments(t *testing.T) {
+	db := testDB(t)
+
+	// Create a moment and an event
+	db.CreateNode(&MemNode{URI: "mem://user/moments/anchor", NodeType: "leaf", Category: "moments"})
+	db.CreateNode(&MemNode{URI: "mem://user/events/old-event", NodeType: "leaf", Category: "events"})
+
+	// Manually backdate both nodes so decay would apply
+	db.Exec(`UPDATE mem_nodes SET created_at = 0, last_access = NULL WHERE node_type = 'leaf'`)
+
+	updated, err := db.DecayAllNodes()
+	if err != nil {
+		t.Fatalf("DecayAllNodes: %v", err)
+	}
+
+	// Only the event should have decayed, not the moment
+	if updated != 1 {
+		t.Errorf("expected 1 decayed node (event only), got %d", updated)
+	}
+
+	// Verify moment still has full relevance
+	moment, _ := db.GetNodeByURI("mem://user/moments/anchor")
+	if moment.Relevance != 1.0 {
+		t.Errorf("moment relevance = %f, want 1.0 (exempt from decay)", moment.Relevance)
+	}
+
+	// Verify event did decay
+	event, _ := db.GetNodeByURI("mem://user/events/old-event")
+	if event.Relevance >= 1.0 {
+		t.Errorf("event relevance = %f, expected < 1.0 (should have decayed)", event.Relevance)
+	}
+}
+
+func TestFindByCategoryMoments(t *testing.T) {
+	db := testDB(t)
+
+	db.CreateNode(&MemNode{URI: "mem://user/moments/a", NodeType: "leaf", Category: "moments", L0Abstract: "moment a"})
+	db.CreateNode(&MemNode{URI: "mem://user/moments/b", NodeType: "leaf", Category: "moments", L0Abstract: "moment b"})
+	db.CreateNode(&MemNode{URI: "mem://user/events/c", NodeType: "leaf", Category: "events", L0Abstract: "event c"})
+
+	moments, err := db.FindByCategory("moments")
+	if err != nil {
+		t.Fatalf("FindByCategory moments: %v", err)
+	}
+	if len(moments) != 2 {
+		t.Errorf("expected 2 moments, got %d", len(moments))
+	}
+}
+
 // testDB is a helper that creates an in-memory DB for testing.
 func testDB(t *testing.T) *DB {
 	t.Helper()

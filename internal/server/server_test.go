@@ -105,6 +105,75 @@ func TestBuildContextOversizedL0Truncated(t *testing.T) {
 	}
 }
 
+func TestBuildContextDateInjection(t *testing.T) {
+	srv := testServer(t)
+
+	ctx := srv.buildContext("")
+	// Should contain "Current:" with a date
+	if !strings.Contains(ctx, "Current:") {
+		t.Error("context missing date injection")
+	}
+}
+
+func TestBuildContextMomentsSection(t *testing.T) {
+	srv := testServer(t)
+
+	// Seed 4 moments with varying access counts
+	for i, name := range []string{"gift", "sausage", "benchmark", "tea"} {
+		srv.db.CreateNode(&store.MemNode{
+			URI:        fmt.Sprintf("mem://user/moments/%s", name),
+			NodeType:   "leaf",
+			Category:   "moments",
+			L0Abstract: fmt.Sprintf("moment %s with emotional texture", name),
+			L1Overview: "relational context for the moment",
+		})
+		// Touch nodes different amounts to test ordering
+		for j := 0; j < i; j++ {
+			srv.db.TouchNode(fmt.Sprintf("mem://user/moments/%s", name))
+		}
+	}
+
+	ctx := srv.buildContext("")
+	if !strings.Contains(ctx, "### Moments") {
+		t.Error("context missing Moments section")
+	}
+
+	// Should contain at most 3 moments (cap)
+	momentCount := strings.Count(ctx, "moment ")
+	if momentCount > 3 {
+		t.Errorf("expected at most 3 moments in context, got %d", momentCount)
+	}
+
+	// The moment with highest access count (tea, touched 3 times) should appear
+	if !strings.Contains(ctx, "moment tea") {
+		t.Error("most-accessed moment (tea) should appear in context")
+	}
+}
+
+func TestBuildContextNoMoments(t *testing.T) {
+	srv := testServer(t)
+
+	ctx := srv.buildContext("")
+	// No moments seeded, section should not appear
+	if strings.Contains(ctx, "### Moments") {
+		t.Error("Moments section should not appear when no moments exist")
+	}
+}
+
+func TestBuildContextSessionTone(t *testing.T) {
+	srv := testServer(t)
+
+	// Create a completed session with tone
+	srv.db.InitSession("sess-old", "myproject")
+	srv.db.CompleteSession("sess-old")
+	srv.db.SetSessionTone("sess-old", "flow state, sharp pivots")
+
+	ctx := srv.buildContext("sess-current")
+	if !strings.Contains(ctx, "flow state, sharp pivots") {
+		t.Error("context should display session tone in Recent Sessions")
+	}
+}
+
 func TestTruncateAtSentence(t *testing.T) {
 	tests := []struct {
 		name   string
