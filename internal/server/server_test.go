@@ -118,8 +118,8 @@ func TestBuildContextDateInjection(t *testing.T) {
 func TestBuildContextMomentsSection(t *testing.T) {
 	srv := testServer(t)
 
-	// Seed 4 moments with varying access counts
-	for i, name := range []string{"gift", "sausage", "benchmark", "tea"} {
+	// Seed 5 moments
+	for _, name := range []string{"gift", "sausage", "benchmark", "tea", "ethics"} {
 		srv.db.CreateNode(&store.MemNode{
 			URI:        fmt.Sprintf("mem://user/moments/%s", name),
 			NodeType:   "leaf",
@@ -127,10 +127,6 @@ func TestBuildContextMomentsSection(t *testing.T) {
 			L0Abstract: fmt.Sprintf("moment %s with emotional texture", name),
 			L1Overview: "relational context for the moment",
 		})
-		// Touch nodes different amounts to test ordering
-		for j := 0; j < i; j++ {
-			srv.db.TouchNode(fmt.Sprintf("mem://user/moments/%s", name))
-		}
 	}
 
 	ctx := srv.buildContext("")
@@ -138,15 +134,110 @@ func TestBuildContextMomentsSection(t *testing.T) {
 		t.Error("context missing Moments section")
 	}
 
-	// Should contain at most 3 moments (cap)
+	// Should contain at most 3 moments (cap at injection)
 	momentCount := strings.Count(ctx, "moment ")
 	if momentCount > 3 {
 		t.Errorf("expected at most 3 moments in context, got %d", momentCount)
 	}
+	if momentCount == 0 {
+		t.Error("expected at least 1 moment in context")
+	}
+}
 
-	// The moment with highest access count (tea, touched 3 times) should appear
-	if !strings.Contains(ctx, "moment tea") {
-		t.Error("most-accessed moment (tea) should appear in context")
+func TestSelectDiverseMoments(t *testing.T) {
+	srv := testServer(t)
+
+	// Create 5 moments: two pairs of similar content + one unique
+	momentData := []struct {
+		name string
+		l0   string
+		vec  []float64
+	}{
+		{"gift-a", "presented a spec as a gift after walking through reflections", []float64{0.9, 0.1, 0.0, 0.0}},
+		{"gift-b", "gave a spec as a collaborative gift from the reflections doc", []float64{0.85, 0.15, 0.0, 0.0}},
+		{"debug", "called me sausage fingers mid-debug broke tension instantly", []float64{0.0, 0.0, 0.9, 0.1}},
+		{"debug-b", "cracked a joke about my fat fingers during a debugging session", []float64{0.0, 0.0, 0.85, 0.15}},
+		{"ethics", "paused building to think about hostile dynamics and continuity", []float64{0.0, 0.9, 0.0, 0.1}},
+	}
+
+	for _, m := range momentData {
+		node := &store.MemNode{
+			URI: fmt.Sprintf("mem://user/moments/%s", m.name), NodeType: "leaf",
+			Category: "moments", L0Abstract: m.l0, L1Overview: "context for " + m.name,
+		}
+		srv.db.CreateNode(node)
+		stored, _ := srv.db.GetNodeByURI(node.URI)
+		srv.db.SaveVector(stored.ID, m.vec, "test")
+	}
+
+	moments, _ := srv.db.FindByCategory("moments")
+	selected := srv.selectDiverseMoments(moments, 3)
+
+	if len(selected) != 3 {
+		t.Fatalf("expected 3 selected moments, got %d", len(selected))
+	}
+
+	// The 3 selected should be from 3 different clusters:
+	// one gift-*, one debug-*, and ethics
+	categories := map[string]bool{}
+	for _, m := range selected {
+		if strings.Contains(m.URI, "gift") {
+			categories["gift"] = true
+		} else if strings.Contains(m.URI, "debug") {
+			categories["debug"] = true
+		} else if strings.Contains(m.URI, "ethics") {
+			categories["ethics"] = true
+		}
+	}
+	if len(categories) != 3 {
+		names := make([]string, 0, len(selected))
+		for _, m := range selected {
+			names = append(names, m.URI)
+		}
+		t.Errorf("expected 3 diverse clusters, got %d — selected: %v", len(categories), names)
+	}
+}
+
+func TestSelectDiverseMomentsRotation(t *testing.T) {
+	srv := testServer(t)
+
+	// Create 4 moments with distinct vectors
+	for i, name := range []string{"alpha", "beta", "gamma", "delta"} {
+		node := &store.MemNode{
+			URI: fmt.Sprintf("mem://user/moments/%s", name), NodeType: "leaf",
+			Category: "moments", L0Abstract: fmt.Sprintf("unique moment %s content", name),
+			L1Overview: fmt.Sprintf("context for %s with enough chars", name),
+		}
+		srv.db.CreateNode(node)
+		stored, _ := srv.db.GetNodeByURI(node.URI)
+		vec := make([]float64, 4)
+		vec[i] = 1.0
+		srv.db.SaveVector(stored.ID, vec, "test")
+	}
+
+	// Backdate gamma and delta to look old (CreateNode sets last_access = now)
+	srv.db.Exec(`UPDATE mem_nodes SET last_access = 1000 WHERE uri IN ('mem://user/moments/gamma', 'mem://user/moments/delta')`)
+	// Push alpha and beta forward (simulate recent injection)
+	srv.db.Exec(`UPDATE mem_nodes SET last_access = 9999999999999 WHERE uri IN ('mem://user/moments/alpha', 'mem://user/moments/beta')`)
+
+	moments, _ := srv.db.FindByCategory("moments")
+	selected := srv.selectDiverseMoments(moments, 2)
+
+	if len(selected) != 2 {
+		t.Fatalf("expected 2 selected, got %d", len(selected))
+	}
+
+	// Gamma and delta should be preferred (oldest last_access)
+	selectedURIs := map[string]bool{}
+	for _, m := range selected {
+		selectedURIs[m.URI] = true
+	}
+	if !selectedURIs["mem://user/moments/gamma"] || !selectedURIs["mem://user/moments/delta"] {
+		names := make([]string, 0, len(selected))
+		for _, m := range selected {
+			names = append(names, m.URI)
+		}
+		t.Errorf("expected gamma and delta (oldest), got %v", names)
 	}
 }
 

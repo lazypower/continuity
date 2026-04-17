@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lazypower/continuity/internal/engine"
 	"github.com/lazypower/continuity/internal/store"
 )
 
@@ -82,31 +83,24 @@ func (s *Server) buildContext(currentSessionID string) string {
 	}
 
 	// Inject moments — small, permanent, high-value relational anchors
+	// Uses diversity sampling: rotation via last_access, greedy max-diversity selection
 	moments, err := s.db.FindByCategory("moments")
 	if err == nil && len(moments) > 0 {
-		// Sort by access count descending — most validated moments surface first.
-		// FindByCategory orders by relevance, but moments never decay (all 1.0),
-		// so access_count is the meaningful differentiator.
-		sort.Slice(moments, func(i, j int) bool {
-			return moments[i].AccessCount > moments[j].AccessCount
-		})
-		// TODO: diversity sampling — no two from same emotional register, rotation tracking
-		if len(moments) > 3 {
-			moments = moments[:3]
-		}
-		section := "\n### Moments\n"
-		for _, m := range moments {
-			if m.L0Abstract == "" {
-				continue
+		selected := s.selectDiverseMoments(moments, 3)
+		if len(selected) > 0 {
+			section := "\n### Moments\n"
+			for _, m := range selected {
+				l0 := m.L0Abstract
+				if len(l0) > maxItemContext {
+					l0 = truncateAtSentence(l0, maxItemContext)
+				}
+				section += fmt.Sprintf("- %s\n", l0)
+				// Touch for rotation tracking — next session deprioritizes these
+				s.db.TouchNode(m.URI)
 			}
-			l0 := m.L0Abstract
-			if len(l0) > maxItemContext {
-				l0 = truncateAtSentence(l0, maxItemContext)
-			}
-			section += fmt.Sprintf("- %s\n", l0)
+			b.WriteString(section)
+			budget -= len(section)
 		}
-		b.WriteString(section)
-		budget -= len(section)
 	}
 
 	// Collect all non-relational leaves, rank by signal strength
@@ -241,6 +235,125 @@ func truncateAtSentence(s string, maxLen int) string {
 		return strings.TrimSpace(truncated[:idx])
 	}
 	return strings.TrimSpace(truncated)
+}
+
+// selectDiverseMoments picks up to n moments maximizing diversity.
+// Algorithm:
+//  1. Sort by last_access ascending (null first) — rotation bias toward unseen moments
+//  2. First pick = least recently seen moment
+//  3. Each subsequent pick = the moment with lowest max-similarity to already-selected
+//     (greedy diversity maximization)
+//
+// Falls back to access-count ordering when embedder is unavailable.
+func (s *Server) selectDiverseMoments(moments []store.MemNode, n int) []store.MemNode {
+	if len(moments) <= n {
+		return moments
+	}
+
+	// Sort by last_access ascending — nulls (never injected) first, then oldest
+	sort.Slice(moments, func(i, j int) bool {
+		if moments[i].LastAccess == nil && moments[j].LastAccess == nil {
+			return moments[i].CreatedAt < moments[j].CreatedAt
+		}
+		if moments[i].LastAccess == nil {
+			return true
+		}
+		if moments[j].LastAccess == nil {
+			return false
+		}
+		return *moments[i].LastAccess < *moments[j].LastAccess
+	})
+
+	// Try to load vectors for diversity calculation
+	type momentVec struct {
+		node store.MemNode
+		vec  []float64
+	}
+	var pool []momentVec
+	for _, m := range moments {
+		if m.L0Abstract == "" {
+			continue
+		}
+		v, err := s.db.GetVector(m.ID)
+		if err != nil || v == nil {
+			pool = append(pool, momentVec{m, nil})
+			continue
+		}
+		pool = append(pool, momentVec{m, v.Embedding})
+	}
+
+	if len(pool) == 0 {
+		return nil
+	}
+
+	// Check if we have enough vectors for diversity calculation
+	hasVectors := false
+	for _, mv := range pool {
+		if mv.vec != nil {
+			hasVectors = true
+			break
+		}
+	}
+
+	// Fallback: no vectors, just take the first n (already sorted by rotation)
+	if !hasVectors {
+		result := make([]store.MemNode, 0, n)
+		for i := 0; i < n && i < len(pool); i++ {
+			result = append(result, pool[i].node)
+		}
+		return result
+	}
+
+	// Greedy diversity selection
+	selected := make([]int, 0, n)
+	used := make(map[int]bool)
+
+	// First pick: least recently seen (already sorted, so index 0)
+	selected = append(selected, 0)
+	used[0] = true
+
+	// Remaining picks: minimize max similarity to already-selected
+	for len(selected) < n && len(selected) < len(pool) {
+		bestIdx := -1
+		bestMaxSim := 2.0 // higher than any cosine similarity
+
+		for i := range pool {
+			if used[i] || pool[i].vec == nil {
+				continue
+			}
+
+			// Compute max similarity to any already-selected moment
+			maxSim := -1.0
+			for _, selIdx := range selected {
+				if pool[selIdx].vec == nil {
+					continue
+				}
+				sim := engine.CosineSimilarity(pool[i].vec, pool[selIdx].vec)
+				if sim > maxSim {
+					maxSim = sim
+				}
+			}
+
+			// We want the candidate with the LOWEST max-similarity
+			// (most different from everything already selected)
+			if maxSim < bestMaxSim {
+				bestMaxSim = maxSim
+				bestIdx = i
+			}
+		}
+
+		if bestIdx < 0 {
+			break
+		}
+		selected = append(selected, bestIdx)
+		used[bestIdx] = true
+	}
+
+	result := make([]store.MemNode, 0, len(selected))
+	for _, idx := range selected {
+		result = append(result, pool[idx].node)
+	}
+	return result
 }
 
 // nodeScore ranks a memory node for context injection priority.
