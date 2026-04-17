@@ -137,7 +137,7 @@ func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 // GetSessionsSince returns all sessions started after the given timestamp, ordered by started_at ASC.
 func (db *DB) GetSessionsSince(sinceMs int64) ([]Session, error) {
 	rows, err := db.Query(`
-		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone
 		FROM sessions WHERE started_at >= ? ORDER BY started_at ASC
 	`, sinceMs)
 	if err != nil {
@@ -148,7 +148,7 @@ func (db *DB) GetSessionsSince(sinceMs int64) ([]Session, error) {
 	var sessions []Session
 	for rows.Next() {
 		var s Session
-		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		sessions = append(sessions, s)

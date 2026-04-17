@@ -332,11 +332,15 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]sessionJSON, 0, len(sessions))
 	for _, s := range sessions {
-		out = append(out, sessionJSON{
+		sj := sessionJSON{
 			Project:   s.Project,
 			StartedAt: s.StartedAt,
 			ToolCount: s.ToolCount,
-		})
+		}
+		if s.Tone != nil {
+			sj.Tone = *s.Tone
+		}
+		out = append(out, sj)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
