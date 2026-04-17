@@ -69,7 +69,18 @@ continuity init --autostart
 > - Disable autostart: `continuity init` (without `--autostart`)
 > - Stop the server: `pkill continuity` or `kill $(lsof -ti :37777)`
 > - Logs: `~/.continuity/serve.log`
-> - For proper process management (start on boot, auto-restart, log rotation), use `continuity install-service` instead (coming soon).
+> - For proper process management (start on boot, auto-restart), use `continuity install-service` instead.
+
+**Or: install as a system service** for proper lifecycle management:
+
+```bash
+continuity install-service
+# Shows what will be installed, asks for confirmation
+# macOS: LaunchAgent (start on login, restart on crash)
+# Linux: systemd user unit (start on login, restart on failure)
+```
+
+Remove with `continuity uninstall-service`. Both commands are interactive and idempotent.
 
 **2. Add hooks to Claude Code**
 
@@ -208,10 +219,12 @@ For embeddings: Ollama with `nomic-embed-text` if available, otherwise falls bac
 ## CLI
 
 ```
-continuity serve       Start the HTTP API server
-continuity init [--autostart]  Set up Claude Code integration + optional autostart
-continuity hook <evt>  Handle Claude Code hook events
-continuity search      Search memories by query
+continuity serve              Start the HTTP API server
+continuity init [--autostart] Set up Claude Code integration + optional autostart
+continuity install-service    Install as system service (launchd/systemd)
+continuity uninstall-service  Remove system service
+continuity hook <evt>         Handle Claude Code hook events
+continuity search             Search memories by query
 continuity remember    Store a memory directly (no LLM needed)
 continuity profile     Show relational profile
 continuity tree        Browse the memory tree
