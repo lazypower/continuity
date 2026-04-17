@@ -32,8 +32,18 @@ func (o SearchOpts) limit() int {
 	return o.Limit
 }
 
+// categoryBoost returns a scoring multiplier for high-signal categories.
+// Moments are permanent relational anchors that passed a triple qualification
+// filter — they deserve a ranking boost to surface when marginally relevant.
+func categoryBoost(category string) float64 {
+	if category == "moments" {
+		return 1.3
+	}
+	return 1.0
+}
+
 // Find performs fast vector search without LLM assistance.
-// Score = similarity * relevance.
+// Score = similarity * relevance * categoryBoost.
 func Find(ctx context.Context, db *store.DB, embedder Embedder, query string, opts SearchOpts) ([]SearchResult, error) {
 	if embedder == nil {
 		return nil, fmt.Errorf("no embedder configured")
@@ -88,7 +98,7 @@ func Find(ctx context.Context, db *store.DB, embedder Embedder, query string, op
 		}
 
 		similarity := CosineSimilarity(queryVec, v.Embedding)
-		score := similarity * node.Relevance
+		score := similarity * node.Relevance * categoryBoost(node.Category)
 
 		if score > 0 {
 			results = append(results, SearchResult{
@@ -171,11 +181,11 @@ func Search(ctx context.Context, db *store.DB, embedder Embedder, client llm.Cli
 	// Build parent score map for tree-aware scoring
 	parentScores := buildParentScores(db, seen)
 
-	// Re-score with full formula: 0.5*similarity + 0.3*relevance + 0.2*parentScore
+	// Re-score with full formula: (0.5*similarity + 0.3*relevance + 0.2*parentScore) * categoryBoost
 	var results []SearchResult
 	for _, r := range seen {
 		ps := parentScores[r.Node.ParentURI]
-		r.Score = 0.5*r.Similarity + 0.3*r.Node.Relevance + 0.2*ps
+		r.Score = (0.5*r.Similarity + 0.3*r.Node.Relevance + 0.2*ps) * categoryBoost(r.Node.Category)
 		results = append(results, r)
 	}
 

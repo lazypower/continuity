@@ -22,6 +22,7 @@ var (
 var validCategorySet = map[string]bool{
 	"profile": true, "preferences": true, "entities": true,
 	"events": true, "patterns": true, "cases": true,
+	"moments": true,
 }
 
 var rememberCmd = &cobra.Command{
@@ -38,7 +39,7 @@ Example:
 }
 
 func init() {
-	rememberCmd.Flags().StringVarP(&rememberCategory, "category", "c", "", "Memory category (required: profile, preferences, entities, events, patterns, cases)")
+	rememberCmd.Flags().StringVarP(&rememberCategory, "category", "c", "", "Memory category (required: profile, preferences, entities, events, patterns, cases, moments)")
 	rememberCmd.Flags().StringVarP(&rememberName, "name", "n", "", "URI slug name (required)")
 	rememberCmd.Flags().StringVarP(&rememberSummary, "summary", "s", "", "L0 abstract — one sentence, max 200 chars (required)")
 	rememberCmd.Flags().StringVarP(&rememberBody, "body", "b", "", "L1 overview — max 2000 chars, compress detail aggressively (required)")

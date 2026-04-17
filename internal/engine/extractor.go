@@ -41,6 +41,7 @@ func ownerForCategory(category string) string {
 var validCategories = map[string]bool{
 	"profile": true, "preferences": true, "entities": true,
 	"events": true, "patterns": true, "cases": true,
+	"moments": true,
 }
 
 // findSimilarNode searches existing nodes for one semantically similar to the given

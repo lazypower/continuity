@@ -175,6 +175,63 @@ func TestSearchFallsBackToFind(t *testing.T) {
 	}
 }
 
+func TestCategoryBoost(t *testing.T) {
+	if got := categoryBoost("moments"); got != 1.3 {
+		t.Errorf("categoryBoost(moments) = %f, want 1.3", got)
+	}
+	if got := categoryBoost("profile"); got != 1.0 {
+		t.Errorf("categoryBoost(profile) = %f, want 1.0", got)
+	}
+	if got := categoryBoost("events"); got != 1.0 {
+		t.Errorf("categoryBoost(events) = %f, want 1.0", got)
+	}
+}
+
+func TestFindMomentsBoost(t *testing.T) {
+	db := testDB(t)
+
+	// Create a moment and an event with similar content
+	moment := &store.MemNode{
+		URI: "mem://user/moments/gift", NodeType: "leaf", Category: "moments",
+		L0Abstract: "walked through reflections then presented a spec as a gift",
+	}
+	event := &store.MemNode{
+		URI: "mem://user/events/spec-created", NodeType: "leaf", Category: "events",
+		L0Abstract: "walked through reflections then created a specification",
+	}
+	db.CreateNode(moment)
+	db.CreateNode(event)
+
+	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedTestNodes(t, db, embedder, []*store.MemNode{moment, event})
+
+	ctx := context.Background()
+	results, err := Find(ctx, db, embedder, "reflections spec gift", SearchOpts{Limit: 5})
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+
+	if len(results) < 2 {
+		t.Fatalf("expected at least 2 results, got %d", len(results))
+	}
+
+	// The moment should score higher than the event due to 1.3x boost
+	// (assuming similar base similarity since content is nearly identical)
+	var momentScore, eventScore float64
+	for _, r := range results {
+		if r.Node.Category == "moments" {
+			momentScore = r.Score
+		}
+		if r.Node.Category == "events" {
+			eventScore = r.Score
+		}
+	}
+
+	if momentScore <= eventScore {
+		t.Errorf("moment score (%f) should be > event score (%f) due to category boost", momentScore, eventScore)
+	}
+}
+
 func TestParseSubQueries(t *testing.T) {
 	tests := []struct {
 		input string

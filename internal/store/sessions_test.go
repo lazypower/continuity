@@ -183,6 +183,60 @@ func TestGetRecentSessions(t *testing.T) {
 	// Limit works — 3 inserted, 2 returned
 }
 
+func TestSetSessionTone(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	db.InitSession("sess-001", "proj")
+
+	if err := db.SetSessionTone("sess-001", "flow state, sharp pivots"); err != nil {
+		t.Fatalf("SetSessionTone: %v", err)
+	}
+
+	s, _ := db.GetSession("sess-001")
+	if s.Tone == nil {
+		t.Fatal("expected tone to be set, got nil")
+	}
+	if *s.Tone != "flow state, sharp pivots" {
+		t.Errorf("Tone = %q, want %q", *s.Tone, "flow state, sharp pivots")
+	}
+}
+
+func TestSessionToneNilByDefault(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	s, _ := db.InitSession("sess-001", "proj")
+	if s.Tone != nil {
+		t.Errorf("expected nil tone on new session, got %q", *s.Tone)
+	}
+}
+
+func TestSessionToneInRecentSessions(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	db.InitSession("sess-001", "proj")
+	db.SetSessionTone("sess-001", "grind into breakthrough")
+
+	sessions, _ := db.GetRecentSessions(5)
+	if len(sessions) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(sessions))
+	}
+	if sessions[0].Tone == nil || *sessions[0].Tone != "grind into breakthrough" {
+		t.Errorf("tone not preserved in GetRecentSessions")
+	}
+}
+
 func TestIncrementToolCount(t *testing.T) {
 	db, err := OpenMemory()
 	if err != nil {

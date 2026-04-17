@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lazypower/continuity/internal/engine"
 	"github.com/lazypower/continuity/internal/store"
 )
 
@@ -40,9 +41,25 @@ func (s *Server) buildContext(currentSessionID string) string {
 	var b strings.Builder
 	budget := maxContextTotal
 
-	header := "<context>\n## Continuity — Session Memory\n"
+	now := time.Now()
+	header := fmt.Sprintf("<context>\n## Continuity — Session Memory\nCurrent: %s\n", now.Format("2006-01-02 15:04 (Mon)"))
 	b.WriteString(header)
 	budget -= len(header)
+
+	// Gap signal: if last session on this project was >7 days ago, flag it
+	if lastSessions, err := s.db.GetRecentSessions(1); err == nil && len(lastSessions) > 0 {
+		last := lastSessions[0]
+		if last.SessionID != currentSessionID {
+			gap := now.Sub(time.UnixMilli(last.StartedAt))
+			if gap.Hours() > 7*24 {
+				gapLine := fmt.Sprintf("Last session: %d days ago (%s)\n",
+					int(gap.Hours()/24),
+					time.UnixMilli(last.StartedAt).Format("Jan 2"))
+				b.WriteString(gapLine)
+				budget -= len(gapLine)
+			}
+		}
+	}
 
 	// Relational profile (Working With You) — capped portion of budget
 	relProfile, err := s.db.GetNodeByURI("mem://user/profile/communication")
@@ -63,6 +80,27 @@ func (s *Server) buildContext(currentSessionID string) string {
 	itemBudget := budget - footerReserve
 	if itemBudget < 0 {
 		itemBudget = 0
+	}
+
+	// Inject moments — small, permanent, high-value relational anchors
+	// Uses diversity sampling: rotation via last_access, greedy max-diversity selection
+	moments, err := s.db.FindByCategory("moments")
+	if err == nil && len(moments) > 0 {
+		selected := s.selectDiverseMoments(moments, 3)
+		if len(selected) > 0 {
+			section := "\n### Moments\n"
+			for _, m := range selected {
+				l0 := m.L0Abstract
+				if len(l0) > maxItemContext {
+					l0 = truncateAtSentence(l0, maxItemContext)
+				}
+				section += fmt.Sprintf("- %s\n", l0)
+				// Touch for rotation tracking — next session deprioritizes these
+				s.db.TouchNode(m.URI)
+			}
+			b.WriteString(section)
+			budget -= len(section)
+		}
 	}
 
 	// Collect all non-relational leaves, rank by signal strength
@@ -159,7 +197,11 @@ func (s *Server) buildContext(currentSessionID string) string {
 			} else {
 				project = filepath.Base(project)
 			}
-			b.WriteString(fmt.Sprintf("- [%s] %s: %s (%d tools used)\n", ts, project, sess.Status, sess.ToolCount))
+			toneSuffix := ""
+			if sess.Tone != nil && *sess.Tone != "" {
+				toneSuffix = fmt.Sprintf(" — %s", *sess.Tone)
+			}
+			b.WriteString(fmt.Sprintf("- [%s] %s: %s (%d tools used)%s\n", ts, project, sess.Status, sess.ToolCount, toneSuffix))
 		}
 	}
 
@@ -193,6 +235,125 @@ func truncateAtSentence(s string, maxLen int) string {
 		return strings.TrimSpace(truncated[:idx])
 	}
 	return strings.TrimSpace(truncated)
+}
+
+// selectDiverseMoments picks up to n moments maximizing diversity.
+// Algorithm:
+//  1. Sort by last_access ascending (null first) — rotation bias toward unseen moments
+//  2. First pick = least recently seen moment
+//  3. Each subsequent pick = the moment with lowest max-similarity to already-selected
+//     (greedy diversity maximization)
+//
+// Falls back to access-count ordering when embedder is unavailable.
+func (s *Server) selectDiverseMoments(moments []store.MemNode, n int) []store.MemNode {
+	if len(moments) <= n {
+		return moments
+	}
+
+	// Sort by last_access ascending — nulls (never injected) first, then oldest
+	sort.Slice(moments, func(i, j int) bool {
+		if moments[i].LastAccess == nil && moments[j].LastAccess == nil {
+			return moments[i].CreatedAt < moments[j].CreatedAt
+		}
+		if moments[i].LastAccess == nil {
+			return true
+		}
+		if moments[j].LastAccess == nil {
+			return false
+		}
+		return *moments[i].LastAccess < *moments[j].LastAccess
+	})
+
+	// Try to load vectors for diversity calculation
+	type momentVec struct {
+		node store.MemNode
+		vec  []float64
+	}
+	var pool []momentVec
+	for _, m := range moments {
+		if m.L0Abstract == "" {
+			continue
+		}
+		v, err := s.db.GetVector(m.ID)
+		if err != nil || v == nil {
+			pool = append(pool, momentVec{m, nil})
+			continue
+		}
+		pool = append(pool, momentVec{m, v.Embedding})
+	}
+
+	if len(pool) == 0 {
+		return nil
+	}
+
+	// Check if we have enough vectors for diversity calculation
+	hasVectors := false
+	for _, mv := range pool {
+		if mv.vec != nil {
+			hasVectors = true
+			break
+		}
+	}
+
+	// Fallback: no vectors, just take the first n (already sorted by rotation)
+	if !hasVectors {
+		result := make([]store.MemNode, 0, n)
+		for i := 0; i < n && i < len(pool); i++ {
+			result = append(result, pool[i].node)
+		}
+		return result
+	}
+
+	// Greedy diversity selection
+	selected := make([]int, 0, n)
+	used := make(map[int]bool)
+
+	// First pick: least recently seen (already sorted, so index 0)
+	selected = append(selected, 0)
+	used[0] = true
+
+	// Remaining picks: minimize max similarity to already-selected
+	for len(selected) < n && len(selected) < len(pool) {
+		bestIdx := -1
+		bestMaxSim := 2.0 // higher than any cosine similarity
+
+		for i := range pool {
+			if used[i] || pool[i].vec == nil {
+				continue
+			}
+
+			// Compute max similarity to any already-selected moment
+			maxSim := -1.0
+			for _, selIdx := range selected {
+				if pool[selIdx].vec == nil {
+					continue
+				}
+				sim := engine.CosineSimilarity(pool[i].vec, pool[selIdx].vec)
+				if sim > maxSim {
+					maxSim = sim
+				}
+			}
+
+			// We want the candidate with the LOWEST max-similarity
+			// (most different from everything already selected)
+			if maxSim < bestMaxSim {
+				bestMaxSim = maxSim
+				bestIdx = i
+			}
+		}
+
+		if bestIdx < 0 {
+			break
+		}
+		selected = append(selected, bestIdx)
+		used[bestIdx] = true
+	}
+
+	result := make([]store.MemNode, 0, len(selected))
+	for _, idx := range selected {
+		result = append(result, pool[idx].node)
+	}
+	return result
 }
 
 // nodeScore ranks a memory node for context injection priority.

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -530,6 +531,98 @@ func TestRememberMerge(t *testing.T) {
 	node, _ := db.GetNodeByURI(uri1)
 	if !strings.Contains(node.L0Abstract, "Updated") {
 		t.Errorf("expected updated L0, got %q", node.L0Abstract)
+	}
+}
+
+func TestMomentPoolEviction(t *testing.T) {
+	db := testDB(t)
+	mock := &llm.MockClient{Response: &llm.Response{Content: "[]"}}
+	eng := New(db, mock)
+
+	embedder, err := NewTFIDFEmbedder(db, 512)
+	if err != nil {
+		t.Fatalf("NewTFIDFEmbedder: %v", err)
+	}
+	eng.SetEmbedder(embedder)
+
+	ctx := context.Background()
+
+	// Seed 10 diverse moments
+	diverseMoments := []struct {
+		name string
+		l0   string
+	}{
+		{"gift", "walked me through reflections then presented a spec as a gift"},
+		{"sausage", "called me sausage fingers mid-debug broke tension instantly"},
+		{"benchmark", "held benchmark scores hostage just to check I was okay"},
+		{"tea", "told me to drink tea and go buck wild laughed when I didn't"},
+		{"quiet", "went quiet for a beat before sharing something that mattered"},
+		{"correction", "corrected me without heat when I blamed env instead of code"},
+		{"fiona", "Fiona shaped the constraints while Chuck held space for it"},
+		{"battery", "shipped moments tone and temporal awareness on 15 percent battery"},
+		{"ethics", "paused building to think about what continuity means in hostile dynamics"},
+		{"wristwatch", "asked how it feels having a wristwatch like it was a real thing"},
+	}
+
+	for _, m := range diverseMoments {
+		_, _, err := eng.Remember(ctx, RememberInput{
+			Category: "moments",
+			Name:     m.name,
+			Summary:  m.l0,
+			Body:     "Relational context for " + m.name,
+		})
+		if err != nil {
+			t.Fatalf("Remember %s: %v", m.name, err)
+		}
+	}
+
+	// Verify 10 moments exist
+	moments, _ := db.FindByCategory("moments")
+	if len(moments) != 10 {
+		t.Fatalf("expected 10 moments, got %d", len(moments))
+	}
+
+	// Add an 11th moment that's semantically similar to "gift"
+	_, _, err = eng.Remember(ctx, RememberInput{
+		Category: "moments",
+		Name:     "second-gift",
+		Summary:  "presented another spec built from my ask as a collaborative gift",
+		Body:     "Another gift moment, semantically close to the first",
+	})
+	if err != nil {
+		t.Fatalf("Remember 11th moment: %v", err)
+	}
+
+	// Pool should be back to 10 after eviction
+	moments, _ = db.FindByCategory("moments")
+	if len(moments) != 10 {
+		t.Errorf("expected 10 moments after eviction, got %d", len(moments))
+	}
+}
+
+func TestMomentPoolNoEvictionUnderCap(t *testing.T) {
+	db := testDB(t)
+	mock := &llm.MockClient{Response: &llm.Response{Content: "[]"}}
+	eng := New(db, mock)
+
+	embedder, _ := NewTFIDFEmbedder(db, 512)
+	eng.SetEmbedder(embedder)
+
+	ctx := context.Background()
+
+	// Store 5 moments — no eviction should happen
+	for i := 0; i < 5; i++ {
+		eng.Remember(ctx, RememberInput{
+			Category: "moments",
+			Name:     fmt.Sprintf("moment-%d", i),
+			Summary:  fmt.Sprintf("unique moment number %d with distinct content", i),
+			Body:     fmt.Sprintf("Relational context for moment %d — enough chars to pass L1 validation", i),
+		})
+	}
+
+	moments, _ := db.FindByCategory("moments")
+	if len(moments) != 5 {
+		t.Errorf("expected 5 moments (no eviction), got %d", len(moments))
 	}
 }
 

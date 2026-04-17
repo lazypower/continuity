@@ -27,8 +27,8 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 5 {
-		t.Errorf("SchemaVersion = %d, want 5", v)
+	if v != 7 {
+		t.Errorf("SchemaVersion = %d, want 7", v)
 	}
 }
 
@@ -128,8 +128,51 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 5 {
-		t.Errorf("SchemaVersion after re-migrate = %d, want 5", v)
+	if v != 7 {
+		t.Errorf("SchemaVersion after re-migrate = %d, want 7", v)
+	}
+}
+
+func TestMomentsCategory(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	// moments is a valid category after migration 6
+	_, err = db.Exec(`
+		INSERT INTO mem_nodes (uri, node_type, category, created_at, updated_at)
+		VALUES ('mem://user/moments/first-gift', 'leaf', 'moments', 1000, 1000)
+	`)
+	if err != nil {
+		t.Fatalf("moments category insert failed: %v", err)
+	}
+}
+
+func TestSessionToneColumn(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	// tone column exists and is nullable after migration 7
+	_, err = db.Exec(`
+		INSERT INTO sessions (session_id, started_at, status, tone)
+		VALUES ('sess-tone', 1000, 'active', 'flow state, sharp pivots')
+	`)
+	if err != nil {
+		t.Fatalf("session with tone insert failed: %v", err)
+	}
+
+	// null tone is also valid
+	_, err = db.Exec(`
+		INSERT INTO sessions (session_id, started_at, status)
+		VALUES ('sess-no-tone', 1000, 'active')
+	`)
+	if err != nil {
+		t.Fatalf("session without tone insert failed: %v", err)
 	}
 }
 

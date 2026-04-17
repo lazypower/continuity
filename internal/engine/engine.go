@@ -9,6 +9,7 @@ import (
 
 	"github.com/lazypower/continuity/internal/llm"
 	"github.com/lazypower/continuity/internal/store"
+	"github.com/lazypower/continuity/internal/transcript"
 )
 
 // Engine orchestrates memory extraction, relational profiling, and decay.
@@ -310,7 +311,95 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 		}
 	}
 
+	// Moments pool cap: evict most redundant when pool exceeds 10
+	if c.Category == "moments" && e.Embedder != nil {
+		if evicted, err := e.evictRedundantMoment(ctx); err != nil {
+			log.Printf("remember: moment eviction failed: %v", err)
+		} else if evicted != "" {
+			log.Printf("remember: evicted redundant moment %s", evicted)
+		}
+	}
+
 	return uri, created, nil
+}
+
+const maxMoments = 10
+
+// evictRedundantMoment checks the moments pool size and removes the most
+// semantically redundant moment if the pool exceeds maxMoments. Redundancy
+// is measured by average cosine similarity to all other moments — the moment
+// most "covered" by the rest gets evicted.
+// Returns the URI of the evicted moment, or empty string if no eviction needed.
+func (e *Engine) evictRedundantMoment(ctx context.Context) (string, error) {
+	moments, err := e.DB.FindByCategory("moments")
+	if err != nil {
+		return "", fmt.Errorf("find moments: %w", err)
+	}
+	if len(moments) <= maxMoments {
+		return "", nil
+	}
+
+	// Ensure all moments are embedded
+	for i := range moments {
+		if moments[i].L0Abstract == "" {
+			continue
+		}
+		existing, _ := e.DB.GetVector(moments[i].ID)
+		if existing != nil {
+			continue
+		}
+		if err := e.EmbedNode(ctx, &moments[i]); err != nil {
+			log.Printf("evict: embed %s: %v", moments[i].URI, err)
+		}
+	}
+
+	// Load vectors for all moments
+	type momentVec struct {
+		node store.MemNode
+		vec  []float64
+	}
+	var pool []momentVec
+	for _, m := range moments {
+		v, err := e.DB.GetVector(m.ID)
+		if err != nil || v == nil {
+			continue
+		}
+		pool = append(pool, momentVec{m, v.Embedding})
+	}
+
+	if len(pool) <= maxMoments {
+		return "", nil // not enough embedded moments to evict
+	}
+
+	// Compute average similarity for each moment against all others
+	var mostRedundantIdx int
+	highestAvgSim := -1.0
+
+	for i := range pool {
+		var totalSim float64
+		for j := range pool {
+			if i == j {
+				continue
+			}
+			totalSim += CosineSimilarity(pool[i].vec, pool[j].vec)
+		}
+		avgSim := totalSim / float64(len(pool)-1)
+		if avgSim > highestAvgSim {
+			highestAvgSim = avgSim
+			mostRedundantIdx = i
+		}
+	}
+
+	// Evict the most redundant
+	evictURI := pool[mostRedundantIdx].node.URI
+	if err := e.DB.DeleteNode(pool[mostRedundantIdx].node.ID); err != nil {
+		return "", fmt.Errorf("delete redundant moment: %w", err)
+	}
+
+	// Clean up orphaned directory nodes
+	e.DB.DeleteOrphanDirs()
+
+	return evictURI, nil
 }
 
 // mergeableCategory returns whether the given category supports in-place merging.
@@ -385,6 +474,45 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 	return nil
 }
 
+// extractTone runs tone extraction for a session and stores the result.
+func extractTone(db *store.DB, client llm.Client, sessionID, transcriptPath string) error {
+	entries, err := transcript.ParseFile(transcriptPath)
+	if err != nil {
+		return fmt.Errorf("parse transcript: %w", err)
+	}
+
+	condensed := transcript.Condense(entries)
+	if len(condensed) < 100 {
+		return nil // too short for meaningful tone
+	}
+
+	prompt := llm.TonePrompt(condensed)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	resp, err := client.Complete(ctx, prompt)
+	if err != nil {
+		return fmt.Errorf("llm tone extraction: %w", err)
+	}
+
+	tone := strings.TrimSpace(resp.Content)
+	// Strip quotes if LLM wraps it
+	tone = strings.Trim(tone, "\"'`")
+	tone = strings.TrimSpace(tone)
+
+	if tone == "" || len(tone) > 200 {
+		log.Printf("tone: rejecting for %s — empty or too long (%d chars)", sessionID, len(tone))
+		return nil
+	}
+
+	if err := db.SetSessionTone(sessionID, tone); err != nil {
+		return fmt.Errorf("store tone: %w", err)
+	}
+	log.Printf("tone: %s → %q", sessionID, tone)
+	return nil
+}
+
 // ExtractSession runs the full extraction pipeline for a completed session.
 // This is designed to be called asynchronously (in a goroutine).
 // Idempotent: skips sessions that have already been extracted.
@@ -409,6 +537,10 @@ func (e *Engine) ExtractSession(sessionID, transcriptPath string) error {
 
 	if err := extractRelational(e.DB, e.LLM, sessionID, transcriptPath); err != nil {
 		return fmt.Errorf("relational extraction: %w", err)
+	}
+
+	if err := extractTone(e.DB, e.LLM, sessionID, transcriptPath); err != nil {
+		log.Printf("tone extraction failed (non-fatal): %v", err)
 	}
 
 	// Mark as extracted so we don't re-process
