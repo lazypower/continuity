@@ -30,11 +30,23 @@ Your memory lives in continuity. Reach for it naturally:
 Before searching the codebase for prior decisions, conventions, or context — check continuity first. If you learn something worth keeping, store it immediately.
 `
 
+var initAutostart bool
+
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Set up Claude Code integration",
-	Long:  "Idempotently appends continuity's behavioral directives to ~/.claude/CLAUDE.md so Claude Code uses continuity for memory instead of the built-in markdown system.",
-	RunE:  runInit,
+	Long: `Idempotently appends continuity's behavioral directives to ~/.claude/CLAUDE.md
+so Claude Code uses continuity for memory instead of the built-in markdown system.
+
+With --autostart, enables automatic server launch when the SessionStart hook
+detects the server is down. Without --autostart, disables autostart if it was
+previously enabled.`,
+	RunE: runInit,
+}
+
+func init() {
+	initCmd.Flags().BoolVar(&initAutostart, "autostart", false,
+		"Enable automatic server launch when hooks detect the server is down")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -43,15 +55,14 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("find home directory: %w", err)
 	}
 
+	// --- CLAUDE.md directives ---
 	claudeDir := filepath.Join(homeDir, ".claude")
 	claudeMD := filepath.Join(claudeDir, "CLAUDE.md")
 
-	// Ensure ~/.claude/ exists
 	if err := os.MkdirAll(claudeDir, 0755); err != nil {
 		return fmt.Errorf("create %s: %w", claudeDir, err)
 	}
 
-	// Read existing content (may not exist yet)
 	existing, err := os.ReadFile(claudeMD)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("read %s: %w", claudeMD, err)
@@ -59,26 +70,44 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	content := string(existing)
 
-	// Already initialized?
 	if strings.Contains(content, claudeMDMarker) {
 		fmt.Printf("Already initialized: %s\n", claudeMD)
-		return nil
+	} else {
+		if len(content) > 0 && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		if len(content) > 0 {
+			content += "\n"
+		}
+		content += claudeMDDirective
+
+		if err := os.WriteFile(claudeMD, []byte(content), 0644); err != nil {
+			return fmt.Errorf("write %s: %w", claudeMD, err)
+		}
+
+		fmt.Printf("Initialized: %s\n", claudeMD)
+		fmt.Println("Claude Code will now use continuity for memory in all sessions.")
 	}
 
-	// Append directive block
-	if len(content) > 0 && !strings.HasSuffix(content, "\n") {
-		content += "\n"
-	}
-	if len(content) > 0 {
-		content += "\n"
-	}
-	content += claudeMDDirective
+	// --- Autostart marker ---
+	autostartPath := filepath.Join(homeDir, ".continuity", "autostart")
 
-	if err := os.WriteFile(claudeMD, []byte(content), 0644); err != nil {
-		return fmt.Errorf("write %s: %w", claudeMD, err)
+	if initAutostart {
+		if err := os.MkdirAll(filepath.Dir(autostartPath), 0755); err != nil {
+			return fmt.Errorf("create .continuity dir: %w", err)
+		}
+		if err := os.WriteFile(autostartPath, []byte("enabled\n"), 0644); err != nil {
+			return fmt.Errorf("write autostart marker: %w", err)
+		}
+		fmt.Println("Autostart enabled: continuity serve will launch automatically when needed.")
+		fmt.Println("  The server persists as a background process until stopped or reboot.")
+		fmt.Println("  Stop: pkill continuity  |  Logs: ~/.continuity/serve.log")
+	} else {
+		if err := os.Remove(autostartPath); err == nil {
+			fmt.Println("Autostart disabled.")
+		}
+		// If file didn't exist, nothing to report
 	}
 
-	fmt.Printf("Initialized: %s\n", claudeMD)
-	fmt.Println("Claude Code will now use continuity for memory in all sessions.")
 	return nil
 }

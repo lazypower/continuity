@@ -58,6 +58,19 @@ continuity serve
 #   embedder: tfidf (fallback)
 ```
 
+**Or: enable autostart** so the server launches automatically when Claude Code needs it:
+
+```bash
+continuity init --autostart
+```
+
+> **Process lifecycle notice:** With `--autostart`, the SessionStart hook launches `continuity serve` as a detached background process when it detects the server isn't running. This process **persists after your Claude Code session ends** — it runs until explicitly stopped, the machine reboots, or you disable autostart. We never start background processes without your explicit opt-in.
+>
+> - Disable autostart: `continuity init` (without `--autostart`)
+> - Stop the server: `pkill continuity` or `kill $(lsof -ti :37777)`
+> - Logs: `~/.continuity/serve.log`
+> - For proper process management (start on boot, auto-restart, log rotation), use `continuity install-service` instead (coming soon).
+
 **2. Add hooks to Claude Code**
 
 Drop this in `~/.claude/settings.json`:
@@ -196,7 +209,7 @@ For embeddings: Ollama with `nomic-embed-text` if available, otherwise falls bac
 
 ```
 continuity serve       Start the HTTP API server
-continuity init        Set up Claude Code integration (~/.claude/CLAUDE.md)
+continuity init [--autostart]  Set up Claude Code integration + optional autostart
 continuity hook <evt>  Handle Claude Code hook events
 continuity search      Search memories by query
 continuity remember    Store a memory directly (no LLM needed)

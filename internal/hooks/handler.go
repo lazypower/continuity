@@ -25,10 +25,15 @@ func Handle(event string, stdin io.Reader) {
 	// Check server health — degrade gracefully if down
 	if !client.Healthy() {
 		if event == "start" {
-			WriteSessionStartOutput("")
-			return
+			if TryAutostart() {
+				// Server now healthy — fall through to handleStart
+			} else {
+				WriteSessionStartOutput("")
+				return
+			}
+		} else {
+			return // silent exit for other events
 		}
-		return // silent exit for other events
 	}
 
 	switch event {
