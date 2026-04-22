@@ -166,6 +166,40 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "processing"})
 }
 
+func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
+	uri := r.URL.Query().Get("uri")
+	if uri == "" {
+		http.Error(w, `{"error":"uri parameter required"}`, http.StatusBadRequest)
+		return
+	}
+
+	node, err := s.db.GetNodeByURI(uri)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	if node == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "memory not found: " + uri})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"uri":         node.URI,
+		"category":    node.Category,
+		"node_type":   node.NodeType,
+		"summary":     node.L0Abstract,
+		"body":        node.L1Overview,
+		"detail":      node.L2Content,
+		"relevance":   node.Relevance,
+		"created_at":  node.CreatedAt,
+		"updated_at":  node.UpdatedAt,
+		"access_count": node.AccessCount,
+	})
+}
+
 func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Category  string `json:"category"`

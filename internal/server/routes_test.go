@@ -238,6 +238,68 @@ func TestRememberRouteUpdate(t *testing.T) {
 	}
 }
 
+func TestGetMemoryRoute(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	// Seed a memory via POST
+	body := `{"category":"patterns","name":"test-journal","summary":"tiny test","body":"section A\n- entry 1\n\nsection B\n- entry 2\n"}`
+	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("seed: status = %d, want %d", w.Code, http.StatusCreated)
+	}
+
+	// Read it back
+	req = httptest.NewRequest("GET", "/api/memories?uri=mem://agent/patterns/test-journal", nil)
+	w = httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["uri"] != "mem://agent/patterns/test-journal" {
+		t.Errorf("uri = %v, want mem://agent/patterns/test-journal", resp["uri"])
+	}
+	if resp["summary"] != "tiny test" {
+		t.Errorf("summary = %v, want tiny test", resp["summary"])
+	}
+	gotBody, _ := resp["body"].(string)
+	if !strings.Contains(gotBody, "section A") || !strings.Contains(gotBody, "section B") {
+		t.Errorf("body did not preserve both sections: %q", gotBody)
+	}
+	if resp["category"] != "patterns" {
+		t.Errorf("category = %v, want patterns", resp["category"])
+	}
+}
+
+func TestGetMemoryRouteNotFound(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	req := httptest.NewRequest("GET", "/api/memories?uri=mem://agent/patterns/does-not-exist", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
+	}
+}
+
+func TestGetMemoryRouteMissingURI(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	req := httptest.NewRequest("GET", "/api/memories", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
 func TestRememberRouteNoEngine(t *testing.T) {
 	srv := testServer(t) // engine is nil
 
