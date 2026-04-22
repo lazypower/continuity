@@ -44,13 +44,17 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
+	defer r.Close()
+
 	orig := os.Stdout
 	os.Stdout = w
+	defer func() { os.Stdout = orig }()
+	defer w.Close()
 
 	runErr := fn()
 
+	// Close the write end before reading so io.ReadAll sees EOF.
 	w.Close()
-	os.Stdout = orig
 
 	out, _ := io.ReadAll(r)
 	return string(out), runErr
@@ -250,6 +254,11 @@ func TestShowNotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not found") {
 		t.Errorf("error should mention 'not found', got: %v", err)
+	}
+	// Assert we got the clean server-side error, not the raw transport wrap
+	// ("show: GET /api/memories?...: status 404: {...}").
+	if strings.Contains(err.Error(), "status 404") || strings.HasPrefix(err.Error(), "show: GET") {
+		t.Errorf("expected clean error message, got noisy transport wrap: %v", err)
 	}
 }
 

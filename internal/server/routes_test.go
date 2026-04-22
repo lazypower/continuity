@@ -260,7 +260,9 @@ func TestGetMemoryRoute(t *testing.T) {
 	}
 
 	var resp map[string]any
-	json.Unmarshal(w.Body.Bytes(), &resp)
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v\n%s", err, w.Body.String())
+	}
 	if resp["uri"] != "mem://agent/patterns/test-journal" {
 		t.Errorf("uri = %v, want mem://agent/patterns/test-journal", resp["uri"])
 	}

@@ -169,13 +169,17 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	uri := r.URL.Query().Get("uri")
 	if uri == "" {
-		http.Error(w, `{"error":"uri parameter required"}`, http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "uri parameter required"})
 		return
 	}
 
 	node, err := s.db.GetNodeByURI(uri)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	if node == nil {
