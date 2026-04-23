@@ -13,9 +13,26 @@
   let { uri, category, l0_abstract, l1_overview, relevance, score }: Props = $props();
 
   let expanded = $state(false);
+  let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
 
   function toggle() {
     expanded = !expanded;
+  }
+
+  async function copyBody(event: MouseEvent | KeyboardEvent) {
+    event.stopPropagation();
+    if (!l1_overview) return;
+    try {
+      await navigator.clipboard.writeText(l1_overview);
+      copyState = 'copied';
+    } catch {
+      copyState = 'failed';
+    }
+    clearTimeout(copyResetTimer);
+    copyResetTimer = setTimeout(() => {
+      copyState = 'idle';
+    }, 1500);
   }
 
   function categoryColor(cat: string): string {
@@ -98,7 +115,29 @@
 
     {#if expanded && l1_overview}
       <div class="mt-3 pt-3 border-t border-[var(--border)] expand-enter">
-        <p class="text-sm text-[var(--text-secondary)] whitespace-pre-wrap leading-relaxed">{l1_overview}</p>
+        <div class="flex items-start justify-between gap-3">
+          <!--
+            Clicks inside the expanded body must not bubble to the card's
+            toggle handler, or text selection / double-click gestures would
+            collapse the card mid-drag. Keyboard users still toggle via the
+            card's role="button" + Enter handler on the outer container.
+          -->
+          <p
+            class="body-text text-sm text-[var(--text-secondary)] whitespace-pre-wrap leading-relaxed flex-1"
+            onclick={(e) => e.stopPropagation()}
+            onkeydown={(e) => e.stopPropagation()}
+            onmousedown={(e) => e.stopPropagation()}
+            role="presentation"
+          >{l1_overview}</p>
+          <button
+            type="button"
+            class="copy-btn shrink-0 text-xs font-mono px-2 py-1 rounded border border-[var(--border)] hover:border-[var(--border-hover)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+            onclick={copyBody}
+            aria-label="Copy memory body to clipboard"
+          >
+            {copyState === 'copied' ? 'copied' : copyState === 'failed' ? 'failed' : 'copy'}
+          </button>
+        </div>
       </div>
     {/if}
   </div>
@@ -142,5 +181,22 @@
 
   .card-container.expanded .expand-icon {
     transform: rotate(45deg);
+  }
+
+  /*
+   * Expanded body text must be selectable so operators can copy it natively.
+   * The parent card is cursor-pointer; reset to a text caret here so the
+   * affordance is legible.
+   */
+  .body-text {
+    user-select: text;
+    -webkit-user-select: text;
+    cursor: text;
+  }
+
+  .copy-btn {
+    cursor: pointer;
+    background: transparent;
+    transition: border-color 150ms ease, color 150ms ease;
   }
 </style>
