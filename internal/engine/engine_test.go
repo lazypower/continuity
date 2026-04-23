@@ -640,3 +640,125 @@ func (m *multiResponseMock) Complete(ctx context.Context, prompt string) (*llm.R
 	m.callIdx++
 	return resp, nil
 }
+
+// TestExtractSessionGateSkipsWithoutMarking verifies the bug fix for issue
+// #2: when the transcript is too small to extract from, ExtractSession must
+// return without setting extracted_at, so a later Stop/SessionEnd can try
+// again once the conversation has grown.
+func TestExtractSessionGateSkipsWithoutMarking(t *testing.T) {
+	db := testDB(t)
+	mock := &llm.MockClient{
+		Response: &llm.Response{Content: "[]", Provider: "mock"},
+	}
+
+	// Two user messages — below the 3-message gate.
+	path := writeTranscript(t, []map[string]any{
+		{"type": "user", "message": map[string]any{"role": "user", "content": "Help me with a thing please"}},
+		{"type": "assistant", "message": map[string]any{"role": "assistant", "content": "Sure, what do you need?"}},
+		{"type": "user", "message": map[string]any{"role": "user", "content": "Never mind, bye"}},
+	})
+
+	// Seed the session row so GetSession returns non-nil.
+	if _, err := db.InitSession("gate-test", "test"); err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
+
+	eng := New(db, mock)
+	if err := eng.ExtractSession("gate-test", path); err != nil {
+		t.Fatalf("ExtractSession: %v", err)
+	}
+
+	// LLM must not have been called — gate should trip before any extractor runs.
+	if len(mock.Calls) != 0 {
+		t.Errorf("expected 0 LLM calls for sub-threshold transcript, got %d", len(mock.Calls))
+	}
+
+	// Critical: session must NOT be marked extracted, so later hooks get
+	// another chance once the conversation grows past the threshold.
+	sess, err := db.GetSession("gate-test")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess == nil {
+		t.Fatal("expected session to exist")
+	}
+	if sess.ExtractedAt != nil {
+		t.Errorf("expected extracted_at=nil after gate skip, got %v", *sess.ExtractedAt)
+	}
+}
+
+// TestExtractSessionMarksWhenGatePasses confirms the happy path still marks
+// extracted_at once real extraction runs — guards against overcorrecting the
+// above fix.
+func TestExtractSessionMarksWhenGatePasses(t *testing.T) {
+	db := testDB(t)
+
+	mock := &multiResponseMock{
+		responses: []*llm.Response{
+			{Content: `[{"category":"preferences","uri_hint":"go-style","l0":"Uses Go","l1":"Prefers Go","l2":""}]`, Provider: "mock"},
+			{Content: "NO_UPDATE", Provider: "mock"},
+			{Content: "focused", Provider: "mock"},
+		},
+	}
+
+	if _, err := db.InitSession("passes-gate", "test"); err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
+
+	eng := New(db, mock)
+	if err := eng.ExtractSession("passes-gate", makeTranscript(t)); err != nil {
+		t.Fatalf("ExtractSession: %v", err)
+	}
+
+	sess, err := db.GetSession("passes-gate")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.ExtractedAt == nil {
+		t.Error("expected extracted_at to be set after successful extraction")
+	}
+}
+
+// TestExtractSessionForceBypassesIdempotency confirms --force re-runs
+// extraction on a session that was already marked.
+func TestExtractSessionForceBypassesIdempotency(t *testing.T) {
+	db := testDB(t)
+
+	if _, err := db.InitSession("already-extracted", "test"); err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
+	if err := db.MarkExtracted("already-extracted"); err != nil {
+		t.Fatalf("MarkExtracted: %v", err)
+	}
+
+	mock := &multiResponseMock{
+		responses: []*llm.Response{
+			{Content: `[{"category":"preferences","uri_hint":"reforced","l0":"Got reforced","l1":"reforced body content here","l2":""}]`, Provider: "mock"},
+			{Content: "NO_UPDATE", Provider: "mock"},
+			{Content: "focused", Provider: "mock"},
+		},
+	}
+	eng := New(db, mock)
+
+	// Without force: should skip.
+	if err := eng.ExtractSession("already-extracted", makeTranscript(t)); err != nil {
+		t.Fatalf("ExtractSession: %v", err)
+	}
+	if mock.callIdx != 0 {
+		t.Errorf("expected 0 LLM calls under idempotency, got %d", mock.callIdx)
+	}
+
+	// With force: should run.
+	if err := eng.ExtractSessionForce("already-extracted", makeTranscript(t)); err != nil {
+		t.Fatalf("ExtractSessionForce: %v", err)
+	}
+	if mock.callIdx == 0 {
+		t.Error("expected LLM to be called when forced")
+	}
+
+	// Verify new memory landed.
+	node, _ := db.GetNodeByURI("mem://user/preferences/reforced")
+	if node == nil {
+		t.Error("expected forced extraction to produce memory")
+	}
+}

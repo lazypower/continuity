@@ -29,4 +29,5 @@ func init() {
 	rootCmd.AddCommand(timelineCmd)
 	rootCmd.AddCommand(installServiceCmd)
 	rootCmd.AddCommand(uninstallServiceCmd)
+	rootCmd.AddCommand(extractCmd)
 }

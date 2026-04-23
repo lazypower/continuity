@@ -516,18 +516,48 @@ func extractTone(db *store.DB, client llm.Client, sessionID, transcriptPath stri
 // ExtractSession runs the full extraction pipeline for a completed session.
 // This is designed to be called asynchronously (in a goroutine).
 // Idempotent: skips sessions that have already been extracted.
+// Content-gated: sessions with insufficient content (fewer than 3 user
+// messages or <100 chars condensed) return nil WITHOUT marking the session
+// as extracted, so subsequent Stop/SessionEnd hooks get another chance once
+// the conversation grows.
 func (e *Engine) ExtractSession(sessionID, transcriptPath string) error {
+	return e.extractSession(sessionID, transcriptPath, false)
+}
+
+// ExtractSessionForce runs extraction while bypassing the idempotency guard.
+// The content gate still applies — forcing extraction on a genuinely empty
+// session is a no-op. Used by `continuity extract --force` for reprocessing
+// sessions that were incorrectly marked as extracted.
+func (e *Engine) ExtractSessionForce(sessionID, transcriptPath string) error {
+	return e.extractSession(sessionID, transcriptPath, true)
+}
+
+func (e *Engine) extractSession(sessionID, transcriptPath string, force bool) error {
 	if transcriptPath == "" {
 		return fmt.Errorf("no transcript path provided")
 	}
 
-	// Idempotency guard: skip if already extracted
-	sess, err := e.DB.GetSession(sessionID)
-	if err != nil {
-		return fmt.Errorf("check session: %w", err)
+	// Idempotency guard: skip if already extracted (unless forced)
+	if !force {
+		sess, err := e.DB.GetSession(sessionID)
+		if err != nil {
+			return fmt.Errorf("check session: %w", err)
+		}
+		if sess != nil && sess.ExtractedAt != nil {
+			log.Printf("extraction: skipping %s — already extracted", sessionID)
+			return nil
+		}
 	}
-	if sess != nil && sess.ExtractedAt != nil {
-		log.Printf("extraction: skipping %s — already extracted", sessionID)
+
+	// Pre-flight content gate — return without marking if there's not enough
+	// to extract yet. Parsing the transcript here is cheap; the downstream
+	// extractors re-parse but that's a separate concern.
+	ok, reason, err := hasEnoughContent(transcriptPath)
+	if err != nil {
+		return fmt.Errorf("content gate: %w", err)
+	}
+	if !ok {
+		log.Printf("extraction: skipping %s — %s (not marking)", sessionID, reason)
 		return nil
 	}
 
@@ -549,4 +579,22 @@ func (e *Engine) ExtractSession(sessionID, transcriptPath string) error {
 	}
 
 	return nil
+}
+
+// hasEnoughContent returns true when the transcript meets the extractors'
+// minimum thresholds (>=3 user messages AND >=100 chars condensed). This is
+// the single source of truth for the content gate — mirrored client-side in
+// the Stop hook to avoid unnecessary HTTP round-trips.
+func hasEnoughContent(transcriptPath string) (bool, string, error) {
+	entries, err := transcript.ParseFile(transcriptPath)
+	if err != nil {
+		return false, "", fmt.Errorf("parse transcript: %w", err)
+	}
+	if transcript.CountUserMessages(entries) < 3 {
+		return false, "fewer than 3 user messages", nil
+	}
+	if len(transcript.Condense(entries)) < 100 {
+		return false, "condensed transcript too short", nil
+	}
+	return true, "", nil
 }

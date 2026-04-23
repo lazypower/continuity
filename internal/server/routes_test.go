@@ -386,3 +386,63 @@ func TestGetContextWithSessions(t *testing.T) {
 		t.Errorf("context missing project name: %s", resp["context"])
 	}
 }
+
+func TestUnmarkEmptyExtractionsRoute(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	// Seed: one session marked extracted with no memories (should unmark)
+	// and one marked-with-memory (should stay)
+	srv.db.InitSession("empty-sess", "proj")
+	srv.db.MarkExtracted("empty-sess")
+	srv.db.InitSession("real-sess", "proj")
+	srv.db.MarkExtracted("real-sess")
+	srv.db.UpsertNode(&store.MemNode{
+		URI:           "mem://user/preferences/x",
+		NodeType:      "leaf",
+		Category:      "preferences",
+		SourceSession: "real-sess",
+	})
+
+	req := httptest.NewRequest("POST", "/api/sessions/unmark-empty-extractions", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Status   string `json:"status"`
+		Unmarked int64  `json:"unmarked"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Unmarked != 1 {
+		t.Errorf("unmarked = %d, want 1", resp.Unmarked)
+	}
+
+	empty, _ := srv.db.GetSession("empty-sess")
+	if empty.ExtractedAt != nil {
+		t.Error("empty-sess should have been unmarked")
+	}
+	kept, _ := srv.db.GetSession("real-sess")
+	if kept.ExtractedAt == nil {
+		t.Error("real-sess should have stayed marked")
+	}
+}
+
+// TestExtractSessionRouteAcceptsForce verifies the extract endpoint accepts
+// and honors the force flag. Real extraction runs async so we only assert
+// the request is accepted cleanly.
+func TestExtractSessionRouteAcceptsForce(t *testing.T) {
+	srv := testServerWithEngine(t)
+	srv.db.InitSession("extract-001", "proj")
+
+	body := `{"transcript_path":"/nonexistent/transcript.jsonl","force":true}`
+	req := httptest.NewRequest("POST", "/api/sessions/extract-001/extract", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body: %s", w.Code, w.Body.String())
+	}
+}
