@@ -65,9 +65,7 @@ func runShow(cmd *cobra.Command, args []string) error {
 	data, getErr := client.Get("/api/memories?" + params.Encode())
 
 	// hooks.Client.Get returns (body, err) for non-2xx responses so callers can
-	// inspect the JSON error. Try to parse a clean error from the body first;
-	// fall back to the raw transport error if the body isn't a structured
-	// response.
+	// inspect the JSON error.
 	var resp struct {
 		URI      string `json:"uri"`
 		Category string `json:"category"`
@@ -76,14 +74,23 @@ func runShow(cmd *cobra.Command, args []string) error {
 		Detail   string `json:"detail"`
 		Error    string `json:"error"`
 	}
-	if len(data) > 0 {
-		_ = json.Unmarshal(data, &resp)
-	}
+
 	if getErr != nil {
-		if resp.Error != "" {
-			return fmt.Errorf("%s", resp.Error)
+		// Error path: best-effort parse for a clean server-side message, fall
+		// back to the raw transport error if the body isn't structured JSON.
+		if len(data) > 0 {
+			if jsonErr := json.Unmarshal(data, &resp); jsonErr == nil && resp.Error != "" {
+				return fmt.Errorf("%s", resp.Error)
+			}
 		}
 		return fmt.Errorf("show: %w", getErr)
+	}
+
+	// Success path: a bad decode means the server returned something
+	// unexpected (HTML from a proxy, a partial response, etc.) — fail fast
+	// rather than printing empty fields.
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("parse response: %w", err)
 	}
 	if resp.Error != "" {
 		return fmt.Errorf("%s", resp.Error)

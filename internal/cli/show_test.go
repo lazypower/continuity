@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -275,6 +276,42 @@ func TestShowInvalidLayer(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid --layer") {
 		t.Errorf("error should mention invalid --layer, got: %v", err)
+	}
+}
+
+// TestShowBadSuccessResponse simulates a proxy or misbehaving server that
+// returns 200 OK with a non-JSON body. runShow should fail fast with a
+// "parse response" error instead of silently printing empty fields.
+func TestShowBadSuccessResponse(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/health") {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html><body>proxy intercepted this</body></html>"))
+	}))
+	t.Cleanup(ts.Close)
+
+	prev := os.Getenv("CONTINUITY_URL")
+	os.Setenv("CONTINUITY_URL", ts.URL)
+	t.Cleanup(func() { os.Setenv("CONTINUITY_URL", prev) })
+
+	resetShowFlags()
+	out, err := captureStdout(t, func() error {
+		return runShow(showCmd, []string{"mem://agent/patterns/anything"})
+	})
+	if err == nil {
+		t.Fatalf("expected parse error for non-JSON 200, got nil (stdout: %q)", out)
+	}
+	if !strings.Contains(err.Error(), "parse response") {
+		t.Errorf("error should mention 'parse response', got: %v", err)
+	}
+	// Must not have silently printed empty fields to stdout.
+	if strings.Contains(out, "## Summary") || strings.Contains(out, "## Body") {
+		t.Errorf("expected no output on parse failure, got:\n%s", out)
 	}
 }
 
