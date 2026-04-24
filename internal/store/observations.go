@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-// maxToolResponseSize is the maximum size of tool_response stored in the DB.
+// maxToolFieldSize is the maximum size of tool_input and tool_response stored in the DB.
 // Prevents bloat — Phase 2 extraction processes full transcript anyway.
-const maxToolResponseSize = 10 * 1024 // 10KB
+const maxToolFieldSize = 10 * 1024 // 10KB
 
 // Observation represents a single tool use recorded during a session.
 type Observation struct {
@@ -22,13 +22,13 @@ type Observation struct {
 
 // AddObservation stores a tool use observation. Truncates large fields to prevent DB bloat.
 func (db *DB) AddObservation(sessionID, toolName, toolInput, toolResponse string) error {
-	if len(toolInput) > maxToolResponseSize {
-		log.Printf("observation: tool_input truncated for session %s: %d → %d bytes", sessionID, len(toolInput), maxToolResponseSize)
-		toolInput = toolInput[:maxToolResponseSize]
+	if len(toolInput) > maxToolFieldSize {
+		log.Printf("observation: tool_input truncated for session %s: %d → %d bytes", sessionID, len(toolInput), maxToolFieldSize)
+		toolInput = toolInput[:maxToolFieldSize]
 	}
-	if len(toolResponse) > maxToolResponseSize {
-		log.Printf("observation: tool_response truncated for session %s: %d → %d bytes", sessionID, len(toolResponse), maxToolResponseSize)
-		toolResponse = toolResponse[:maxToolResponseSize]
+	if len(toolResponse) > maxToolFieldSize {
+		log.Printf("observation: tool_response truncated for session %s: %d → %d bytes", sessionID, len(toolResponse), maxToolFieldSize)
+		toolResponse = toolResponse[:maxToolFieldSize]
 	}
 
 	now := time.Now().UnixMilli()

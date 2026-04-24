@@ -42,15 +42,19 @@ func TestAddObservationTruncation(t *testing.T) {
 	}
 	defer db.Close()
 
-	bigResponse := strings.Repeat("x", 20*1024) // 20KB
-	err = db.AddObservation("sess-001", "Bash", "{}", bigResponse)
+	bigInput := strings.Repeat("i", 20*1024)    // 20KB
+	bigResponse := strings.Repeat("r", 20*1024)  // 20KB
+	err = db.AddObservation("sess-001", "Bash", bigInput, bigResponse)
 	if err != nil {
 		t.Fatalf("AddObservation: %v", err)
 	}
 
 	obs, _ := db.GetObservations("sess-001")
-	if len(obs[0].ToolResponse) != maxToolResponseSize {
-		t.Errorf("ToolResponse length = %d, want %d", len(obs[0].ToolResponse), maxToolResponseSize)
+	if len(obs[0].ToolInput) != maxToolFieldSize {
+		t.Errorf("ToolInput length = %d, want %d", len(obs[0].ToolInput), maxToolFieldSize)
+	}
+	if len(obs[0].ToolResponse) != maxToolFieldSize {
+		t.Errorf("ToolResponse length = %d, want %d", len(obs[0].ToolResponse), maxToolFieldSize)
 	}
 }
 

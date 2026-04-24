@@ -41,8 +41,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) routes() {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
-	r.Use(localhostOnly)
 	r.Use(securityHeaders)
+	r.Use(localhostOnly)
 	r.Use(limitRequestBody)
 
 	r.Route("/api", func(r chi.Router) {

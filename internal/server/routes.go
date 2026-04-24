@@ -13,8 +13,8 @@ import (
 	"github.com/lazypower/continuity/internal/engine"
 )
 
-// jsonError writes a JSON error response. All error responses should use this
-// to avoid JSON injection via string concatenation.
+// jsonError writes a JSON error response with proper Content-Type and encoding.
+// Prefer this over http.Error for consistent JSON responses.
 func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -27,11 +27,11 @@ func (s *Server) handleSessionInit(w http.ResponseWriter, r *http.Request) {
 		Project   string `json:"project"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	if req.SessionID == "" {
-		http.Error(w, `{"error":"session_id required"}`, http.StatusBadRequest)
+		jsonError(w, "session_id required", http.StatusBadRequest)
 		return
 	}
 
@@ -60,11 +60,11 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, `{"error":"read body failed"}`, http.StatusBadRequest)
+		jsonError(w, "read body failed", http.StatusBadRequest)
 		return
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 
@@ -119,7 +119,7 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 		Force          bool   `json:"force"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 
@@ -155,11 +155,11 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 		Prompt string `json:"prompt"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	if req.Prompt == "" {
-		http.Error(w, `{"error":"prompt required"}`, http.StatusBadRequest)
+		jsonError(w, "prompt required", http.StatusBadRequest)
 		return
 	}
 
@@ -248,11 +248,11 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 		SessionID string `json:"session_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	if req.Category == "" || req.Name == "" || req.Summary == "" || req.Body == "" {
-		http.Error(w, `{"error":"category, name, summary, and body are required"}`, http.StatusBadRequest)
+		jsonError(w, "category, name, summary, and body are required", http.StatusBadRequest)
 		return
 	}
 
@@ -295,7 +295,7 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
-		http.Error(w, `{"error":"q parameter required"}`, http.StatusBadRequest)
+		jsonError(w, "q parameter required", http.StatusBadRequest)
 		return
 	}
 

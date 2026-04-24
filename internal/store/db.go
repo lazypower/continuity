@@ -73,17 +73,14 @@ func OpenMemory() (*DB, error) {
 }
 
 // hardenPermissions tightens file/directory permissions for existing installs.
+// MkdirAll/OpenFile only set permissions on creation — this fixes pre-existing files.
 func hardenPermissions(dir, dbPath string) {
 	if info, err := os.Stat(dir); err == nil && info.Mode().Perm()&0077 != 0 {
-		if err := os.Chmod(dir, 0700); err == nil {
-			fmt.Fprintf(os.Stderr, "  security: tightened %s to 0700\n", dir)
-		}
+		_ = os.Chmod(dir, 0700)
 	}
 	for _, f := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
 		if info, err := os.Stat(f); err == nil && info.Mode().Perm()&0077 != 0 {
-			if err := os.Chmod(f, 0600); err == nil {
-				fmt.Fprintf(os.Stderr, "  security: tightened %s to 0600\n", f)
-			}
+			_ = os.Chmod(f, 0600)
 		}
 	}
 }
