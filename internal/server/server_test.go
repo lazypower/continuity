@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,14 @@ import (
 
 	"github.com/lazypower/continuity/internal/store"
 )
+
+// newTestRequest wraps httptest.NewRequest with Host: localhost so the
+// localhostOnly middleware doesn't reject test traffic.
+func newTestRequest(method, url string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, url, body)
+	req.Host = "localhost"
+	return req
+}
 
 func testServer(t *testing.T) *Server {
 	t.Helper()
@@ -293,7 +302,7 @@ func TestTruncateAtSentence(t *testing.T) {
 func TestHealthEndpoint(t *testing.T) {
 	srv := testServer(t)
 
-	req := httptest.NewRequest("GET", "/api/health", nil)
+	req := newTestRequest("GET", "/api/health", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -330,7 +339,7 @@ func TestStubRoutes(t *testing.T) {
 	}
 
 	for _, s := range stubs {
-		req := httptest.NewRequest(s.method, s.path, nil)
+		req := newTestRequest(s.method, s.path, nil)
 		w := httptest.NewRecorder()
 		srv.ServeHTTP(w, req)
 
@@ -353,7 +362,7 @@ func TestSearchRoute(t *testing.T) {
 	srv := testServer(t)
 
 	// Search without embedder returns 503
-	req := httptest.NewRequest("GET", "/api/search?q=test", nil)
+	req := newTestRequest("GET", "/api/search?q=test", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -362,7 +371,7 @@ func TestSearchRoute(t *testing.T) {
 	}
 
 	// Search without q param returns 400
-	req = httptest.NewRequest("GET", "/api/search", nil)
+	req = newTestRequest("GET", "/api/search", nil)
 	w = httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -374,7 +383,7 @@ func TestSearchRoute(t *testing.T) {
 func TestProfileRoute(t *testing.T) {
 	srv := testServer(t)
 
-	req := httptest.NewRequest("GET", "/api/profile", nil)
+	req := newTestRequest("GET", "/api/profile", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -394,7 +403,7 @@ func TestProfileRoute(t *testing.T) {
 func TestTreeRoute(t *testing.T) {
 	srv := testServer(t)
 
-	req := httptest.NewRequest("GET", "/api/tree", nil)
+	req := newTestRequest("GET", "/api/tree", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 

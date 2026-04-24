@@ -28,9 +28,13 @@ func DefaultDBPath() (string, error) {
 // configures pragmas, and runs migrations.
 func Open(path string) (*DB, error) {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
 	}
+
+	// Tighten permissions on existing installs — MkdirAll/Open only set
+	// permissions on creation, so pre-existing dirs/files need explicit chmod.
+	hardenPermissions(dir, path)
 
 	sqlDB, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -66,6 +70,22 @@ func OpenMemory() (*DB, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return db, nil
+}
+
+// hardenPermissions tightens file/directory permissions for existing installs.
+func hardenPermissions(dir, dbPath string) {
+	if info, err := os.Stat(dir); err == nil && info.Mode().Perm()&0077 != 0 {
+		if err := os.Chmod(dir, 0700); err == nil {
+			fmt.Fprintf(os.Stderr, "  security: tightened %s to 0700\n", dir)
+		}
+	}
+	for _, f := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if info, err := os.Stat(f); err == nil && info.Mode().Perm()&0077 != 0 {
+			if err := os.Chmod(f, 0600); err == nil {
+				fmt.Fprintf(os.Stderr, "  security: tightened %s to 0600\n", f)
+			}
+		}
+	}
 }
 
 func (db *DB) configurePragmas() error {

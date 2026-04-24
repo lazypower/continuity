@@ -56,10 +56,14 @@ func TryAutostart() bool {
 		return false
 	}
 	logPath := filepath.Join(home, ".continuity", "serve.log")
-	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "continuity: autostart: open log: %v\n", err)
 		return false
+	}
+	// Tighten existing log files from previous installs (0644 → 0600)
+	if info, err := logFile.Stat(); err == nil && info.Mode().Perm()&0077 != 0 {
+		os.Chmod(logPath, 0600)
 	}
 
 	devNull, err := os.Open(os.DevNull)

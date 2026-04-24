@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -19,9 +20,14 @@ type Observation struct {
 	CreatedAt    int64
 }
 
-// AddObservation stores a tool use observation. Truncates tool_response to 10KB.
+// AddObservation stores a tool use observation. Truncates large fields to prevent DB bloat.
 func (db *DB) AddObservation(sessionID, toolName, toolInput, toolResponse string) error {
+	if len(toolInput) > maxToolResponseSize {
+		log.Printf("observation: tool_input truncated for session %s: %d → %d bytes", sessionID, len(toolInput), maxToolResponseSize)
+		toolInput = toolInput[:maxToolResponseSize]
+	}
 	if len(toolResponse) > maxToolResponseSize {
+		log.Printf("observation: tool_response truncated for session %s: %d → %d bytes", sessionID, len(toolResponse), maxToolResponseSize)
 		toolResponse = toolResponse[:maxToolResponseSize]
 	}
 

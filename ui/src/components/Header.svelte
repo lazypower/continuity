@@ -3,9 +3,9 @@
   import ThemeToggle from './ThemeToggle.svelte';
 
   const tabs: { id: Tab; label: string; icon: string }[] = [
-    { id: 'tree', label: 'Tree', icon: '&#9672;' },
-    { id: 'search', label: 'Search', icon: '&#9906;' },
-    { id: 'profile', label: 'Profile', icon: '&#9830;' },
+    { id: 'tree', label: 'Tree', icon: '\u25C8' },
+    { id: 'search', label: 'Search', icon: '\u26B2' },
+    { id: 'profile', label: 'Profile', icon: '\u2666' },
   ];
 
   function setTab(tab: Tab) {
@@ -36,7 +36,7 @@
             : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-card)]'}"
         >
           <span class="text-xs" style={$activeTab === tab.id ? 'color: var(--color-accent)' : ''}>
-            {@html tab.icon}
+            {tab.icon}
           </span>
           {tab.label}
         </button>

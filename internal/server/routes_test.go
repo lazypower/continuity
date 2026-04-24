@@ -15,7 +15,7 @@ func TestSessionInit(t *testing.T) {
 	srv := testServer(t)
 
 	body := `{"session_id":"test-001","project":"/tmp/myproject"}`
-	req := httptest.NewRequest("POST", "/api/sessions/init", strings.NewReader(body))
+	req := newTestRequest("POST", "/api/sessions/init", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -37,7 +37,7 @@ func TestSessionInitMissingID(t *testing.T) {
 	srv := testServer(t)
 
 	body := `{"project":"/tmp/myproject"}`
-	req := httptest.NewRequest("POST", "/api/sessions/init", strings.NewReader(body))
+	req := newTestRequest("POST", "/api/sessions/init", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -51,13 +51,13 @@ func TestAddObservation(t *testing.T) {
 
 	// Init session first
 	initBody := `{"session_id":"test-001","project":"/tmp/myproject"}`
-	req := httptest.NewRequest("POST", "/api/sessions/init", strings.NewReader(initBody))
+	req := newTestRequest("POST", "/api/sessions/init", strings.NewReader(initBody))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
 	// Add observation
 	obsBody := `{"tool_name":"Bash","tool_input":"{\"command\":\"ls\"}","tool_response":"file1 file2"}`
-	req = httptest.NewRequest("POST", "/api/sessions/test-001/observations", strings.NewReader(obsBody))
+	req = newTestRequest("POST", "/api/sessions/test-001/observations", strings.NewReader(obsBody))
 	w = httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -71,12 +71,12 @@ func TestCompleteSession(t *testing.T) {
 
 	// Init session
 	initBody := `{"session_id":"test-001","project":"/tmp/myproject"}`
-	req := httptest.NewRequest("POST", "/api/sessions/init", strings.NewReader(initBody))
+	req := newTestRequest("POST", "/api/sessions/init", strings.NewReader(initBody))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
 	// Complete session
-	req = httptest.NewRequest("POST", "/api/sessions/test-001/complete", nil)
+	req = newTestRequest("POST", "/api/sessions/test-001/complete", nil)
 	w = httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -96,12 +96,12 @@ func TestEndSession(t *testing.T) {
 
 	// Init session
 	initBody := `{"session_id":"test-001","project":"/tmp/myproject"}`
-	req := httptest.NewRequest("POST", "/api/sessions/init", strings.NewReader(initBody))
+	req := newTestRequest("POST", "/api/sessions/init", strings.NewReader(initBody))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
 	// End session
-	req = httptest.NewRequest("POST", "/api/sessions/test-001/end", nil)
+	req = newTestRequest("POST", "/api/sessions/test-001/end", nil)
 	w = httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -120,7 +120,7 @@ func TestSignalRouteNoEngine(t *testing.T) {
 	srv := testServer(t) // engine is nil
 
 	body := `{"prompt":"remember this: always use WAL mode"}`
-	req := httptest.NewRequest("POST", "/api/sessions/test-001/signal", strings.NewReader(body))
+	req := newTestRequest("POST", "/api/sessions/test-001/signal", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -133,7 +133,7 @@ func TestSignalRouteMissingPrompt(t *testing.T) {
 	srv := testServer(t)
 
 	body := `{}`
-	req := httptest.NewRequest("POST", "/api/sessions/test-001/signal", strings.NewReader(body))
+	req := newTestRequest("POST", "/api/sessions/test-001/signal", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -145,7 +145,7 @@ func TestSignalRouteMissingPrompt(t *testing.T) {
 func TestSignalRouteInvalidJSON(t *testing.T) {
 	srv := testServer(t)
 
-	req := httptest.NewRequest("POST", "/api/sessions/test-001/signal", strings.NewReader("not json"))
+	req := newTestRequest("POST", "/api/sessions/test-001/signal", strings.NewReader("not json"))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -158,7 +158,7 @@ func TestGetContext(t *testing.T) {
 	srv := testServer(t)
 
 	// Empty context
-	req := httptest.NewRequest("GET", "/api/context", nil)
+	req := newTestRequest("GET", "/api/context", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -191,7 +191,7 @@ func TestRememberRoute(t *testing.T) {
 	srv := testServerWithEngine(t)
 
 	body := `{"category":"preferences","name":"devbox","summary":"Always use devbox","body":"The project uses devbox shell to provide Go and SQLite tools."}`
-	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(body))
+	req := newTestRequest("POST", "/api/memories", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -215,7 +215,7 @@ func TestRememberRouteUpdate(t *testing.T) {
 	body := `{"category":"preferences","name":"devbox","summary":"Always use devbox","body":"The project uses devbox shell to provide Go and SQLite tools."}`
 
 	// First call → created
-	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(body))
+	req := newTestRequest("POST", "/api/memories", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -224,7 +224,7 @@ func TestRememberRouteUpdate(t *testing.T) {
 
 	// Second call with different content → updated
 	body2 := `{"category":"preferences","name":"devbox","summary":"Updated devbox preference","body":"Updated: devbox shell provides Go, SQLite, and additional tooling."}`
-	req = httptest.NewRequest("POST", "/api/memories", strings.NewReader(body2))
+	req = newTestRequest("POST", "/api/memories", strings.NewReader(body2))
 	w = httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -243,7 +243,7 @@ func TestGetMemoryRoute(t *testing.T) {
 
 	// Seed a memory via POST
 	body := `{"category":"patterns","name":"test-journal","summary":"tiny test","body":"section A\n- entry 1\n\nsection B\n- entry 2\n"}`
-	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(body))
+	req := newTestRequest("POST", "/api/memories", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -251,7 +251,7 @@ func TestGetMemoryRoute(t *testing.T) {
 	}
 
 	// Read it back
-	req = httptest.NewRequest("GET", "/api/memories?uri=mem://agent/patterns/test-journal", nil)
+	req = newTestRequest("GET", "/api/memories?uri=mem://agent/patterns/test-journal", nil)
 	w = httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -281,7 +281,7 @@ func TestGetMemoryRoute(t *testing.T) {
 func TestGetMemoryRouteNotFound(t *testing.T) {
 	srv := testServerWithEngine(t)
 
-	req := httptest.NewRequest("GET", "/api/memories?uri=mem://agent/patterns/does-not-exist", nil)
+	req := newTestRequest("GET", "/api/memories?uri=mem://agent/patterns/does-not-exist", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -293,7 +293,7 @@ func TestGetMemoryRouteNotFound(t *testing.T) {
 func TestGetMemoryRouteMissingURI(t *testing.T) {
 	srv := testServerWithEngine(t)
 
-	req := httptest.NewRequest("GET", "/api/memories", nil)
+	req := newTestRequest("GET", "/api/memories", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -306,7 +306,7 @@ func TestRememberRouteNoEngine(t *testing.T) {
 	srv := testServer(t) // engine is nil
 
 	body := `{"category":"preferences","name":"test","summary":"test","body":"test body with enough content for validation."}`
-	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(body))
+	req := newTestRequest("POST", "/api/memories", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -330,7 +330,7 @@ func TestRememberRouteMissingFields(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("POST", "/api/memories", strings.NewReader(tt.body))
+			req := newTestRequest("POST", "/api/memories", strings.NewReader(tt.body))
 			w := httptest.NewRecorder()
 			srv.ServeHTTP(w, req)
 
@@ -344,7 +344,7 @@ func TestRememberRouteMissingFields(t *testing.T) {
 func TestRememberRouteInvalidJSON(t *testing.T) {
 	srv := testServerWithEngine(t)
 
-	req := httptest.NewRequest("POST", "/api/memories", strings.NewReader("not json"))
+	req := newTestRequest("POST", "/api/memories", strings.NewReader("not json"))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -358,21 +358,21 @@ func TestGetContextWithSessions(t *testing.T) {
 
 	// Create a completed session with observations
 	initBody := `{"session_id":"old-001","project":"/tmp/myproject"}`
-	req := httptest.NewRequest("POST", "/api/sessions/init", strings.NewReader(initBody))
+	req := newTestRequest("POST", "/api/sessions/init", strings.NewReader(initBody))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
 	obsBody := `{"tool_name":"Bash","tool_input":"{}","tool_response":"ok"}`
-	req = httptest.NewRequest("POST", "/api/sessions/old-001/observations", strings.NewReader(obsBody))
+	req = newTestRequest("POST", "/api/sessions/old-001/observations", strings.NewReader(obsBody))
 	w = httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
-	req = httptest.NewRequest("POST", "/api/sessions/old-001/complete", nil)
+	req = newTestRequest("POST", "/api/sessions/old-001/complete", nil)
 	w = httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
 	// Get context for a new session
-	req = httptest.NewRequest("GET", "/api/context?session_id=new-001", nil)
+	req = newTestRequest("GET", "/api/context?session_id=new-001", nil)
 	w = httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -405,7 +405,7 @@ func TestUnmarkEmptyExtractionsRoute(t *testing.T) {
 		t.Fatalf("UpsertNode: %v", err)
 	}
 
-	req := httptest.NewRequest("POST", "/api/sessions/unmark-empty-extractions", nil)
+	req := newTestRequest("POST", "/api/sessions/unmark-empty-extractions", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
@@ -440,7 +440,7 @@ func TestExtractSessionRouteAcceptsForce(t *testing.T) {
 	srv.db.InitSession("extract-001", "proj")
 
 	body := `{"transcript_path":"/nonexistent/transcript.jsonl","force":true}`
-	req := httptest.NewRequest("POST", "/api/sessions/extract-001/extract", strings.NewReader(body))
+	req := newTestRequest("POST", "/api/sessions/extract-001/extract", strings.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
