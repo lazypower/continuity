@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import { categoryColors, type Category } from '../lib/types';
 
   interface Props {
@@ -15,6 +16,13 @@
   let expanded = $state(false);
   let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
   let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // If the card unmounts while a reset timer is pending, the setTimeout
+  // callback would still fire and try to mutate copyState on a destroyed
+  // component. Clear it on teardown.
+  onDestroy(() => {
+    clearTimeout(copyResetTimer);
+  });
 
   function toggle() {
     expanded = !expanded;
@@ -33,6 +41,17 @@
     copyResetTimer = setTimeout(() => {
       copyState = 'idle';
     }, 1500);
+  }
+
+  function copyLabel(state: 'idle' | 'copied' | 'failed'): string {
+    switch (state) {
+      case 'copied':
+        return 'Memory body copied to clipboard';
+      case 'failed':
+        return 'Copy to clipboard failed';
+      default:
+        return 'Copy memory body to clipboard';
+    }
   }
 
   function categoryColor(cat: string): string {
@@ -133,11 +152,20 @@
             type="button"
             class="copy-btn shrink-0 text-xs font-mono px-2 py-1 rounded border border-[var(--border)] hover:border-[var(--border-hover)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
             onclick={copyBody}
-            aria-label="Copy memory body to clipboard"
+            onkeydown={(e) => e.stopPropagation()}
+            aria-label={copyLabel(copyState)}
           >
             {copyState === 'copied' ? 'copied' : copyState === 'failed' ? 'failed' : 'copy'}
           </button>
         </div>
+        <!--
+          Screen-reader-only announcement of copy state. aria-live="polite"
+          speaks the transition (copied / failed) without interrupting; the
+          visual button text carries the same info for sighted users.
+        -->
+        <span class="sr-only" role="status" aria-live="polite">
+          {copyState === 'copied' ? 'Copied to clipboard' : copyState === 'failed' ? 'Copy failed' : ''}
+        </span>
       </div>
     {/if}
   </div>
