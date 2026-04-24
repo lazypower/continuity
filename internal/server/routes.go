@@ -105,6 +105,7 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		TranscriptPath string `json:"transcript_path"`
+		Force          bool   `json:"force"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
@@ -120,7 +121,13 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 
 	// Async extraction — return 202 immediately
 	go func() {
-		if err := s.engine.ExtractSession(sessionID, req.TranscriptPath); err != nil {
+		var err error
+		if req.Force {
+			err = s.engine.ExtractSessionForce(sessionID, req.TranscriptPath)
+		} else {
+			err = s.engine.ExtractSession(sessionID, req.TranscriptPath)
+		}
+		if err != nil {
 			log.Printf("extraction failed for %s: %v", sessionID, err)
 		}
 	}()
@@ -164,6 +171,26 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"status": "processing"})
+}
+
+// handleUnmarkEmptyExtractions clears extracted_at on every session marked
+// as extracted but with zero memories attributed. This is the backfill path
+// for sessions that were silently locked out by the pre-fix mark-on-skip
+// bug. Returns the number of sessions unmarked.
+func (s *Server) handleUnmarkEmptyExtractions(w http.ResponseWriter, r *http.Request) {
+	n, err := s.db.UnmarkEmptyExtractions()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":   "ok",
+		"unmarked": n,
+	})
 }
 
 func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {

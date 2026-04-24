@@ -166,6 +166,38 @@ func (db *DB) MarkExtracted(sessionID string) error {
 	return nil
 }
 
+// UnmarkExtracted clears extracted_at for a single session so it can be
+// re-extracted by a subsequent run without --force.
+func (db *DB) UnmarkExtracted(sessionID string) error {
+	_, err := db.Exec(`UPDATE sessions SET extracted_at = NULL WHERE session_id = ?`, sessionID)
+	if err != nil {
+		return fmt.Errorf("unmark extracted: %w", err)
+	}
+	return nil
+}
+
+// UnmarkEmptyExtractions unmarks every session that is flagged as extracted
+// but has no memories attributed to it via mem_nodes.source_session. This is
+// the backfill path for sessions that were silently locked out by the
+// mark-on-skip bug. Returns the number of rows affected.
+func (db *DB) UnmarkEmptyExtractions() (int64, error) {
+	result, err := db.Exec(`
+		UPDATE sessions
+		SET extracted_at = NULL
+		WHERE extracted_at IS NOT NULL
+		  AND session_id NOT IN (
+		      SELECT DISTINCT source_session
+		      FROM mem_nodes
+		      WHERE source_session IS NOT NULL
+		  )
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("unmark empty extractions: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	return rows, nil
+}
+
 // SetSessionTone stores the emotional arc tone for a session.
 func (db *DB) SetSessionTone(sessionID, tone string) error {
 	_, err := db.Exec(`UPDATE sessions SET tone = ? WHERE session_id = ?`, tone, sessionID)

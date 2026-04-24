@@ -55,6 +55,7 @@ func (s *Server) routes() {
 
 		// Phase 2: extraction
 		r.Post("/sessions/{sessionID}/extract", s.handleExtractSession)
+		r.Post("/sessions/unmark-empty-extractions", s.handleUnmarkEmptyExtractions)
 
 		// Phase 4: signal keywords
 		r.Post("/sessions/{sessionID}/signal", s.handleSignal)

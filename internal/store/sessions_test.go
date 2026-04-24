@@ -237,6 +237,91 @@ func TestSessionToneInRecentSessions(t *testing.T) {
 	}
 }
 
+func TestUnmarkExtracted(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	db.InitSession("sess-001", "proj")
+	if err := db.MarkExtracted("sess-001"); err != nil {
+		t.Fatalf("MarkExtracted: %v", err)
+	}
+	s, _ := db.GetSession("sess-001")
+	if s.ExtractedAt == nil {
+		t.Fatal("precondition: expected extracted_at set")
+	}
+
+	if err := db.UnmarkExtracted("sess-001"); err != nil {
+		t.Fatalf("UnmarkExtracted: %v", err)
+	}
+	s, _ = db.GetSession("sess-001")
+	if s.ExtractedAt != nil {
+		t.Errorf("expected extracted_at=nil after unmark, got %v", *s.ExtractedAt)
+	}
+}
+
+// TestUnmarkEmptyExtractions is the backfill for issue #2: sessions marked
+// extracted but with no memories attributed should be eligible for
+// re-extraction. Sessions with at least one attributed memory must be
+// left alone.
+func TestUnmarkEmptyExtractions(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	// Session A: marked extracted, no memories → should be unmarked.
+	db.InitSession("empty-a", "proj")
+	db.MarkExtracted("empty-a")
+
+	// Session B: marked extracted, has an attributed memory → keep marked.
+	db.InitSession("has-memory", "proj")
+	db.MarkExtracted("has-memory")
+	if err := db.UpsertNode(&MemNode{
+		URI:           "mem://user/preferences/real",
+		NodeType:      "leaf",
+		Category:      "preferences",
+		SourceSession: "has-memory",
+	}); err != nil {
+		t.Fatalf("UpsertNode: %v", err)
+	}
+
+	// Session C: never marked extracted → untouched.
+	db.InitSession("never-marked", "proj")
+
+	// Session D: marked extracted, no memories → also unmarked.
+	db.InitSession("empty-d", "proj")
+	db.MarkExtracted("empty-d")
+
+	n, err := db.UnmarkEmptyExtractions()
+	if err != nil {
+		t.Fatalf("UnmarkEmptyExtractions: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("unmarked count = %d, want 2", n)
+	}
+
+	a, _ := db.GetSession("empty-a")
+	if a.ExtractedAt != nil {
+		t.Error("empty-a should have been unmarked")
+	}
+	b, _ := db.GetSession("has-memory")
+	if b.ExtractedAt == nil {
+		t.Error("has-memory should have stayed marked")
+	}
+	c, _ := db.GetSession("never-marked")
+	if c.ExtractedAt != nil {
+		t.Error("never-marked should not have been touched")
+	}
+	d, _ := db.GetSession("empty-d")
+	if d.ExtractedAt != nil {
+		t.Error("empty-d should have been unmarked")
+	}
+}
+
 func TestIncrementToolCount(t *testing.T) {
 	db, err := OpenMemory()
 	if err != nil {
