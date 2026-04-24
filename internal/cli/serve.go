@@ -107,8 +107,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	addr := cfg.ListenAddr()
 
 	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: srv,
+		Addr:           addr,
+		Handler:        srv,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
 	// Graceful shutdown

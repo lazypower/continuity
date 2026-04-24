@@ -93,10 +93,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 	autostartPath := filepath.Join(homeDir, ".continuity", "autostart")
 
 	if initAutostart {
-		if err := os.MkdirAll(filepath.Dir(autostartPath), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(autostartPath), 0700); err != nil {
 			return fmt.Errorf("create .continuity dir: %w", err)
 		}
-		if err := os.WriteFile(autostartPath, []byte("enabled\n"), 0644); err != nil {
+		if err := os.WriteFile(autostartPath, []byte("enabled\n"), 0600); err != nil {
 			return fmt.Errorf("write autostart marker: %w", err)
 		}
 		fmt.Println("Autostart enabled: continuity serve will launch automatically when needed.")

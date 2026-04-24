@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -14,23 +13,32 @@ import (
 	"github.com/lazypower/continuity/internal/engine"
 )
 
+// jsonError writes a JSON error response with proper Content-Type and encoding.
+// Prefer this over http.Error for consistent JSON responses.
+func jsonError(w http.ResponseWriter, msg string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
 func (s *Server) handleSessionInit(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SessionID string `json:"session_id"`
 		Project   string `json:"project"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	if req.SessionID == "" {
-		http.Error(w, `{"error":"session_id required"}`, http.StatusBadRequest)
+		jsonError(w, "session_id required", http.StatusBadRequest)
 		return
 	}
 
 	sess, err := s.db.InitSession(req.SessionID, req.Project)
 	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		log.Printf("init session: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -52,16 +60,17 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, `{"error":"read body failed"}`, http.StatusBadRequest)
+		jsonError(w, "read body failed", http.StatusBadRequest)
 		return
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 
 	if err := s.db.AddObservation(sessionID, req.ToolName, req.ToolInput, req.ToolResponse); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		log.Printf("add observation: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -79,8 +88,9 @@ func (s *Server) handleCompleteSession(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.CompleteSession(sessionID); err != nil {
 		// Not finding an active session is not a server error — the session
 		// may have already been completed or never existed. Log but return OK.
+		log.Printf("complete session: %v", err)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "note": err.Error()})
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		return
 	}
 
@@ -92,7 +102,8 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "sessionID")
 
 	if err := s.db.EndSession(sessionID); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		log.Printf("end session: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -108,7 +119,7 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 		Force          bool   `json:"force"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 
@@ -144,11 +155,11 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 		Prompt string `json:"prompt"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	if req.Prompt == "" {
-		http.Error(w, `{"error":"prompt required"}`, http.StatusBadRequest)
+		jsonError(w, "prompt required", http.StatusBadRequest)
 		return
 	}
 
@@ -180,9 +191,8 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUnmarkEmptyExtractions(w http.ResponseWriter, r *http.Request) {
 	n, err := s.db.UnmarkEmptyExtractions()
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		log.Printf("unmark empty extractions: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -204,15 +214,12 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 
 	node, err := s.db.GetNodeByURI(uri)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		log.Printf("get memory: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if node == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"error": "memory not found: " + uri})
+		jsonError(w, "memory not found", http.StatusNotFound)
 		return
 	}
 
@@ -241,11 +248,11 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 		SessionID string `json:"session_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+		jsonError(w, "invalid json", http.StatusBadRequest)
 		return
 	}
 	if req.Category == "" || req.Name == "" || req.Summary == "" || req.Body == "" {
-		http.Error(w, `{"error":"category, name, summary, and body are required"}`, http.StatusBadRequest)
+		jsonError(w, "category, name, summary, and body are required", http.StatusBadRequest)
 		return
 	}
 
@@ -268,9 +275,8 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 		SessionID: req.SessionID,
 	})
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		log.Printf("remember: %v", err)
+		jsonError(w, "failed to store memory", http.StatusBadRequest)
 		return
 	}
 
@@ -289,7 +295,7 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
-		http.Error(w, `{"error":"q parameter required"}`, http.StatusBadRequest)
+		jsonError(w, "q parameter required", http.StatusBadRequest)
 		return
 	}
 
@@ -303,6 +309,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		if n, err := strconv.Atoi(l); err == nil && n > 0 {
 			limit = n
 		}
+	}
+	if limit > 100 {
+		limit = 100
 	}
 
 	category := r.URL.Query().Get("category")
@@ -333,7 +342,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		log.Printf("search: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -384,7 +394,8 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 
 	sessions, err := s.db.GetSessionsSince(sinceMs)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		log.Printf("timeline: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -415,7 +426,8 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 	relProfile, err := s.db.GetNodeByURI("mem://user/profile/communication")
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		log.Printf("profile: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 
@@ -476,7 +488,8 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		// List roots
 		roots, err := s.db.ListRoots()
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+			log.Printf("tree roots: %v", err)
+			jsonError(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		for _, r := range roots {
@@ -492,7 +505,8 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		// List children
 		children, err := s.db.GetChildren(uri)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+			log.Printf("tree children: %v", err)
+			jsonError(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		for _, c := range children {

@@ -22,13 +22,26 @@
     }
   }
 
-  function formatProfile(text: string): string {
-    // Simple markdown-ish rendering for section headers
-    return text
-      .replace(/^## (\d+)\. (.+)$/gm, '<h4 class="profile-section-header">$2</h4>')
-      .replace(/^- (.+)$/gm, '<div class="profile-bullet">$1</div>')
-      .replace(/\n\n/g, '<br/>');
+  type ProfileLine = { kind: 'header' | 'bullet' | 'break' | 'text'; text: string };
+
+  function parseProfile(text: string): ProfileLine[] {
+    const lines: ProfileLine[] = [];
+    for (const line of text.split('\n')) {
+      const headerMatch = line.match(/^## \d+\. (.+)$/);
+      if (headerMatch) {
+        lines.push({ kind: 'header', text: headerMatch[1] });
+      } else if (line.startsWith('- ')) {
+        lines.push({ kind: 'bullet', text: line.slice(2) });
+      } else if (line === '') {
+        lines.push({ kind: 'break', text: '' });
+      } else {
+        lines.push({ kind: 'text', text: line });
+      }
+    }
+    return lines;
   }
+
+  let profileLines = $derived(parseProfile(relationalProfile));
 
   load();
 </script>
@@ -53,7 +66,17 @@
           </h3>
         </div>
         <div class="profile-content text-sm leading-relaxed">
-          {@html formatProfile(relationalProfile)}
+          {#each profileLines as line}
+            {#if line.kind === 'header'}
+              <h4 class="profile-section-header">{line.text}</h4>
+            {:else if line.kind === 'bullet'}
+              <div class="profile-bullet">{line.text}</div>
+            {:else if line.kind === 'break'}
+              <br/>
+            {:else}
+              <span class="text-[var(--text-secondary)]">{line.text}</span>
+            {/if}
+          {/each}
         </div>
       </div>
     {:else}

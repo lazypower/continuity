@@ -6,11 +6,13 @@ import (
 	"io"
 )
 
+const maxHookInputSize = 10 << 20 // 10MB
+
 // Handle reads HookInput from the given reader, dispatches to the appropriate
 // handler based on the event argument, and writes output to stdout.
 func Handle(event string, stdin io.Reader) {
 	var input HookInput
-	if err := json.NewDecoder(stdin).Decode(&input); err != nil {
+	if err := json.NewDecoder(io.LimitReader(stdin, maxHookInputSize)).Decode(&input); err != nil {
 		// Stdin may be empty for some events — degrade gracefully
 		if event == "start" {
 			WriteSessionStartOutput("")
