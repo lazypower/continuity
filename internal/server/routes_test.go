@@ -396,12 +396,14 @@ func TestUnmarkEmptyExtractionsRoute(t *testing.T) {
 	srv.db.MarkExtracted("empty-sess")
 	srv.db.InitSession("real-sess", "proj")
 	srv.db.MarkExtracted("real-sess")
-	srv.db.UpsertNode(&store.MemNode{
+	if err := srv.db.UpsertNode(&store.MemNode{
 		URI:           "mem://user/preferences/x",
 		NodeType:      "leaf",
 		Category:      "preferences",
 		SourceSession: "real-sess",
-	})
+	}); err != nil {
+		t.Fatalf("UpsertNode: %v", err)
+	}
 
 	req := httptest.NewRequest("POST", "/api/sessions/unmark-empty-extractions", nil)
 	w := httptest.NewRecorder()

@@ -134,8 +134,15 @@ func runBackfillEmpty(client *hooks.Client) error {
 }
 
 // findTranscript searches ~/.claude/projects/*/<session-id>.jsonl for a
-// Claude Code transcript matching the given session id.
+// Claude Code transcript matching the given session id. The sessionID is
+// validated first — path separators or ".." would let a glob pattern escape
+// ~/.claude/projects, which is surprising for "auto-discovery". Callers who
+// genuinely need to point at a transcript outside that tree should pass
+// --transcript explicitly.
 func findTranscript(sessionID string) (string, error) {
+	if err := validateSessionIDForGlob(sessionID); err != nil {
+		return "", fmt.Errorf("%w — pass --transcript to point at a specific file", err)
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)
@@ -152,4 +159,21 @@ func findTranscript(sessionID string) (string, error) {
 		return "", fmt.Errorf("multiple transcripts found for %s — pass --transcript to disambiguate:\n  %s", sessionID, strings.Join(matches, "\n  "))
 	}
 	return matches[0], nil
+}
+
+// validateSessionIDForGlob rejects session IDs that would let the
+// auto-discovery glob escape ~/.claude/projects. Real Claude Code session
+// IDs are UUIDs, but continuity imports from other sources so we don't
+// require that — we just refuse anything that would traverse the filesystem.
+func validateSessionIDForGlob(sessionID string) error {
+	if sessionID == "" {
+		return fmt.Errorf("session-id is empty")
+	}
+	if strings.ContainsAny(sessionID, `/\`) {
+		return fmt.Errorf("session-id %q contains a path separator", sessionID)
+	}
+	if sessionID == "." || sessionID == ".." || strings.Contains(sessionID, "..") {
+		return fmt.Errorf("session-id %q contains path traversal", sessionID)
+	}
+	return nil
 }

@@ -50,12 +50,19 @@ func writeDummyTranscript(t *testing.T) string {
 		{"type": "assistant", "message": map[string]any{"role": "assistant", "content": "Sure, I can help."}},
 		{"type": "user", "message": map[string]any{"role": "user", "content": "Another message here"}},
 	}
-	f, _ := os.Create(path)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create transcript: %v", err)
+	}
 	defer f.Close()
 	for _, e := range entries {
 		data, _ := json.Marshal(e)
-		f.Write(data)
-		f.Write([]byte("\n"))
+		if _, err := f.Write(data); err != nil {
+			t.Fatalf("write transcript: %v", err)
+		}
+		if _, err := f.Write([]byte("\n")); err != nil {
+			t.Fatalf("write transcript: %v", err)
+		}
 	}
 	return path
 }
@@ -141,5 +148,31 @@ func TestExtractCLITranscriptMissing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not readable") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateSessionIDForGlob(t *testing.T) {
+	cases := []struct {
+		name      string
+		sessionID string
+		wantErr   bool
+	}{
+		{"empty", "", true},
+		{"uuid", "0f5d812c-69e1-40d0-9eef-5436f5721a80", false},
+		{"plain slug", "my-session", false},
+		{"forward slash", "foo/bar", true},
+		{"backslash", `foo\bar`, true},
+		{"parent traversal", "..", true},
+		{"embedded traversal", "foo..bar", true},
+		{"dot", ".", true},
+		{"absolute escape", "/etc/passwd", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSessionIDForGlob(tc.sessionID)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validateSessionIDForGlob(%q) err=%v wantErr=%v", tc.sessionID, err, tc.wantErr)
+			}
+		})
 	}
 }
