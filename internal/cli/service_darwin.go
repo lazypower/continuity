@@ -24,14 +24,9 @@ func plistPath() (string, error) {
 }
 
 func generatePlist() (string, error) {
-	self, err := os.Executable()
+	self, err := resolveBinaryPath()
 	if err != nil {
-		return "", fmt.Errorf("resolve binary path: %w", err)
-	}
-	// Resolve symlinks so the plist points to the real binary
-	self, err = filepath.EvalSymlinks(self)
-	if err != nil {
-		return "", fmt.Errorf("resolve symlinks: %w", err)
+		return "", err
 	}
 
 	home, err := os.UserHomeDir()
@@ -82,11 +77,10 @@ func platformServiceStatus() (installed bool, status string) {
 }
 
 func platformServicePlan() (string, error) {
-	self, err := os.Executable()
+	self, err := resolveBinaryPath()
 	if err != nil {
-		return "", fmt.Errorf("resolve binary: %w", err)
+		return "", err
 	}
-	self, _ = filepath.EvalSymlinks(self)
 
 	path, err := plistPath()
 	if err != nil {

@@ -23,13 +23,9 @@ func unitPath() (string, error) {
 }
 
 func generateUnit() (string, error) {
-	self, err := os.Executable()
+	self, err := resolveBinaryPath()
 	if err != nil {
-		return "", fmt.Errorf("resolve binary path: %w", err)
-	}
-	self, err = filepath.EvalSymlinks(self)
-	if err != nil {
-		return "", fmt.Errorf("resolve symlinks: %w", err)
+		return "", err
 	}
 
 	home, err := os.UserHomeDir()
@@ -78,11 +74,10 @@ func platformServicePlan() (string, error) {
 		return "", fmt.Errorf("systemctl not found — systemd is required for install-service on Linux")
 	}
 
-	self, err := os.Executable()
+	self, err := resolveBinaryPath()
 	if err != nil {
-		return "", fmt.Errorf("resolve binary: %w", err)
+		return "", err
 	}
-	self, _ = filepath.EvalSymlinks(self)
 
 	path, err := unitPath()
 	if err != nil {

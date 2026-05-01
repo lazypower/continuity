@@ -4,10 +4,47 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
+
+// resolveBinaryPath returns a stable path to the running continuity binary,
+// suitable for embedding in launchd plists or systemd unit files.
+//
+// On Homebrew installs, os.Executable() + EvalSymlinks resolves to a versioned
+// Cellar path (e.g. /opt/homebrew/Cellar/continuity/0.3.0/bin/continuity) which
+// breaks after `brew upgrade`. We prefer a PATH-resolved location when it points
+// to the same underlying binary, since the symlink in /opt/homebrew/bin or
+// /usr/local/bin remains valid across upgrades.
+func resolveBinaryPath() (string, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve binary path: %w", err)
+	}
+	pathLoc, _ := exec.LookPath("continuity")
+	return resolveBinaryPathFrom(self, pathLoc)
+}
+
+func resolveBinaryPathFrom(self, pathLoc string) (string, error) {
+	selfReal, err := filepath.EvalSymlinks(self)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlinks: %w", err)
+	}
+
+	if pathLoc != "" {
+		if pathLocReal, err := filepath.EvalSymlinks(pathLoc); err == nil && pathLocReal == selfReal {
+			if abs, err := filepath.Abs(pathLoc); err == nil {
+				return abs, nil
+			}
+			return pathLoc, nil
+		}
+	}
+
+	return selfReal, nil
+}
 
 var installServiceCmd = &cobra.Command{
 	Use:   "install-service",
