@@ -534,6 +534,78 @@ func TestRememberMerge(t *testing.T) {
 	}
 }
 
+// TestRememberHonorsExplicitSlug is the regression test for issue #11.
+// Two distinct events with overlapping summary words (high TFIDF cosine) used
+// to be silently deduped: the second write was redirected onto the first
+// memory's URI, the new content was created at a hidden timestamp-suffixed
+// node, and the response reported `updated:` pointing at the unrelated first
+// memory. The fix is to honor the caller-supplied slug verbatim on the
+// Remember API and report the actually-stored URI.
+func TestRememberHonorsExplicitSlug(t *testing.T) {
+	db := testDB(t)
+	mock := &llm.MockClient{Response: &llm.Response{Content: "[]"}}
+	eng := New(db, mock)
+
+	embedder, err := NewTFIDFEmbedder(db, 512)
+	if err != nil {
+		t.Fatalf("NewTFIDFEmbedder: %v", err)
+	}
+	eng.SetEmbedder(embedder)
+
+	ctx := context.Background()
+
+	uri1, created1, err := eng.Remember(ctx, RememberInput{
+		Category: "events",
+		Name:     "test-dedup-foo-1234",
+		Summary:  "Foo test memory for dedup repro",
+		Body:     "This is the FOO memory for testing dedup. It should be a brand new node at events/test-dedup-foo-1234.",
+	})
+	if err != nil {
+		t.Fatalf("first Remember: %v", err)
+	}
+	if !created1 {
+		t.Errorf("first call: created=false, want true")
+	}
+	if want := "mem://user/events/test-dedup-foo-1234"; uri1 != want {
+		t.Errorf("first URI = %q, want %q", uri1, want)
+	}
+
+	// Second write: distinct slug, body content, but overlapping summary words —
+	// pre-fix this would trip the similarity dedup and silently merge onto FOO.
+	uri2, created2, err := eng.Remember(ctx, RememberInput{
+		Category: "events",
+		Name:     "test-dedup-bar-5678",
+		Summary:  "Bar test memory for dedup repro",
+		Body:     "This is the BAR memory for testing dedup. It should be a brand new node at events/test-dedup-bar-5678 — completely unrelated content from foo.",
+	})
+	if err != nil {
+		t.Fatalf("second Remember: %v", err)
+	}
+	if !created2 {
+		t.Errorf("second call: created=false, want true (distinct slug should be a fresh node)")
+	}
+	if want := "mem://user/events/test-dedup-bar-5678"; uri2 != want {
+		t.Errorf("second URI = %q, want %q (caller's slug must be honored verbatim)", uri2, want)
+	}
+
+	// Both nodes must exist independently — neither has consumed the other.
+	foo, err := db.GetNodeByURI("mem://user/events/test-dedup-foo-1234")
+	if err != nil || foo == nil {
+		t.Fatalf("FOO node missing after second write")
+	}
+	if !strings.Contains(foo.L1Overview, "FOO") {
+		t.Errorf("FOO node body was overwritten: %q", foo.L1Overview)
+	}
+
+	bar, err := db.GetNodeByURI("mem://user/events/test-dedup-bar-5678")
+	if err != nil || bar == nil {
+		t.Fatalf("BAR node missing — second write was silently dropped (#11 regression)")
+	}
+	if !strings.Contains(bar.L1Overview, "BAR") {
+		t.Errorf("BAR node body wrong: %q", bar.L1Overview)
+	}
+}
+
 func TestMomentPoolEviction(t *testing.T) {
 	db := testDB(t)
 	mock := &llm.MockClient{Response: &llm.Response{Content: "[]"}}

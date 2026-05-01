@@ -250,6 +250,13 @@ type RememberInput struct {
 
 // Remember stores a structured memory directly — no LLM round-trip needed.
 // Returns the resulting URI, whether the node was newly created, and any error.
+//
+// The caller-supplied slug (input.Name) is always honored. The semantic-similarity
+// dedup heuristic that runs on the LLM extraction path is intentionally skipped
+// here: a direct write through this API is explicit user/agent intent, and
+// silently redirecting it onto a near-duplicate's URI causes silent data loss
+// (see issue #11). For immutable-category slug collisions, the underlying
+// UpsertNode appends a timestamp suffix; we report the actual stored URI.
 func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, bool, error) {
 	c := memoryCandidate{
 		Category: input.Category,
@@ -266,28 +273,15 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 	c = vc
 
 	owner := ownerForCategory(c.Category)
-	uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
+	requestedURI := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
 
-	// For immutable categories, check for near-duplicates via embeddings
-	if e.Embedder != nil && !mergeableCategory(c.Category) {
-		match, sim, err := findSimilarNode(ctx, e.DB, e.Embedder, c.L0, c.Category, defaultSimilarityThreshold)
-		if err != nil {
-			log.Printf("remember: similarity check failed: %v", err)
-		} else if match != nil {
-			log.Printf("remember: merging %s → %s (similarity: %.3f)", uri, match.URI, sim)
-			uri = match.URI
-		}
-	}
-
-	// Check if node already exists to determine created vs updated
-	existing, err := e.DB.GetNodeByURI(uri)
+	existing, err := e.DB.GetNodeByURI(requestedURI)
 	if err != nil {
 		return "", false, fmt.Errorf("check existing: %w", err)
 	}
-	created := existing == nil
 
 	node := &store.MemNode{
-		URI:           uri,
+		URI:           requestedURI,
 		NodeType:      "leaf",
 		Category:      c.Category,
 		L0Abstract:    c.L0,
@@ -299,14 +293,21 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 	if err := e.DB.UpsertNode(node); err != nil {
 		return "", false, fmt.Errorf("upsert: %w", err)
 	}
-	log.Printf("remember: stored %s [%s] (created=%v)", uri, c.Category, created)
+
+	// UpsertNode mutates node.URI when an immutable-category slug collision
+	// triggers the timestamp-suffix path. created reflects whether a new row
+	// was inserted (fresh slug, OR collision-with-suffix), as opposed to an
+	// in-place merge of a mergeable category.
+	created := existing == nil || node.URI != requestedURI
+	storedURI := node.URI
+	log.Printf("remember: stored %s [%s] (created=%v)", storedURI, c.Category, created)
 
 	// Embed if available
 	if e.Embedder != nil && node.L0Abstract != "" {
-		stored, err := e.DB.GetNodeByURI(uri)
+		stored, err := e.DB.GetNodeByURI(storedURI)
 		if err == nil && stored != nil {
 			if err := e.EmbedNode(ctx, stored); err != nil {
-				log.Printf("remember: embed %s: %v", uri, err)
+				log.Printf("remember: embed %s: %v", storedURI, err)
 			}
 		}
 	}
@@ -320,7 +321,7 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 		}
 	}
 
-	return uri, created, nil
+	return storedURI, created, nil
 }
 
 const maxMoments = 10
