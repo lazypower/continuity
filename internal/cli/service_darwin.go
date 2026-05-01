@@ -13,6 +13,12 @@ import (
 const (
 	launchAgentLabel = "com.continuity.server"
 	plistFilename    = "com.continuity.server.plist"
+
+	// servicePATH is what we inject into the launchd EnvironmentVariables.
+	// launchd hands daemons a stripped PATH (/usr/bin:/bin:/usr/sbin:/sbin), so the
+	// service can't find `claude` (Homebrew) and LLM extraction silently fails.
+	// Both Apple-Silicon and Intel Homebrew prefixes are listed first.
+	servicePATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 )
 
 func plistPath() (string, error) {
@@ -54,9 +60,14 @@ func generatePlist() (string, error) {
     <string>%s</string>
     <key>StandardErrorPath</key>
     <string>%s</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>%s</string>
+    </dict>
 </dict>
 </plist>
-`, launchAgentLabel, self, logPath, logPath), nil
+`, launchAgentLabel, self, logPath, logPath, servicePATH), nil
 }
 
 func platformServiceStatus() (installed bool, status string) {
