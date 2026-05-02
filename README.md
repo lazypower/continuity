@@ -235,11 +235,30 @@ continuity uninstall-service  Remove system service
 continuity hook <evt>         Handle Claude Code hook events
 continuity search             Search memories by query
 continuity remember    Store a memory directly (no LLM needed)
+continuity retract     Retract a memory you wrote (tombstone or supersession)
 continuity profile     Show relational profile
 continuity tree        Browse the memory tree
 continuity dedup       Deduplicate similar memory nodes
 continuity version     Print version information
 ```
+
+### Memory accountability
+
+Memory is not immutable; it is accountable. When a write turns out to be wrong, stale, or sensitive, the agent can retract it:
+
+```bash
+# Pure tombstone — preserved as a marker, hidden from default reads
+continuity retract mem://user/events/test-foo --reason "test repro, no ongoing value"
+
+# Supersession — link a successor to preserve the trail of how understanding evolved
+continuity retract mem://user/preferences/old-style \
+  --reason "preference changed after 2026-04 review" \
+  --superseded-by mem://user/preferences/new-style
+```
+
+Retracted memories stay in the tree — nothing is silently erased. Pass `--include-retracted` to `show` or `tree` to inspect them. The reason text is sequestered behind that flag (absent from default responses, not empty or redacted), so confronting your own past retraction is a deliberate act.
+
+The verb exists for the agent to curate its own substrate. Operators don't run it. The trust contract is what governs the substrate, not architectural enforcement.
 
 ## API
 
@@ -248,7 +267,10 @@ All endpoints on `http://127.0.0.1:37777`:
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/health` | Server health + uptime |
-| `GET` | `/api/tree?uri=` | Browse memory tree |
+| `GET` | `/api/tree?uri=&include_retracted=` | Browse memory tree |
+| `GET` | `/api/memories?uri=&include_retracted=` | Fetch a single memory |
+| `POST` | `/api/memories` | Store a memory directly |
+| `POST` | `/api/memories/retract` | Retract a memory (tombstone or supersession) |
 | `GET` | `/api/search?q=&mode=find\|search` | Query memories |
 | `GET` | `/api/profile` | Relational profile + preference nodes |
 | `GET` | `/api/context?session_id=` | Get injection context |

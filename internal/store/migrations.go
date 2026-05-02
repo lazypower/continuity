@@ -159,6 +159,15 @@ PRAGMA foreign_keys=ON;
 		Description: "sessions: add tone for session emotional arc",
 		SQL:         `ALTER TABLE sessions ADD COLUMN tone TEXT;`,
 	},
+	{
+		Version:     8,
+		Description: "mem_nodes: retraction columns for memory accountability (issue #12)",
+		SQL: `
+ALTER TABLE mem_nodes ADD COLUMN tombstoned_at INTEGER;
+ALTER TABLE mem_nodes ADD COLUMN tombstone_reason TEXT;
+ALTER TABLE mem_nodes ADD COLUMN superseded_by TEXT;
+`,
+	},
 }
 
 func (db *DB) migrate() error {

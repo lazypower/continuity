@@ -11,8 +11,9 @@ import (
 )
 
 var (
-	showLayer string
-	showJSON  bool
+	showLayer            string
+	showJSON             bool
+	showIncludeRetracted bool
 )
 
 var showCmd = &cobra.Command{
@@ -25,10 +26,15 @@ Requires a running server (continuity serve).
 Use this to read a memory's full body before updating it in place, so
 appends don't clobber unseen content.
 
+For retracted memories, only metadata (URI, retraction timestamp, supersession
+link if any) is shown by default. Pass --include-retracted to see the reason
+text and the original content.
+
 Examples:
   continuity show mem://user/preferences/devbox
   continuity show mem://user/preferences/devbox --layer body
   continuity show mem://user/preferences/devbox --json
+  continuity show mem://user/events/old-fact --include-retracted
 
 You can also omit the mem:// prefix; it will be added automatically.`,
 	Args: cobra.ExactArgs(1),
@@ -38,6 +44,7 @@ You can also omit the mem:// prefix; it will be added automatically.`,
 func init() {
 	showCmd.Flags().StringVar(&showLayer, "layer", "all", "Which tier to print: summary, body, detail, or all")
 	showCmd.Flags().BoolVar(&showJSON, "json", false, "Emit machine-readable JSON")
+	showCmd.Flags().BoolVar(&showIncludeRetracted, "include-retracted", false, "Reveal the reason and original content of a retracted memory")
 }
 
 func runShow(cmd *cobra.Command, args []string) error {
@@ -62,17 +69,24 @@ func runShow(cmd *cobra.Command, args []string) error {
 
 	params := url.Values{}
 	params.Set("uri", uri)
+	if showIncludeRetracted {
+		params.Set("include_retracted", "true")
+	}
 	data, getErr := client.Get("/api/memories?" + params.Encode())
 
 	// hooks.Client.Get returns (body, err) for non-2xx responses so callers can
 	// inspect the JSON error.
 	var resp struct {
-		URI      string `json:"uri"`
-		Category string `json:"category"`
-		Summary  string `json:"summary"`
-		Body     string `json:"body"`
-		Detail   string `json:"detail"`
-		Error    string `json:"error"`
+		URI             string `json:"uri"`
+		Category        string `json:"category"`
+		Summary         string `json:"summary"`
+		Body            string `json:"body"`
+		Detail          string `json:"detail"`
+		Retracted       bool   `json:"retracted"`
+		TombstonedAt    int64  `json:"tombstoned_at"`
+		TombstoneReason string `json:"tombstone_reason"`
+		SupersededBy    string `json:"superseded_by"`
+		Error           string `json:"error"`
 	}
 
 	if getErr != nil {
@@ -97,25 +111,60 @@ func runShow(cmd *cobra.Command, args []string) error {
 	}
 
 	if showJSON {
-		// Pretty-print what we got back — but filter by layer if requested.
-		out := map[string]any{"uri": resp.URI, "category": resp.Category}
-		switch showLayer {
-		case "summary":
-			out["summary"] = resp.Summary
-		case "body":
-			out["body"] = resp.Body
-		case "detail":
-			out["detail"] = resp.Detail
-		default:
-			out["summary"] = resp.Summary
-			out["body"] = resp.Body
-			out["detail"] = resp.Detail
+		// Echo the server response shape unchanged — the server already enforces
+		// the retracted-without-flag absence-not-empty contract by omitting fields.
+		// Reparse and re-emit with indentation; this preserves field absence (not
+		// substituting empty strings for missing fields).
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			return fmt.Errorf("parse json: %w", err)
 		}
-		enc, err := json.MarshalIndent(out, "", "  ")
+		// Layer filter still applies for the content-bearing fields.
+		if showLayer != "all" {
+			filtered := map[string]any{"uri": raw["uri"], "category": raw["category"]}
+			if v, ok := raw["retracted"]; ok {
+				filtered["retracted"] = v
+			}
+			if v, ok := raw["tombstoned_at"]; ok {
+				filtered["tombstoned_at"] = v
+			}
+			if v, ok := raw["tombstone_reason"]; ok {
+				filtered["tombstone_reason"] = v
+			}
+			if v, ok := raw["superseded_by"]; ok {
+				filtered["superseded_by"] = v
+			}
+			switch showLayer {
+			case "summary":
+				if v, ok := raw["summary"]; ok {
+					filtered["summary"] = v
+				}
+			case "body":
+				if v, ok := raw["body"]; ok {
+					filtered["body"] = v
+				}
+			case "detail":
+				if v, ok := raw["detail"]; ok {
+					filtered["detail"] = v
+				}
+			}
+			raw = filtered
+		}
+		enc, err := json.MarshalIndent(raw, "", "  ")
 		if err != nil {
 			return fmt.Errorf("marshal: %w", err)
 		}
 		fmt.Println(string(enc))
+		return nil
+	}
+
+	// Retracted-without-flag: text output is metadata only.
+	if resp.Retracted && !showIncludeRetracted {
+		fmt.Printf("%s [%s] [retracted]\n", resp.URI, resp.Category)
+		if resp.SupersededBy != "" {
+			fmt.Printf("  superseded by: %s\n", resp.SupersededBy)
+		}
+		fmt.Fprintln(cmd.ErrOrStderr(), "(reason and original content hidden — pass --include-retracted to reveal)")
 		return nil
 	}
 
@@ -132,8 +181,20 @@ func runShow(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Println(resp.Detail)
 	default:
-		fmt.Printf("%s [%s]\n", resp.URI, resp.Category)
+		header := fmt.Sprintf("%s [%s]", resp.URI, resp.Category)
+		if resp.Retracted {
+			header += " [retracted]"
+		}
+		fmt.Println(header)
 		fmt.Println()
+		if resp.Retracted {
+			fmt.Println("## Retraction")
+			fmt.Printf("Reason: %s\n", resp.TombstoneReason)
+			if resp.SupersededBy != "" {
+				fmt.Printf("Superseded by: %s\n", resp.SupersededBy)
+			}
+			fmt.Println()
+		}
 		fmt.Println("## Summary")
 		fmt.Println(resp.Summary)
 		fmt.Println()

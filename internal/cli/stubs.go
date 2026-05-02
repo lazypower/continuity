@@ -239,11 +239,17 @@ func runProfile(cmd *cobra.Command, args []string) error {
 
 // --- tree command ---
 
+var treeIncludeRetracted bool
+
 var treeCmd = &cobra.Command{
 	Use:   "tree [uri]",
 	Short: "Browse memory tree",
 	Long:  "List memory tree nodes. With no argument, shows root dirs. With a URI, shows children.",
 	RunE:  runTree,
+}
+
+func init() {
+	treeCmd.Flags().BoolVar(&treeIncludeRetracted, "include-retracted", false, "Include retracted memories in the listing")
 }
 
 func runTree(cmd *cobra.Command, args []string) error {
@@ -256,7 +262,12 @@ func runTree(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 {
 		// Show children of the given URI
 		uri := args[0]
-		children, err := db.GetChildren(uri)
+		var children []store.MemNode
+		if treeIncludeRetracted {
+			children, err = db.GetChildrenIncludingRetracted(uri)
+		} else {
+			children, err = db.GetChildren(uri)
+		}
 		if err != nil {
 			return fmt.Errorf("get children: %w", err)
 		}
@@ -271,7 +282,10 @@ func runTree(cmd *cobra.Command, args []string) error {
 				count, _ := db.CountChildren(c.URI)
 				suffix = fmt.Sprintf(" (%d children)", count)
 			}
-			if c.L0Abstract != "" {
+			if c.IsRetracted() {
+				suffix += " [retracted]"
+			}
+			if c.L0Abstract != "" && !c.IsRetracted() {
 				fmt.Printf("  %s %s%s\n    %s\n", c.NodeType, c.URI, suffix, c.L0Abstract)
 			} else {
 				fmt.Printf("  %s %s%s\n", c.NodeType, c.URI, suffix)

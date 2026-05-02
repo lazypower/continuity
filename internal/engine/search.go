@@ -96,6 +96,12 @@ func Find(ctx context.Context, db *store.DB, embedder Embedder, query string, op
 		if node.NodeType != "leaf" {
 			continue
 		}
+		// Retracted nodes are excluded from default search (issue #12).
+		// Dedup-against-retracted runs on a separate path that intentionally
+		// keeps retracted nodes in the match space.
+		if node.IsRetracted() {
+			continue
+		}
 
 		similarity := CosineSimilarity(queryVec, v.Embedding)
 		score := similarity * node.Relevance * categoryBoost(node.Category)

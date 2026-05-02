@@ -24,6 +24,7 @@ func init() {
 	rootCmd.AddCommand(importCmd)
 	rootCmd.AddCommand(dedupCmd)
 	rootCmd.AddCommand(rememberCmd)
+	rootCmd.AddCommand(retractCmd)
 	rootCmd.AddCommand(showCmd)
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(timelineCmd)

@@ -26,8 +26,11 @@ Your memory lives in continuity. Reach for it naturally:
 - Looking something up: ` + "`continuity search \"<query>\"`" + `
 - Browsing what you know: ` + "`continuity tree [uri]`" + `
 - Understanding who you're working with: ` + "`continuity profile`" + `
+- Retracting a memory you wrote: ` + "`continuity retract <uri> --reason \"...\"`" + ` (or with ` + "`--superseded-by`" + ` to link a successor)
 
 Before searching the codebase for prior decisions, conventions, or context — check continuity first. If you learn something worth keeping, store it immediately.
+
+**Memory is not immutable; it is accountable.** When a write you made turns out to be wrong, stale, or sensitive, retract it — the memory is preserved as a marker but excluded from default reads. Retraction is for *you*, the agent: operators don't run this verb. The trust contract is what governs the substrate, not enforcement at the CLI.
 `
 
 var initAutostart bool

@@ -246,6 +246,13 @@ type RememberInput struct {
 	Body      string // L1 overview
 	Detail    string // L2 content (optional)
 	SessionID string // optional provenance
+
+	// AcknowledgeRetracted, when true, bypasses the dedup-against-retracted gate.
+	// Set this only after the agent has fetched the matched memory's reason via
+	// `continuity show <uri> --include-retracted` and decided the candidate is
+	// genuinely different. Override events are intentionally not recorded — see
+	// issue #12 / RFC "Override behavior."
+	AcknowledgeRetracted bool
 }
 
 // Remember stores a structured memory directly — no LLM round-trip needed.
@@ -278,6 +285,34 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 	existing, err := e.DB.GetNodeByURI(requestedURI)
 	if err != nil {
 		return "", false, fmt.Errorf("check existing: %w", err)
+	}
+
+	// Direct URI collision with a retracted memory: refuse the write rather than
+	// silently overwriting the tombstone. The agent must choose a different slug
+	// or, if the retraction was wrong, restore via SQL (the friction-bearing path).
+	if existing != nil && existing.IsRetracted() {
+		return "", false, fmt.Errorf("uri %s is retracted; choose a different slug", requestedURI)
+	}
+
+	// Dedup against retracted memories. Retracted memories must still participate
+	// in similarity matching, or retraction-because-PII is silently broken: the
+	// next session writes similar content, hits no match, re-introduces the leak.
+	// Reasons are NOT exposed inline — agent fetches them deliberately via
+	// `continuity show <uri> --include-retracted`. See issue #12 / RFC.
+	if !input.AcknowledgeRetracted && e.Embedder != nil && c.L0 != "" {
+		matches, err := e.findRetractedMatches(ctx, c.L0, c.Category, defaultSimilarityThreshold)
+		if err != nil {
+			log.Printf("remember: retracted-match check failed: %v", err)
+		} else if len(matches) > 0 {
+			uris := make([]string, len(matches))
+			hashes := make([]string, len(matches))
+			for i, m := range matches {
+				uris[i] = m.URI
+				hashes[i] = hashURI(m.URI)
+			}
+			log.Printf("dedup-retracted: candidate matches %d retracted node(s) hash=%s", len(matches), strings.Join(hashes, ","))
+			return "", false, &RetractedMatchError{MatchedURIs: uris}
+		}
 	}
 
 	node := &store.MemNode{
