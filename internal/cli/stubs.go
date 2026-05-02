@@ -279,7 +279,12 @@ func runTree(cmd *cobra.Command, args []string) error {
 		for _, c := range children {
 			suffix := ""
 			if c.NodeType == "dir" {
-				count, _ := db.CountChildren(c.URI)
+				var count int
+				if treeIncludeRetracted {
+					count, _ = db.CountChildren(c.URI)
+				} else {
+					count, _ = db.CountLiveChildren(c.URI)
+				}
 				suffix = fmt.Sprintf(" (%d children)", count)
 			}
 			if c.IsRetracted() {
@@ -308,7 +313,12 @@ func runTree(cmd *cobra.Command, args []string) error {
 	fmt.Println("## Memory Tree")
 	fmt.Println()
 	for _, r := range roots {
-		count, _ := db.CountChildren(r.URI)
+		var count int
+		if treeIncludeRetracted {
+			count, _ = db.CountChildren(r.URI)
+		} else {
+			count, _ = db.CountLiveChildren(r.URI)
+		}
 		fmt.Printf("  %s (%d children)\n", r.URI, count)
 	}
 

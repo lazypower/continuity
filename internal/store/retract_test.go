@@ -57,7 +57,7 @@ func TestRetractNode_RequiresReason(t *testing.T) {
 
 	_, err := db.RetractNode("mem://user/events/foo", "", "")
 	if err == nil {
-		t.Error("expected error when reason is empty")
+		t.Fatal("expected error when reason is empty")
 	}
 	if !strings.Contains(err.Error(), "reason required") {
 		t.Errorf("error = %q, want substring %q", err.Error(), "reason required")
@@ -69,7 +69,7 @@ func TestRetractNode_ErrorsOnMissingURI(t *testing.T) {
 
 	_, err := db.RetractNode("mem://user/events/does-not-exist", "any reason", "")
 	if err == nil {
-		t.Error("expected error when URI does not exist")
+		t.Fatal("expected error when URI does not exist")
 	}
 	if !strings.Contains(err.Error(), "not found") {
 		t.Errorf("error = %q, want substring %q", err.Error(), "not found")
@@ -124,10 +124,74 @@ func TestRetractNode_SupersedesNonexistentSuccessor(t *testing.T) {
 	_, err := db.RetractNode("mem://user/preferences/old-style", "preference changed",
 		"mem://user/preferences/never-existed")
 	if err == nil {
-		t.Error("expected error when superseded_by URI does not exist")
+		t.Fatal("expected error when superseded_by URI does not exist")
 	}
 	if !strings.Contains(err.Error(), "successor not found") {
 		t.Errorf("error = %q, want substring %q", err.Error(), "successor not found")
+	}
+}
+
+// TestScanNodes_NoPointerAliasing guards against a class of bug where the
+// loop-local NullInt64 vars in scanNodes could be reused across iterations,
+// making every node's TombstonedAt / LastAccess pointer alias the last row's
+// value. The `var` declaration inside the loop body should escape per-iteration
+// so each node gets a distinct heap allocation; this test verifies that.
+func TestScanNodes_NoPointerAliasing(t *testing.T) {
+	db := testDB(t)
+	seedNode(t, db, "mem://user/events/a", "events", "a")
+	seedNode(t, db, "mem://user/events/b", "events", "b")
+	seedNode(t, db, "mem://user/events/c", "events", "c")
+
+	if _, err := db.RetractNode("mem://user/events/a", "first", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Brief wait so timestamps differ (millisecond-resolution).
+	if _, err := db.RetractNode("mem://user/events/b", "second", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RetractNode("mem://user/events/c", "third", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := db.FindByCategoryIncludingRetracted("events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 3 {
+		t.Fatalf("want 3 nodes, got %d", len(nodes))
+	}
+
+	// Pointers must be distinct, not aliasing the last row's value.
+	seen := map[*int64]bool{}
+	for _, n := range nodes {
+		if n.TombstonedAt == nil {
+			t.Errorf("node %s missing TombstonedAt", n.URI)
+			continue
+		}
+		if seen[n.TombstonedAt] {
+			t.Errorf("node %s shares TombstonedAt pointer with another row (aliasing bug)", n.URI)
+		}
+		seen[n.TombstonedAt] = true
+	}
+}
+
+func TestRetractNode_RejectsSelfSupersession(t *testing.T) {
+	db := testDB(t)
+	seedNode(t, db, "mem://user/preferences/loop", "preferences", "loop test")
+
+	_, err := db.RetractNode("mem://user/preferences/loop", "self-loop test",
+		"mem://user/preferences/loop")
+	if err == nil {
+		t.Fatal("expected error when supersededBy == uri (self-loop)")
+	}
+	if !strings.Contains(err.Error(), "self-supersession") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "self-supersession")
+	}
+
+	// Node must remain in its pre-call state — not retracted at all.
+	got, _ := db.GetNodeByURI("mem://user/preferences/loop")
+	if got.IsRetracted() {
+		t.Error("self-supersession attempt left the node retracted; should have been rejected before any write")
 	}
 }
 

@@ -36,6 +36,9 @@ func (db *DB) RetractNode(uri, reason, supersededBy string) (newly bool, err err
 	}
 
 	if supersededBy != "" {
+		if supersededBy == uri {
+			return false, fmt.Errorf("self-supersession: %s cannot supersede itself", uri)
+		}
 		successor, err := db.GetNodeByURI(supersededBy)
 		if err != nil {
 			return false, fmt.Errorf("look up successor: %w", err)

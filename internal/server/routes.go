@@ -597,7 +597,12 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, r := range roots {
-			count, _ := s.db.CountChildren(r.URI)
+			var count int
+			if includeRetracted {
+				count, _ = s.db.CountChildren(r.URI)
+			} else {
+				count, _ = s.db.CountLiveChildren(r.URI)
+			}
 			nodes = append(nodes, treeNodeJSON{
 				URI:      r.URI,
 				NodeType: r.NodeType,
@@ -633,7 +638,12 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 				tn.L1Overview = c.L1Overview
 			}
 			if c.NodeType == "dir" {
-				count, _ := s.db.CountChildren(c.URI)
+				var count int
+				if includeRetracted {
+					count, _ = s.db.CountChildren(c.URI)
+				} else {
+					count, _ = s.db.CountLiveChildren(c.URI)
+				}
 				tn.Children = count
 			}
 			nodes = append(nodes, tn)

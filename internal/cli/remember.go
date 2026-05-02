@@ -90,18 +90,21 @@ func runRemember(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	data, err := client.Post("/api/memories", body)
-	// data may carry a structured response even on non-2xx (e.g. 409 matches_retracted).
+	data, postErr := client.Post("/api/memories", body)
+
+	// data may carry a structured response on either path (success body or a
+	// non-2xx JSON error like 409 matches_retracted). Decode opportunistically:
+	// on the error path, a parse failure means the server returned something
+	// non-JSON and we fall back to the transport error; on the success path,
+	// a parse failure is a real bug we surface rather than printing empty fields.
 	var resp struct {
-		Status       string   `json:"status"`
-		URI          string   `json:"uri"`
-		MatchedURIs  []string `json:"matched_uris"`
-		Hint         string   `json:"hint"`
-		Error        string   `json:"error"`
+		Status      string   `json:"status"`
+		URI         string   `json:"uri"`
+		MatchedURIs []string `json:"matched_uris"`
+		Hint        string   `json:"hint"`
+		Error       string   `json:"error"`
 	}
-	if len(data) > 0 {
-		_ = json.Unmarshal(data, &resp)
-	}
+	parseErr := json.Unmarshal(data, &resp)
 
 	if resp.Status == "matches_retracted" {
 		fmt.Fprintln(os.Stderr, "matches_retracted: candidate write matches retracted memory")
@@ -114,10 +117,19 @@ func runRemember(cmd *cobra.Command, args []string) error {
 		os.Exit(2)
 	}
 
-	if err != nil {
-		return fmt.Errorf("remember: %w", err)
+	if postErr != nil {
+		// Non-2xx: prefer a structured server-side error message if we got one.
+		if parseErr == nil && resp.Error != "" {
+			return fmt.Errorf("%s", resp.Error)
+		}
+		return fmt.Errorf("remember: %w", postErr)
 	}
 
+	// Success path: a bad decode means the server returned something unexpected.
+	// Fail fast rather than printing empty fields.
+	if parseErr != nil {
+		return fmt.Errorf("parse response: %w", parseErr)
+	}
 	if resp.Error != "" {
 		fmt.Fprintf(os.Stderr, "error: %s\n", resp.Error)
 		os.Exit(1)

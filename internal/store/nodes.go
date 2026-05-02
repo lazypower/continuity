@@ -616,10 +616,23 @@ func (db *DB) DeleteOrphanDirs() (int, error) {
 	return int(n), nil
 }
 
-// CountChildren returns the number of direct children for a parent URI.
+// CountChildren returns the number of direct children for a parent URI,
+// including retracted ones. Use CountLiveChildren for counts that match what
+// a default `tree` listing returns; mismatched counts mislead users.
 func (db *DB) CountChildren(parentURI string) (int, error) {
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM mem_nodes WHERE parent_uri = ?", parentURI).Scan(&count)
+	return count, err
+}
+
+// CountLiveChildren returns the number of direct children that aren't retracted.
+// Pair this with GetChildren so listing and count agree on what's visible.
+func (db *DB) CountLiveChildren(parentURI string) (int, error) {
+	var count int
+	err := db.QueryRow(
+		"SELECT COUNT(*) FROM mem_nodes WHERE parent_uri = ? AND tombstoned_at IS NULL",
+		parentURI,
+	).Scan(&count)
 	return count, err
 }
 
