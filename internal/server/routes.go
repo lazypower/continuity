@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/lazypower/continuity/internal/engine"
+	"github.com/lazypower/continuity/internal/store"
 )
 
 // jsonError writes a JSON error response with proper Content-Type and encoding.
@@ -211,6 +212,7 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "uri parameter required"})
 		return
 	}
+	includeRetracted := r.URL.Query().Get("include_retracted") == "true"
 
 	node, err := s.db.GetNodeByURI(uri)
 	if err != nil {
@@ -224,28 +226,61 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"uri":         node.URI,
-		"category":    node.Category,
-		"node_type":   node.NodeType,
-		"summary":     node.L0Abstract,
-		"body":        node.L1Overview,
-		"detail":      node.L2Content,
-		"relevance":   node.Relevance,
-		"created_at":  node.CreatedAt,
-		"updated_at":  node.UpdatedAt,
+
+	// Retracted memory without --include-retracted: surface metadata only.
+	// Reason and content fields are *absent*, not empty/null/redacted, so consumers
+	// don't have to disambiguate "no content given" from "content hidden by contract."
+	// See issue #12 / RFC: "confronting your own past retraction should be a
+	// deliberate act, not a passive notification."
+	if node.IsRetracted() && !includeRetracted {
+		out := map[string]any{
+			"uri":            node.URI,
+			"category":       node.Category,
+			"node_type":      node.NodeType,
+			"retracted":      true,
+			"tombstoned_at":  *node.TombstonedAt,
+			"created_at":     node.CreatedAt,
+			"updated_at":     node.UpdatedAt,
+		}
+		if node.SupersededBy != "" {
+			out["superseded_by"] = node.SupersededBy
+		}
+		json.NewEncoder(w).Encode(out)
+		return
+	}
+
+	out := map[string]any{
+		"uri":          node.URI,
+		"category":     node.Category,
+		"node_type":    node.NodeType,
+		"summary":      node.L0Abstract,
+		"body":         node.L1Overview,
+		"detail":       node.L2Content,
+		"relevance":    node.Relevance,
+		"created_at":   node.CreatedAt,
+		"updated_at":   node.UpdatedAt,
 		"access_count": node.AccessCount,
-	})
+	}
+	if node.IsRetracted() {
+		out["retracted"] = true
+		out["tombstoned_at"] = *node.TombstonedAt
+		out["tombstone_reason"] = node.TombstoneReason
+		if node.SupersededBy != "" {
+			out["superseded_by"] = node.SupersededBy
+		}
+	}
+	json.NewEncoder(w).Encode(out)
 }
 
 func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Category  string `json:"category"`
-		Name      string `json:"name"`
-		Summary   string `json:"summary"`
-		Body      string `json:"body"`
-		Detail    string `json:"detail"`
-		SessionID string `json:"session_id"`
+		Category             string `json:"category"`
+		Name                 string `json:"name"`
+		Summary              string `json:"summary"`
+		Body                 string `json:"body"`
+		Detail               string `json:"detail"`
+		SessionID            string `json:"session_id"`
+		AcknowledgeRetracted bool   `json:"acknowledge_retracted"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid json", http.StatusBadRequest)
@@ -267,14 +302,28 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	uri, created, err := s.engine.Remember(ctx, engine.RememberInput{
-		Category:  req.Category,
-		Name:      req.Name,
-		Summary:   req.Summary,
-		Body:      req.Body,
-		Detail:    req.Detail,
-		SessionID: req.SessionID,
+		Category:             req.Category,
+		Name:                 req.Name,
+		Summary:              req.Summary,
+		Body:                 req.Body,
+		Detail:               req.Detail,
+		SessionID:            req.SessionID,
+		AcknowledgeRetracted: req.AcknowledgeRetracted,
 	})
 	if err != nil {
+		// Dedup-against-retracted gate fired. Surface URIs only — reasons stay
+		// sequestered behind --include-retracted. Operator-side log already
+		// captured URI hashes in the engine layer.
+		if isMatch, uris := engine.IsRetractedMatch(err); isMatch {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]any{
+				"status":           "matches_retracted",
+				"matched_uris":     uris,
+				"hint":             "inspect each with `continuity show <uri> --include-retracted` before proceeding; pass --acknowledge-retracted to override",
+			})
+			return
+		}
 		log.Printf("remember: %v", err)
 		jsonError(w, "failed to store memory", http.StatusBadRequest)
 		return
@@ -290,6 +339,59 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"status": status, "uri": uri})
+}
+
+func (s *Server) handleRetract(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URI          string `json:"uri"`
+		Reason       string `json:"reason"`
+		SupersededBy string `json:"superseded_by"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.URI == "" {
+		jsonError(w, "uri is required", http.StatusBadRequest)
+		return
+	}
+	if req.Reason == "" {
+		jsonError(w, "reason is required", http.StatusBadRequest)
+		return
+	}
+
+	if s.engine == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	newly, err := s.engine.Retract(ctx, engine.RetractInput{
+		URI:          req.URI,
+		Reason:       req.Reason,
+		SupersededBy: req.SupersededBy,
+	})
+	if err != nil {
+		log.Printf("retract: %v", err)
+		jsonError(w, "failed to retract memory", http.StatusBadRequest)
+		return
+	}
+
+	status := "retracted"
+	if !newly {
+		status = "already_retracted"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":        status,
+		"uri":           req.URI,
+		"superseded_by": req.SupersededBy,
+	})
 }
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -472,6 +574,7 @@ func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 	uri := r.URL.Query().Get("uri")
+	includeRetracted := r.URL.Query().Get("include_retracted") == "true"
 
 	type treeNodeJSON struct {
 		URI        string `json:"uri"`
@@ -480,12 +583,13 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		L0Abstract string `json:"l0_abstract,omitempty"`
 		L1Overview string `json:"l1_overview,omitempty"`
 		Children   int    `json:"children,omitempty"`
+		Retracted  bool   `json:"retracted,omitempty"`
 	}
 
 	var nodes []treeNodeJSON
 
 	if uri == "" {
-		// List roots
+		// List roots (dirs are never retracted; no flag needed)
 		roots, err := s.db.ListRoots()
 		if err != nil {
 			log.Printf("tree roots: %v", err)
@@ -493,7 +597,12 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, r := range roots {
-			count, _ := s.db.CountChildren(r.URI)
+			var count int
+			if includeRetracted {
+				count, _ = s.db.CountChildren(r.URI)
+			} else {
+				count, _ = s.db.CountLiveChildren(r.URI)
+			}
 			nodes = append(nodes, treeNodeJSON{
 				URI:      r.URI,
 				NodeType: r.NodeType,
@@ -503,7 +612,13 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// List children
-		children, err := s.db.GetChildren(uri)
+		var children []store.MemNode
+		var err error
+		if includeRetracted {
+			children, err = s.db.GetChildrenIncludingRetracted(uri)
+		} else {
+			children, err = s.db.GetChildren(uri)
+		}
 		if err != nil {
 			log.Printf("tree children: %v", err)
 			jsonError(w, "internal error", http.StatusInternalServerError)
@@ -511,14 +626,24 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, c := range children {
 			tn := treeNodeJSON{
-				URI:        c.URI,
-				NodeType:   c.NodeType,
-				Category:   c.Category,
-				L0Abstract: c.L0Abstract,
-				L1Overview: c.L1Overview,
+				URI:       c.URI,
+				NodeType:  c.NodeType,
+				Category:  c.Category,
+				Retracted: c.IsRetracted(),
+			}
+			// Suppress content fields on retracted nodes — same absence-not-empty
+			// principle as handleGetMemory.
+			if !c.IsRetracted() {
+				tn.L0Abstract = c.L0Abstract
+				tn.L1Overview = c.L1Overview
 			}
 			if c.NodeType == "dir" {
-				count, _ := s.db.CountChildren(c.URI)
+				var count int
+				if includeRetracted {
+					count, _ = s.db.CountChildren(c.URI)
+				} else {
+					count, _ = s.db.CountLiveChildren(c.URI)
+				}
 				tn.Children = count
 			}
 			nodes = append(nodes, tn)

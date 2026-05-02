@@ -73,6 +73,7 @@ func (s *Server) routes() {
 		r.Get("/sessions/{sessionID}", stub("session detail"))
 		r.Post("/memories", s.handleRemember)
 		r.Get("/memories", s.handleGetMemory)
+		r.Post("/memories/retract", s.handleRetract)
 	})
 
 	// Serve embedded UI at all non-API paths

@@ -11,12 +11,13 @@ import (
 )
 
 var (
-	rememberCategory string
-	rememberName     string
-	rememberSummary  string
-	rememberBody     string
-	rememberDetail   string
-	rememberSession  string
+	rememberCategory             string
+	rememberName                 string
+	rememberSummary              string
+	rememberBody                 string
+	rememberDetail               string
+	rememberSession              string
+	rememberAcknowledgeRetracted bool
 )
 
 var validCategorySet = map[string]bool{
@@ -45,6 +46,7 @@ func init() {
 	rememberCmd.Flags().StringVarP(&rememberBody, "body", "b", "", "L1 overview — max 2000 chars, compress detail aggressively (required)")
 	rememberCmd.Flags().StringVarP(&rememberDetail, "detail", "d", "", "L2 full content — max 40000 chars (optional)")
 	rememberCmd.Flags().StringVar(&rememberSession, "session", "", "Session ID for provenance (optional)")
+	rememberCmd.Flags().BoolVar(&rememberAcknowledgeRetracted, "acknowledge-retracted", false, "Proceed past a dedup match against retracted memory (use after inspecting with `show --include-retracted`)")
 
 	rememberCmd.MarkFlagRequired("category")
 	rememberCmd.MarkFlagRequired("name")
@@ -67,7 +69,7 @@ func runRemember(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
 	}
 
-	payload := map[string]string{
+	payload := map[string]any{
 		"category": rememberCategory,
 		"name":     rememberName,
 		"summary":  rememberSummary,
@@ -79,26 +81,55 @@ func runRemember(cmd *cobra.Command, args []string) error {
 	if rememberSession != "" {
 		payload["session_id"] = rememberSession
 	}
+	if rememberAcknowledgeRetracted {
+		payload["acknowledge_retracted"] = true
+	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	data, err := client.Post("/api/memories", body)
-	if err != nil {
-		return fmt.Errorf("remember: %w", err)
-	}
+	data, postErr := client.Post("/api/memories", body)
 
+	// data may carry a structured response on either path (success body or a
+	// non-2xx JSON error like 409 matches_retracted). Decode opportunistically:
+	// on the error path, a parse failure means the server returned something
+	// non-JSON and we fall back to the transport error; on the success path,
+	// a parse failure is a real bug we surface rather than printing empty fields.
 	var resp struct {
-		Status string `json:"status"`
-		URI    string `json:"uri"`
-		Error  string `json:"error"`
+		Status      string   `json:"status"`
+		URI         string   `json:"uri"`
+		MatchedURIs []string `json:"matched_uris"`
+		Hint        string   `json:"hint"`
+		Error       string   `json:"error"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return fmt.Errorf("parse response: %w", err)
+	parseErr := json.Unmarshal(data, &resp)
+
+	if resp.Status == "matches_retracted" {
+		fmt.Fprintln(os.Stderr, "matches_retracted: candidate write matches retracted memory")
+		for _, u := range resp.MatchedURIs {
+			fmt.Fprintf(os.Stderr, "  - %s\n", u)
+		}
+		if resp.Hint != "" {
+			fmt.Fprintln(os.Stderr, resp.Hint)
+		}
+		os.Exit(2)
 	}
 
+	if postErr != nil {
+		// Non-2xx: prefer a structured server-side error message if we got one.
+		if parseErr == nil && resp.Error != "" {
+			return fmt.Errorf("%s", resp.Error)
+		}
+		return fmt.Errorf("remember: %w", postErr)
+	}
+
+	// Success path: a bad decode means the server returned something unexpected.
+	// Fail fast rather than printing empty fields.
+	if parseErr != nil {
+		return fmt.Errorf("parse response: %w", parseErr)
+	}
 	if resp.Error != "" {
 		fmt.Fprintf(os.Stderr, "error: %s\n", resp.Error)
 		os.Exit(1)

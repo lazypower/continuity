@@ -11,6 +11,8 @@ Persistent memory for AI coding agents. Single Go binary, zero dependencies.
 - **L1 (`-b`)**: Max 2000 characters (~300 words). Primary context tier. Compress aggressively.
 - **L2 (`-d`)**: Max 40000 characters. Full content, retrieved on-demand only.
 
+**Memory is not immutable; it is accountable.** Wrong write, stale fact, captured a piece of PII you shouldn't have? Use `continuity retract <uri> --reason "..."` to mark it retracted. The memory stays in the tree as a marker but is excluded from default reads. Pass `--superseded-by <new-uri>` when you have a replacement to preserve trajectory. Operators don't run this verb — it exists for the agent to curate its own substrate. The trust contract is what governs the substrate, not architectural enforcement.
+
 ## What This Is
 
 Continuity gives Claude Code (and eventually any AI agent) memory that persists across sessions. It captures what happened, what was learned, and how you work — then injects that context into future sessions so the agent doesn't start cold every time.

@@ -72,6 +72,16 @@ type MemNode struct {
 	SourceSession string
 	CreatedAt     int64
 	UpdatedAt     int64
+
+	// Retraction (issue #12). nil/empty when the node is live.
+	TombstonedAt    *int64
+	TombstoneReason string
+	SupersededBy    string
+}
+
+// IsRetracted reports whether this node has been retracted.
+func (n *MemNode) IsRetracted() bool {
+	return n.TombstonedAt != nil
 }
 
 // mergeableCategories defines which categories support in-place merging.
@@ -120,19 +130,22 @@ func (db *DB) CreateNode(node *MemNode) error {
 }
 
 // GetNodeByURI returns a node by its URI, or nil if not found.
+// Retraction state is included on the returned node; callers decide how to handle.
 func (db *DB) GetNodeByURI(uri string) (*MemNode, error) {
 	var n MemNode
 	var mergeable int
-	var lastAccess sql.NullInt64
-	var parentURI, l0, l1, l2, mergedFrom, sourceSession sql.NullString
+	var lastAccess, tombstonedAt sql.NullInt64
+	var parentURI, l0, l1, l2, mergedFrom, sourceSession, tombstoneReason, supersededBy sql.NullString
 	err := db.QueryRow(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
-			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
+			tombstoned_at, tombstone_reason, superseded_by
 		FROM mem_nodes WHERE uri = ?
 	`, uri).Scan(&n.ID, &n.URI, &parentURI, &n.NodeType, &n.Category,
 		&l0, &l1, &l2,
 		&mergeable, &mergedFrom, &n.Relevance, &lastAccess, &n.AccessCount,
-		&sourceSession, &n.CreatedAt, &n.UpdatedAt)
+		&sourceSession, &n.CreatedAt, &n.UpdatedAt,
+		&tombstonedAt, &tombstoneReason, &supersededBy)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -149,6 +162,11 @@ func (db *DB) GetNodeByURI(uri string) (*MemNode, error) {
 	if lastAccess.Valid {
 		n.LastAccess = &lastAccess.Int64
 	}
+	if tombstonedAt.Valid {
+		n.TombstonedAt = &tombstonedAt.Int64
+	}
+	n.TombstoneReason = tombstoneReason.String
+	n.SupersededBy = supersededBy.String
 	return &n, nil
 }
 
@@ -198,12 +216,14 @@ func (db *DB) UpsertNode(node *MemNode) error {
 	return db.CreateNode(node)
 }
 
-// FindByCategory returns all leaf nodes for a given category, ordered by relevance DESC.
+// FindByCategory returns live leaf nodes for a given category, ordered by relevance DESC.
+// Retracted nodes are excluded — use FindByCategoryIncludingRetracted for inspection.
 func (db *DB) FindByCategory(category string) ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
-			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
-		FROM mem_nodes WHERE category = ? AND node_type = 'leaf'
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
+			tombstoned_at, tombstone_reason, superseded_by
+		FROM mem_nodes WHERE category = ? AND node_type = 'leaf' AND tombstoned_at IS NULL
 		ORDER BY relevance DESC
 	`, category)
 	if err != nil {
@@ -214,12 +234,14 @@ func (db *DB) FindByCategory(category string) ([]MemNode, error) {
 	return scanNodes(rows)
 }
 
-// ListLeaves returns all leaf nodes ordered by relevance DESC.
+// ListLeaves returns live leaf nodes ordered by relevance DESC.
+// Retracted nodes are excluded — use ListLeavesIncludingRetracted for inspection.
 func (db *DB) ListLeaves() ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
-			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
-		FROM mem_nodes WHERE node_type = 'leaf'
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
+			tombstoned_at, tombstone_reason, superseded_by
+		FROM mem_nodes WHERE node_type = 'leaf' AND tombstoned_at IS NULL
 		ORDER BY relevance DESC
 	`)
 	if err != nil {
@@ -455,19 +477,22 @@ func parentURIOf(uri string) string {
 }
 
 // GetNodeByID returns a node by its database ID, or nil if not found.
+// Retraction state is included on the returned node; callers decide how to handle.
 func (db *DB) GetNodeByID(id int64) (*MemNode, error) {
 	var n MemNode
 	var mergeable int
-	var lastAccess sql.NullInt64
-	var parentURI, l0, l1, l2, mergedFrom, sourceSession sql.NullString
+	var lastAccess, tombstonedAt sql.NullInt64
+	var parentURI, l0, l1, l2, mergedFrom, sourceSession, tombstoneReason, supersededBy sql.NullString
 	err := db.QueryRow(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
-			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
+			tombstoned_at, tombstone_reason, superseded_by
 		FROM mem_nodes WHERE id = ?
 	`, id).Scan(&n.ID, &n.URI, &parentURI, &n.NodeType, &n.Category,
 		&l0, &l1, &l2,
 		&mergeable, &mergedFrom, &n.Relevance, &lastAccess, &n.AccessCount,
-		&sourceSession, &n.CreatedAt, &n.UpdatedAt)
+		&sourceSession, &n.CreatedAt, &n.UpdatedAt,
+		&tombstonedAt, &tombstoneReason, &supersededBy)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -484,15 +509,22 @@ func (db *DB) GetNodeByID(id int64) (*MemNode, error) {
 	if lastAccess.Valid {
 		n.LastAccess = &lastAccess.Int64
 	}
+	if tombstonedAt.Valid {
+		n.TombstonedAt = &tombstonedAt.Int64
+	}
+	n.TombstoneReason = tombstoneReason.String
+	n.SupersededBy = supersededBy.String
 	return &n, nil
 }
 
-// GetChildren returns all direct children of a given parent URI.
+// GetChildren returns live direct children of a given parent URI.
+// Retracted nodes are excluded — use GetChildrenIncludingRetracted for inspection.
 func (db *DB) GetChildren(parentURI string) ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
-			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
-		FROM mem_nodes WHERE parent_uri = ?
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
+			tombstoned_at, tombstone_reason, superseded_by
+		FROM mem_nodes WHERE parent_uri = ? AND tombstoned_at IS NULL
 		ORDER BY uri
 	`, parentURI)
 	if err != nil {
@@ -506,7 +538,8 @@ func (db *DB) GetChildren(parentURI string) ([]MemNode, error) {
 func (db *DB) ListRoots() ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
-			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
+			tombstoned_at, tombstone_reason, superseded_by
 		FROM mem_nodes WHERE parent_uri IS NULL
 		ORDER BY uri
 	`)
@@ -542,7 +575,8 @@ func (db *DB) GetNodesByIDs(ids []int64) ([]MemNode, error) {
 
 	query := fmt.Sprintf(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
-			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at
+			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
+			tombstoned_at, tombstone_reason, superseded_by
 		FROM mem_nodes WHERE id IN (%s)
 	`, ph)
 
@@ -582,10 +616,23 @@ func (db *DB) DeleteOrphanDirs() (int, error) {
 	return int(n), nil
 }
 
-// CountChildren returns the number of direct children for a parent URI.
+// CountChildren returns the number of direct children for a parent URI,
+// including retracted ones. Use CountLiveChildren for counts that match what
+// a default `tree` listing returns; mismatched counts mislead users.
 func (db *DB) CountChildren(parentURI string) (int, error) {
 	var count int
 	err := db.QueryRow("SELECT COUNT(*) FROM mem_nodes WHERE parent_uri = ?", parentURI).Scan(&count)
+	return count, err
+}
+
+// CountLiveChildren returns the number of direct children that aren't retracted.
+// Pair this with GetChildren so listing and count agree on what's visible.
+func (db *DB) CountLiveChildren(parentURI string) (int, error) {
+	var count int
+	err := db.QueryRow(
+		"SELECT COUNT(*) FROM mem_nodes WHERE parent_uri = ? AND tombstoned_at IS NULL",
+		parentURI,
+	).Scan(&count)
 	return count, err
 }
 
@@ -594,12 +641,13 @@ func scanNodes(rows *sql.Rows) ([]MemNode, error) {
 	for rows.Next() {
 		var n MemNode
 		var mergeable int
-		var lastAccess sql.NullInt64
-		var parentURI, l0, l1, l2, mergedFrom, sourceSession sql.NullString
+		var lastAccess, tombstonedAt sql.NullInt64
+		var parentURI, l0, l1, l2, mergedFrom, sourceSession, tombstoneReason, supersededBy sql.NullString
 		if err := rows.Scan(&n.ID, &n.URI, &parentURI, &n.NodeType, &n.Category,
 			&l0, &l1, &l2,
 			&mergeable, &mergedFrom, &n.Relevance, &lastAccess, &n.AccessCount,
-			&sourceSession, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			&sourceSession, &n.CreatedAt, &n.UpdatedAt,
+			&tombstonedAt, &tombstoneReason, &supersededBy); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		n.ParentURI = parentURI.String
@@ -612,6 +660,11 @@ func scanNodes(rows *sql.Rows) ([]MemNode, error) {
 		if lastAccess.Valid {
 			n.LastAccess = &lastAccess.Int64
 		}
+		if tombstonedAt.Valid {
+			n.TombstonedAt = &tombstonedAt.Int64
+		}
+		n.TombstoneReason = tombstoneReason.String
+		n.SupersededBy = supersededBy.String
 		nodes = append(nodes, n)
 	}
 	return nodes, rows.Err()
