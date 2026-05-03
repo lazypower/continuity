@@ -9,9 +9,14 @@
     l1_overview?: string;
     relevance?: number;
     score?: number;
+    // When true, the memory has been retracted. The card displays a marker
+    // and suppresses content. The API default paths shouldn't deliver
+    // retracted nodes here, but this guard makes the component correct
+    // regardless of upstream filtering — see issue #12.
+    retracted?: boolean;
   }
 
-  let { uri, category, l0_abstract, l1_overview, relevance, score }: Props = $props();
+  let { uri, category, l0_abstract, l1_overview, relevance, score, retracted }: Props = $props();
 
   let expanded = $state(false);
   let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
@@ -109,8 +114,35 @@
               {score.toFixed(2)}
             </span>
           {/if}
+          <!--
+            Retracted state rendering. The defensive markers + content
+            suppression below are inert today: /api/tree filters retracted
+            nodes server-side by default, so this prop never arrives true via
+            the live API. The code is here so that if upstream behavior changes
+            (an inspection toggle, an alternate data flow), the card doesn't
+            silently render a retracted memory as if it were live.
+
+            Visual regression coverage is deferred to #6 (Playwright harness
+            + API-seeded fixtures). Retraction state is one of the states
+            those fixtures should expose when the harness lands.
+          -->
+          {#if retracted}
+            <span
+              class="inline-block px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wide opacity-70"
+              style="border: 1px solid var(--text-secondary); color: var(--text-secondary);"
+              title="This memory was retracted. Reason and original content are hidden by contract — use `continuity show <uri> --include-retracted` to inspect."
+            >
+              retracted
+            </span>
+          {/if}
         </div>
-        <p class="text-sm leading-relaxed">{l0_abstract}</p>
+        {#if retracted}
+          <p class="text-xs italic text-[var(--text-secondary)] opacity-70 leading-relaxed">
+            (retracted — reason and original content hidden by contract)
+          </p>
+        {:else}
+          <p class="text-sm leading-relaxed">{l0_abstract}</p>
+        {/if}
       </div>
       <span class="expand-icon text-[var(--text-secondary)] text-sm shrink-0">
         {expanded ? '\u2212' : '\u002B'}
@@ -132,7 +164,7 @@
       </div>
     {/if}
 
-    {#if expanded && l1_overview}
+    {#if expanded && l1_overview && !retracted}
       <div class="mt-3 pt-3 border-t border-[var(--border)] expand-enter">
         <div class="flex items-start justify-between gap-3">
           <!--

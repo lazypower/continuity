@@ -175,6 +175,50 @@ func TestScanNodes_NoPointerAliasing(t *testing.T) {
 	}
 }
 
+func TestRetractNode_RefusesDirNodes(t *testing.T) {
+	db := testDB(t)
+	// Seed a leaf so the parent dir gets created via EnsureParentDirs.
+	seedNode(t, db, "mem://user/events/some-event", "events", "some event")
+
+	dirURI := "mem://user/events"
+	dir, _ := db.GetNodeByURI(dirURI)
+	if dir == nil || dir.NodeType != "dir" {
+		t.Fatalf("expected dir at %s, got %+v", dirURI, dir)
+	}
+
+	_, err := db.RetractNode(dirURI, "trying to retract a dir", "")
+	if err == nil {
+		t.Fatal("expected error when retracting a dir node")
+	}
+	if !strings.Contains(err.Error(), "cannot retract dir node") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "cannot retract dir node")
+	}
+
+	// Dir state must be unchanged — no tombstone fields written.
+	got, _ := db.GetNodeByURI(dirURI)
+	if got.IsRetracted() {
+		t.Error("dir node was retracted despite refusal — leaked write into the failure path")
+	}
+}
+
+func TestRetractNode_RefusesSystemOwnedURIs(t *testing.T) {
+	db := testDB(t)
+	seedNode(t, db, "mem://user/profile/communication", "profile", "synthesized relational profile content")
+
+	_, err := db.RetractNode("mem://user/profile/communication", "trying to retract synthesized node", "")
+	if err == nil {
+		t.Fatal("expected error when retracting a system-owned URI")
+	}
+	if !strings.Contains(err.Error(), "system-owned") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "system-owned")
+	}
+
+	got, _ := db.GetNodeByURI("mem://user/profile/communication")
+	if got.IsRetracted() {
+		t.Error("system-owned node was retracted despite refusal")
+	}
+}
+
 func TestRetractNode_RejectsSelfSupersession(t *testing.T) {
 	db := testDB(t)
 	seedNode(t, db, "mem://user/preferences/loop", "preferences", "loop test")

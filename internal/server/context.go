@@ -61,9 +61,14 @@ func (s *Server) buildContext(currentSessionID string) string {
 		}
 	}
 
-	// Relational profile (Working With You) — capped portion of budget
+	// Relational profile (Working With You) — capped portion of budget.
+	// A retracted profile must not be injected: silently injecting retracted
+	// content into every future session would defeat the retraction. No
+	// fallback path fills this section if the profile is retracted; the
+	// session simply lacks a "Working With You" block until the profile is
+	// re-synthesized by a future extraction.
 	relProfile, err := s.db.GetNodeByURI("mem://user/profile/communication")
-	if err == nil && relProfile != nil && relProfile.L1Overview != "" {
+	if err == nil && relProfile != nil && !relProfile.IsRetracted() && relProfile.L1Overview != "" {
 		section := "\n### Working With You\n"
 		content := relProfile.L1Overview
 		if len(content) > maxRelationalContext {
