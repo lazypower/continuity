@@ -109,6 +109,7 @@
           l1_overview={result.l1_overview}
           relevance={result.relevance}
           score={result.score}
+          retracted={result.retracted}
         />
       </div>
     {/each}
