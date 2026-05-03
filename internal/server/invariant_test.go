@@ -188,6 +188,14 @@ func TestInvariant_HTTPDefaultRoutesExcludeRetracted(t *testing.T) {
 			srv.ServeHTTP(w, req)
 			body := w.Body.String()
 
+			// A failing route would emit an error body that doesn't contain the
+			// markers and would pass the leak assertions for the wrong reason —
+			// false negative on the invariant we're defending. Assert success
+			// status before inspecting content.
+			if w.Code != 200 {
+				t.Fatalf("expected 200, got %d (body: %s)", w.Code, body)
+			}
+
 			assertNoLeak(t, c.name, body)
 			if !c.uriMayAppear {
 				assertURINotPresent(t, c.name, body)
@@ -206,6 +214,10 @@ func TestInvariant_TreeListingMetadataOnlyForRetracted(t *testing.T) {
 	req := newTestRequest("GET", "/api/tree?uri=mem://user/events", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
 
 	var resp struct {
 		Nodes []map[string]any `json:"nodes"`
@@ -248,6 +260,10 @@ func TestInvariant_ShowRetractedRespectsAbsenceContract(t *testing.T) {
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
 
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
 	body := w.Body.String()
 	assertNoLeak(t, "show without flag", body)
 
@@ -274,6 +290,10 @@ func TestInvariant_ShowWithFlagRevealsRetracted(t *testing.T) {
 	req := newTestRequest("GET", "/api/memories?uri="+retractedURI+"&include_retracted=true", nil)
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
 
 	body := w.Body.String()
 	if !strings.Contains(body, retractedReason) {

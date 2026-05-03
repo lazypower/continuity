@@ -115,9 +115,17 @@ func TestNoResurrection_FindSimilarNodeDoesNotReturnRetracted(t *testing.T) {
 	if err := db.CreateNode(n); err != nil {
 		t.Fatal(err)
 	}
-	embedder, _ := NewTFIDFEmbedder(db, 512)
-	vec, _ := embedder.Embed(ctx, n.L0Abstract)
-	db.SaveVector(n.ID, vec, embedder.Model())
+	embedder, err := NewTFIDFEmbedder(db, 512)
+	if err != nil {
+		t.Fatalf("NewTFIDFEmbedder: %v", err)
+	}
+	vec, err := embedder.Embed(ctx, n.L0Abstract)
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if err := db.SaveVector(n.ID, vec, embedder.Model()); err != nil {
+		t.Fatalf("SaveVector: %v", err)
+	}
 	if _, err := db.RetractNode(n.URI, "test retraction", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -154,9 +162,17 @@ func TestNoResurrection_ExtractMemoriesDoesNotMutateRetracted(t *testing.T) {
 	if err := db.CreateNode(n); err != nil {
 		t.Fatal(err)
 	}
-	embedder, _ := NewTFIDFEmbedder(db, 512)
-	vec, _ := embedder.Embed(ctx, n.L0Abstract)
-	db.SaveVector(n.ID, vec, embedder.Model())
+	embedder, err := NewTFIDFEmbedder(db, 512)
+	if err != nil {
+		t.Fatalf("NewTFIDFEmbedder: %v", err)
+	}
+	vec, err := embedder.Embed(ctx, n.L0Abstract)
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if err := db.SaveVector(n.ID, vec, embedder.Model()); err != nil {
+		t.Fatalf("SaveVector: %v", err)
+	}
 
 	if _, err := db.RetractNode(n.URI, "operator decided this preference was wrong", ""); err != nil {
 		t.Fatal(err)
@@ -200,9 +216,15 @@ func TestNoResurrection_RememberDoesNotMutateRetracted(t *testing.T) {
 	uri := seedAndEmbed(t, eng, "preferences", "doomed-pref",
 		"original preference content for testing the no-resurrection guard",
 		"ORIGINAL body content with enough length to pass validation thresholds.")
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewTFIDFEmbedder(db, 512)
+	if err != nil {
+		t.Fatalf("NewTFIDFEmbedder: %v", err)
+	}
 	eng.SetEmbedder(embedder)
-	n, _ := db.GetNodeByURI(uri)
+	n, err := db.GetNodeByURI(uri)
+	if err != nil {
+		t.Fatalf("GetNodeByURI: %v", err)
+	}
 	if err := eng.EmbedNode(ctx, n); err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +235,7 @@ func TestNoResurrection_RememberDoesNotMutateRetracted(t *testing.T) {
 	before := snapshotNode(t, db, uri)
 
 	// Path 1: write to the same URI — must error, must NOT mutate.
-	_, _, err := eng.Remember(ctx, RememberInput{
+	_, _, err = eng.Remember(ctx, RememberInput{
 		Category: "preferences", Name: "doomed-pref",
 		Summary:              "different summary text but same URI to test collision",
 		Body:                 "Different body content with enough length to pass validation thresholds.",

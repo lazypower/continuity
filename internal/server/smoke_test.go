@@ -58,17 +58,24 @@ func TestSmoke_MigrationAndRetractAgainstRealDB(t *testing.T) {
 
 	var victimURI, victimL0, victimCategory string
 	t.Run("pick safe victim", func(t *testing.T) {
+		// Pick a victim that buildContext would actually inject — non-empty L0,
+		// relevance >= 0.3 (the buildContext gate), highest relevance first
+		// (most likely to appear in context). Otherwise the absence assertion
+		// below could pass for the wrong reason: the victim never would have
+		// been injected, so its absence post-retraction proves nothing.
 		err := db.QueryRow(`
 			SELECT uri, l0_abstract, category FROM mem_nodes
 			WHERE node_type = 'leaf'
 			  AND tombstoned_at IS NULL
+			  AND l0_abstract != ''
+			  AND relevance >= 0.3
 			  AND uri != 'mem://user/profile/communication'
 			  AND uri NOT LIKE 'mem://user/profile/%'
-			ORDER BY relevance ASC
+			ORDER BY relevance DESC
 			LIMIT 1
 		`).Scan(&victimURI, &victimL0, &victimCategory)
 		if err == sql.ErrNoRows {
-			t.Skip("no eligible leaf found in DB")
+			t.Skip("no eligible leaf found in DB (need non-empty L0 + relevance >= 0.3)")
 		}
 		if err != nil {
 			t.Fatal(err)
