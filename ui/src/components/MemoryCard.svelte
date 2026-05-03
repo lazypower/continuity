@@ -114,6 +114,18 @@
               {score.toFixed(2)}
             </span>
           {/if}
+          <!--
+            Retracted state rendering. The defensive markers + content
+            suppression below are inert today: /api/tree filters retracted
+            nodes server-side by default, so this prop never arrives true via
+            the live API. The code is here so that if upstream behavior changes
+            (an inspection toggle, an alternate data flow), the card doesn't
+            silently render a retracted memory as if it were live.
+
+            Visual regression coverage is deferred to #6 (Playwright harness
+            + API-seeded fixtures). Retraction state is one of the states
+            those fixtures should expose when the harness lands.
+          -->
           {#if retracted}
             <span
               class="inline-block px-1.5 py-0.5 rounded text-[10px] font-mono uppercase tracking-wide opacity-70"
