@@ -85,6 +85,14 @@ func findSimilarNode(ctx context.Context, db *store.DB, embedder Embedder,
 		if !ok || node.NodeType != "leaf" || node.Category != category {
 			continue
 		}
+		// Retracted nodes must not influence similarity selection. Returning
+		// one as a merge target lets a later UpsertNode silently overwrite the
+		// retracted row's content — resurrection through the back door. The
+		// dedup-against-retracted gate (engine.findRetractedMatches) is a
+		// separate path that intentionally finds these; this one must not.
+		if node.IsRetracted() {
+			continue
+		}
 
 		sim := CosineSimilarity(candidateVec, v.Embedding)
 		if sim > bestSim && sim >= threshold {

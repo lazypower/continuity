@@ -107,6 +107,7 @@
               l0_abstract={node.l0_abstract}
               l1_overview={node.l1_overview}
               relevance={node.relevance}
+              retracted={node.retracted}
             />
           </div>
         {/each}

@@ -6,6 +6,19 @@ import (
 	"time"
 )
 
+// systemOwnedURIs are nodes that continuity synthesizes itself and that
+// participate in invariants beyond user memory (session bootstrap, context
+// injection contracts). They are non-retractable via the public verb —
+// the operator must SQL-edit if they need to be cleared, accepting the
+// friction as the safety mechanism.
+//
+// Rule: any URI synthesized by the system whose absence would silently break
+// downstream contracts belongs here. Add new entries deliberately when
+// synthesizing new system-owned nodes.
+var systemOwnedURIs = map[string]bool{
+	"mem://user/profile/communication": true, // synthesized relational profile; bootstraps session context
+}
+
 // RetractNode marks a memory as retracted. The node remains in the database
 // (tombstone, not delete) but is excluded from default reads.
 //
@@ -15,12 +28,19 @@ import (
 //
 // supersededBy may be empty (pure tombstone) or a URI that supersedes this
 // memory (supersession). When non-empty, the successor URI must already exist.
+//
+// Refuses to retract directory nodes (node_type='dir') and system-owned URIs
+// (see systemOwnedURIs) — both shapes have semantics that retraction would
+// silently corrupt.
 func (db *DB) RetractNode(uri, reason, supersededBy string) (newly bool, err error) {
 	if uri == "" {
 		return false, fmt.Errorf("uri required")
 	}
 	if reason == "" {
 		return false, fmt.Errorf("reason required")
+	}
+	if systemOwnedURIs[uri] {
+		return false, fmt.Errorf("system-owned: %s cannot be retracted via the public verb", uri)
 	}
 
 	target, err := db.GetNodeByURI(uri)
@@ -29,6 +49,9 @@ func (db *DB) RetractNode(uri, reason, supersededBy string) (newly bool, err err
 	}
 	if target == nil {
 		return false, fmt.Errorf("memory not found: %s", uri)
+	}
+	if target.NodeType != "leaf" {
+		return false, fmt.Errorf("cannot retract %s node: %s (only leaf memories are retractable)", target.NodeType, uri)
 	}
 
 	if target.IsRetracted() {

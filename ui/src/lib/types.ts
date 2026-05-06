@@ -1,3 +1,10 @@
+// `retracted` is set true by the API when a memory has been tombstoned via
+// `continuity retract`. Default-read API paths (search, tree default,
+// context injection) suppress retracted nodes server-side, so this field
+// arriving as `true` indicates either an explicit `?include_retracted=true`
+// inspection request, or a server-side change in default behavior. Renderers
+// MUST handle this field defensively — a retracted node should never display
+// as if it were live, even if upstream filtering changes. See issue #12.
 export interface TreeNode {
   uri: string;
   node_type: string;
@@ -5,6 +12,7 @@ export interface TreeNode {
   l0_abstract?: string;
   l1_overview?: string;
   children?: number;
+  retracted?: boolean;
 }
 
 export interface TreeResponse {
@@ -20,6 +28,7 @@ export interface SearchResult {
   score: number;
   similarity: number;
   relevance: number;
+  retracted?: boolean;
 }
 
 export interface SearchResponse {
@@ -35,6 +44,7 @@ export interface ProfileNode {
   l0_abstract: string;
   l1_overview?: string;
   relevance: number;
+  retracted?: boolean;
 }
 
 export interface ProfileResponse {
