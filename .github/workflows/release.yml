@@ -62,7 +62,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: continuity-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: continuity-*
+          # Anchor to the per-matrix binary name (with optional .exe for windows).
+          # An unanchored continuity-* glob also matches committed root-level
+          # docs like continuity-moments-spec.md and ships them as release
+          # assets — see the unwanted asset cleanup on v0.5.0 for the visible
+          # symptom.
+          path: continuity-${{ matrix.goos }}-${{ matrix.goarch }}*
 
   release:
     needs: build
