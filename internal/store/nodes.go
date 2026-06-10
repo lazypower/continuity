@@ -85,10 +85,16 @@ func (n *MemNode) IsRetracted() bool {
 }
 
 // mergeableCategories defines which categories support in-place merging.
+// Must stay in lockstep with engine.mergeableCategory; the store layer reads
+// this when deciding whether UpsertNode should merge or create a new node.
+// feedback joined v0.6.0 (issue #24) — near-duplicate rules ("be terse" /
+// "stay concise") should consolidate, not accrete. reference deliberately
+// stays out: each external pointer is distinct, like entities.
 var mergeableCategories = map[string]bool{
 	"profile":     true,
 	"preferences": true,
 	"patterns":    true,
+	"feedback":    true,
 }
 
 // CreateNode inserts a new mem_node. Sets mergeable based on category.

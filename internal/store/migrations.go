@@ -168,6 +168,57 @@ ALTER TABLE mem_nodes ADD COLUMN tombstone_reason TEXT;
 ALTER TABLE mem_nodes ADD COLUMN superseded_by TEXT;
 `,
 	},
+	{
+		Version:     9,
+		Description: "mem_nodes: add feedback and reference categories (issue #24)",
+		SQL: `
+PRAGMA foreign_keys=OFF;
+
+CREATE TABLE mem_nodes_new (
+    id             INTEGER PRIMARY KEY,
+    uri            TEXT NOT NULL UNIQUE,
+    parent_uri     TEXT,
+    node_type      TEXT NOT NULL CHECK (node_type IN ('dir', 'leaf')),
+    category       TEXT NOT NULL CHECK (category IN ('profile', 'preferences', 'entities', 'events', 'patterns', 'cases', 'moments', 'feedback', 'reference', 'session')),
+
+    -- Three-tier content
+    l0_abstract    TEXT,
+    l1_overview    TEXT,
+    l2_content     TEXT,
+
+    -- Merge control
+    mergeable      INTEGER NOT NULL DEFAULT 0,
+    merged_from    TEXT,
+
+    -- Decay
+    relevance      REAL NOT NULL DEFAULT 1.0,
+    last_access    INTEGER,
+    access_count   INTEGER NOT NULL DEFAULT 0,
+
+    -- Metadata
+    source_session TEXT,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+
+    -- Retraction (added in v8)
+    tombstoned_at    INTEGER,
+    tombstone_reason TEXT,
+    superseded_by    TEXT,
+
+    FOREIGN KEY (parent_uri) REFERENCES mem_nodes_new(uri)
+);
+
+INSERT INTO mem_nodes_new SELECT * FROM mem_nodes;
+DROP TABLE mem_nodes;
+ALTER TABLE mem_nodes_new RENAME TO mem_nodes;
+
+CREATE INDEX idx_nodes_parent    ON mem_nodes(parent_uri);
+CREATE INDEX idx_nodes_category  ON mem_nodes(category);
+CREATE INDEX idx_nodes_relevance ON mem_nodes(relevance DESC);
+
+PRAGMA foreign_keys=ON;
+`,
+	},
 }
 
 func (db *DB) migrate() error {

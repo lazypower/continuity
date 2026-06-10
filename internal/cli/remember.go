@@ -23,7 +23,7 @@ var (
 var validCategorySet = map[string]bool{
 	"profile": true, "preferences": true, "entities": true,
 	"events": true, "patterns": true, "cases": true,
-	"moments": true,
+	"moments": true, "feedback": true, "reference": true,
 }
 
 var rememberCmd = &cobra.Command{
@@ -32,15 +32,23 @@ var rememberCmd = &cobra.Command{
 	Long: `Store a structured memory directly into the memory tree.
 Requires a running server (continuity serve).
 
-Example:
+Examples:
   continuity remember -c preferences -n devbox \
     -s "Always use devbox for development tooling" \
-    -b "The project uses devbox shell to provide Go, SQLite tools, and other dev dependencies."`,
+    -b "The project uses devbox shell to provide Go, SQLite tools, and other dev dependencies."
+
+  continuity remember -c feedback -n terse-summaries \
+    -s "User wants terse responses with no trailing summaries." \
+    -b "Rule: terse responses, no trailing summaries. Why: user reads the diff and the recap is wasted tokens. How to apply: omit closing recap unless the user asks for it."
+
+  continuity remember -c reference -n linear-ingest \
+    -s "Pipeline bugs are tracked in Linear project INGEST." \
+    -b "Linear project 'INGEST' is where the team tracks all pipeline bugs. Check there when filing or referencing pipeline-related tickets."`,
 	RunE: runRemember,
 }
 
 func init() {
-	rememberCmd.Flags().StringVarP(&rememberCategory, "category", "c", "", "Memory category (required: profile, preferences, entities, events, patterns, cases, moments)")
+	rememberCmd.Flags().StringVarP(&rememberCategory, "category", "c", "", "Memory category (required: profile, preferences, feedback, entities, events, patterns, cases, moments, reference)")
 	rememberCmd.Flags().StringVarP(&rememberName, "name", "n", "", "URI slug name (required)")
 	rememberCmd.Flags().StringVarP(&rememberSummary, "summary", "s", "", "L0 abstract — one sentence, max 200 chars (required)")
 	rememberCmd.Flags().StringVarP(&rememberBody, "body", "b", "", "L1 overview — max 2000 chars, compress detail aggressively (required)")

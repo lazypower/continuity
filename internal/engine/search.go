@@ -35,6 +35,10 @@ func (o SearchOpts) limit() int {
 // categoryBoost returns a scoring multiplier for high-signal categories.
 // Moments are permanent relational anchors that passed a triple qualification
 // filter — they deserve a ranking boost to surface when marginally relevant.
+// "feedback" and "reference" deliberately take the default 1.0 multiplier:
+// feedback already ranks above patterns in context injection (server/context.go),
+// and reference is low-signal locator data that should not jump ranking on
+// marginal similarity.
 func categoryBoost(category string) float64 {
 	if category == "moments" {
 		return 1.3

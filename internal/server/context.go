@@ -116,7 +116,12 @@ func (s *Server) buildContext(currentSessionID string) string {
 	}
 	var items []rankedItem
 
-	for _, cat := range []string{"profile", "preferences", "patterns", "events", "cases", "entities"} {
+	// Ordering matters: items are scored independently but iterated in this order
+	// before the score-sort. "feedback" ranks above "patterns" because feedback
+	// shapes *action* (do/don't) and patterns are *knowledge*; when they conflict,
+	// feedback wins. "reference" trails because it's low-signal locator data —
+	// useful when surfaced by search but not worth crowding the SessionStart budget.
+	for _, cat := range []string{"profile", "preferences", "feedback", "patterns", "events", "cases", "entities", "reference"} {
 		nodes, err := s.db.FindByCategory(cat)
 		if err != nil {
 			continue
@@ -153,7 +158,12 @@ func (s *Server) buildContext(currentSessionID string) string {
 		}
 
 		var line string
-		if it.category == "profile" || it.category == "preferences" {
+		// Profile, preferences, and feedback collapse into the "Your Profile" block
+		// without a category tag. Feedback rides with profile/preferences because
+		// it's directional guidance that shapes how the agent should act (issue #24)
+		// — not a labelled "memory" you'd browse but identity-shaping context.
+		isProfileSection := it.category == "profile" || it.category == "preferences" || it.category == "feedback"
+		if isProfileSection {
 			line = fmt.Sprintf("- %s\n", l0)
 		} else {
 			line = fmt.Sprintf("- [%s] %s\n", it.category, l0)
@@ -166,7 +176,7 @@ func (s *Server) buildContext(currentSessionID string) string {
 		itemBudget -= len(line)
 		itemsUsed++
 
-		if it.category == "profile" || it.category == "preferences" {
+		if isProfileSection {
 			profileLines = append(profileLines, line)
 		} else {
 			memoryLines = append(memoryLines, line)

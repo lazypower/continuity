@@ -4,10 +4,12 @@
   /* Category colors — saturated neons matching hero image */
   --color-profile: #60a5fa;     /* bright blue — top-left branches */
   --color-preferences: #34d399;  /* emerald green — left branches */
+  --color-feedback: #f97316;     /* warm coral — directional guidance */
   --color-entities: #c084fc;     /* vivid purple — right branches */
   --color-events: #fbbf24;       /* warm amber — lower-left branches */
   --color-patterns: #2dd4bf;     /* bright teal — top-right branches */
   --color-cases: #fb7185;        /* rose pink — lower-right branches */
+  --color-reference: #94a3b8;    /* cool slate — locator data, low-key */
 
   /* Golden accent — the tree trunk */
   --color-accent: #d4a843;
@@ -90,10 +92,12 @@ button, input, select {
 /* Utility: category glow effect */
 .glow-profile { box-shadow: 0 0 12px rgba(96, 165, 250, var(--glow-opacity)); }
 .glow-preferences { box-shadow: 0 0 12px rgba(52, 211, 153, var(--glow-opacity)); }
+.glow-feedback { box-shadow: 0 0 12px rgba(249, 115, 22, var(--glow-opacity)); }
 .glow-entities { box-shadow: 0 0 12px rgba(192, 132, 252, var(--glow-opacity)); }
 .glow-events { box-shadow: 0 0 12px rgba(251, 191, 36, var(--glow-opacity)); }
 .glow-patterns { box-shadow: 0 0 12px rgba(45, 212, 191, var(--glow-opacity)); }
 .glow-cases { box-shadow: 0 0 12px rgba(251, 113, 133, var(--glow-opacity)); }
+.glow-reference { box-shadow: 0 0 12px rgba(148, 163, 184, var(--glow-opacity)); }
 
 /* Expand/collapse animation */
 .expand-enter {

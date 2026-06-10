@@ -834,3 +834,107 @@ func TestExtractSessionForceBypassesIdempotency(t *testing.T) {
 		t.Error("expected forced extraction to produce memory")
 	}
 }
+
+// TestRememberFeedbackMergesOnUpdate confirms feedback rules consolidate
+// rather than accrete when the same slug is written twice. Issue #24 flagged
+// six near-duplicate "be terse" memories as the failure mode to avoid.
+func TestRememberFeedbackMergesOnUpdate(t *testing.T) {
+	db := testDB(t)
+	eng := New(db, nil)
+	ctx := context.Background()
+
+	uri1, created1, err := eng.Remember(ctx, RememberInput{
+		Category: "feedback",
+		Name:     "terse-summaries",
+		Summary:  "User wants terse responses with no trailing summaries.",
+		Body:     "Rule: terse responses, no trailing summaries. Why: user can read the diff. How to apply: omit closing recap.",
+	})
+	if err != nil {
+		t.Fatalf("first Remember: %v", err)
+	}
+	if !created1 {
+		t.Error("first call should be created=true")
+	}
+	if uri1 != "mem://user/feedback/terse-summaries" {
+		t.Errorf("uri = %q, want mem://user/feedback/terse-summaries", uri1)
+	}
+
+	// Refine the same rule — should merge in place because feedback is mergeable.
+	uri2, created2, err := eng.Remember(ctx, RememberInput{
+		Category: "feedback",
+		Name:     "terse-summaries",
+		Summary:  "User wants terse responses, no recap, no preamble.",
+		Body:     "Rule: terse responses, no recap, no preamble. Why: token cost outweighs scanning cost. How to apply: never add a closing summary.",
+	})
+	if err != nil {
+		t.Fatalf("second Remember: %v", err)
+	}
+	if uri2 != uri1 {
+		t.Errorf("merge expected same URI, got %q vs %q", uri2, uri1)
+	}
+	if created2 {
+		t.Error("second call should be created=false (merge)")
+	}
+
+	node, _ := db.GetNodeByURI(uri1)
+	if node == nil {
+		t.Fatal("expected feedback node to exist after merge")
+	}
+	if !strings.Contains(node.L0Abstract, "no recap") {
+		t.Errorf("expected merged L0 to carry refined content, got %q", node.L0Abstract)
+	}
+}
+
+// TestRememberReferenceImmutable confirms reference category collisions produce
+// a NEW node (timestamp-suffixed slug), not an in-place overwrite. Each external
+// pointer is distinct (Linear board ≠ Grafana dashboard); merging would corrupt
+// the lookup.
+func TestRememberReferenceImmutable(t *testing.T) {
+	db := testDB(t)
+	eng := New(db, nil)
+	ctx := context.Background()
+
+	uri1, created1, err := eng.Remember(ctx, RememberInput{
+		Category: "reference",
+		Name:     "linear-ingest",
+		Summary:  "Pipeline bugs are tracked in Linear project INGEST.",
+		Body:     "Linear project 'INGEST' is where the team tracks all pipeline bugs.",
+	})
+	if err != nil {
+		t.Fatalf("first Remember: %v", err)
+	}
+	if !created1 {
+		t.Error("first call should be created=true")
+	}
+	if uri1 != "mem://user/reference/linear-ingest" {
+		t.Errorf("uri = %q, want mem://user/reference/linear-ingest", uri1)
+	}
+
+	// Write the same slug again — immutable categories must NOT silently
+	// overwrite. UpsertNode appends a timestamp suffix; Remember returns
+	// created=true with the new URI.
+	uri2, created2, err := eng.Remember(ctx, RememberInput{
+		Category: "reference",
+		Name:     "linear-ingest",
+		Summary:  "Different reference info that happens to share a slug.",
+		Body:     "Some other Linear-related reference data that should NOT merge in place over the first entry.",
+	})
+	if err != nil {
+		t.Fatalf("second Remember: %v", err)
+	}
+	if uri2 == uri1 {
+		t.Errorf("immutable collision must produce a NEW URI, got %q for both writes", uri1)
+	}
+	if !created2 {
+		t.Error("immutable collision should report created=true (new node)")
+	}
+
+	// Original node must still be readable and unmodified.
+	original, _ := db.GetNodeByURI(uri1)
+	if original == nil {
+		t.Fatal("original reference node missing after collision")
+	}
+	if !strings.Contains(original.L0Abstract, "Pipeline bugs") {
+		t.Errorf("original L0 was overwritten: %q", original.L0Abstract)
+	}
+}

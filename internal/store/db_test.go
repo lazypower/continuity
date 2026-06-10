@@ -27,8 +27,8 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 8 {
-		t.Errorf("SchemaVersion = %d, want 8", v)
+	if v != 9 {
+		t.Errorf("SchemaVersion = %d, want 9", v)
 	}
 }
 
@@ -128,8 +128,8 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 8 {
-		t.Errorf("SchemaVersion after re-migrate = %d, want 8", v)
+	if v != 9 {
+		t.Errorf("SchemaVersion after re-migrate = %d, want 9", v)
 	}
 }
 
@@ -147,6 +147,85 @@ func TestMomentsCategory(t *testing.T) {
 	`)
 	if err != nil {
 		t.Fatalf("moments category insert failed: %v", err)
+	}
+}
+
+// Migration 9 (issue #24) added feedback and reference as first-class categories.
+// These tests pin the CHECK constraint behavior so a future rewrite of the table
+// can't silently drop them.
+func TestFeedbackCategory(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		INSERT INTO mem_nodes (uri, node_type, category, created_at, updated_at)
+		VALUES ('mem://user/feedback/terse-summaries', 'leaf', 'feedback', 1000, 1000)
+	`)
+	if err != nil {
+		t.Fatalf("feedback category insert failed: %v", err)
+	}
+}
+
+func TestReferenceCategory(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(`
+		INSERT INTO mem_nodes (uri, node_type, category, created_at, updated_at)
+		VALUES ('mem://user/reference/linear-ingest', 'leaf', 'reference', 1000, 1000)
+	`)
+	if err != nil {
+		t.Fatalf("reference category insert failed: %v", err)
+	}
+}
+
+// TestMigration9PreservesRetractionColumns confirms the v9 table swap carries
+// the v8 retraction columns through without data loss. If the v9 schema ever
+// drifts from the column list in CREATE TABLE, this catches it.
+func TestMigration9PreservesRetractionColumns(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	// Write a retracted-style row to exercise all v8 columns and the new categories
+	// in one shot.
+	_, err = db.Exec(`
+		INSERT INTO mem_nodes (
+			uri, node_type, category,
+			tombstoned_at, tombstone_reason, superseded_by,
+			created_at, updated_at
+		) VALUES (
+			'mem://user/feedback/retracted-rule', 'leaf', 'feedback',
+			2000, 'wrong write', 'mem://user/feedback/replacement',
+			1000, 1000
+		)
+	`)
+	if err != nil {
+		t.Fatalf("insert with v8 retraction columns failed: %v", err)
+	}
+
+	var (
+		tombstonedAt    int64
+		tombstoneReason string
+		supersededBy    string
+	)
+	err = db.QueryRow(`
+		SELECT tombstoned_at, tombstone_reason, superseded_by
+		FROM mem_nodes WHERE uri = 'mem://user/feedback/retracted-rule'
+	`).Scan(&tombstonedAt, &tombstoneReason, &supersededBy)
+	if err != nil {
+		t.Fatalf("read back retraction columns: %v", err)
+	}
+	if tombstonedAt != 2000 || tombstoneReason != "wrong write" || supersededBy != "mem://user/feedback/replacement" {
+		t.Errorf("retraction columns mangled: got (%d, %q, %q)", tombstonedAt, tombstoneReason, supersededBy)
 	}
 }
 

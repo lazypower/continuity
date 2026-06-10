@@ -439,9 +439,13 @@ func (e *Engine) evictRedundantMoment(ctx context.Context) (string, error) {
 }
 
 // mergeableCategory returns whether the given category supports in-place merging.
+// "feedback" is mergeable: near-duplicate rules ("be terse", "stay concise") should
+// consolidate rather than accrete (issue #24). "reference" is NOT mergeable: each
+// external pointer (a Linear project, a Grafana board, a Slack channel) is a
+// distinct entry, like entities — merging across-purpose corrupts the lookup.
 func mergeableCategory(category string) bool {
 	switch category {
-	case "profile", "preferences", "patterns":
+	case "profile", "preferences", "patterns", "feedback":
 		return true
 	default:
 		return false
