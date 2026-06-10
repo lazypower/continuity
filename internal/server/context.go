@@ -116,11 +116,15 @@ func (s *Server) buildContext(currentSessionID string) string {
 	}
 	var items []rankedItem
 
-	// Ordering matters: items are scored independently but iterated in this order
-	// before the score-sort. "feedback" ranks above "patterns" because feedback
-	// shapes *action* (do/don't) and patterns are *knowledge*; when they conflict,
-	// feedback wins. "reference" trails because it's low-signal locator data —
-	// useful when surfaced by search but not worth crowding the SessionStart budget.
+	// The real "feedback above patterns" guarantee comes from the *section
+	// split* below (feedback rides in "Your Profile", patterns rides in
+	// "Recent Memories" — different sections, rendered in fixed order). The
+	// iteration order here exists for two reasons: (1) documentation of the
+	// intended priority, and (2) as a deterministic tiebreaker for the
+	// stable sort below when scores are equal (common for freshly written
+	// nodes where Relevance=1.0 and AccessCount=0). Don't add a new category
+	// to either end of this list without thinking about which section it
+	// joins downstream.
 	for _, cat := range []string{"profile", "preferences", "feedback", "patterns", "events", "cases", "entities", "reference"} {
 		nodes, err := s.db.FindByCategory(cat)
 		if err != nil {
@@ -138,8 +142,10 @@ func (s *Server) buildContext(currentSessionID string) string {
 		}
 	}
 
-	// Sort by score descending
-	sort.Slice(items, func(i, j int) bool {
+	// Sort by score descending. SliceStable so that when scores tie (every
+	// freshly written node scores 1.0 * accessBoost == 1.0), the iteration
+	// order above survives as the tiebreaker rather than becoming arbitrary.
+	sort.SliceStable(items, func(i, j int) bool {
 		return items[i].score > items[j].score
 	})
 	if len(items) > maxContextItems {
