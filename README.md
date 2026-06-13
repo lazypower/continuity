@@ -263,6 +263,8 @@ continuity retract     Retract a memory you wrote (tombstone or supersession)
 continuity profile     Show relational profile
 continuity tree        Browse the memory tree
 continuity dedup       Deduplicate similar memory nodes
+continuity snapshot list      List retained migration safety snapshots
+continuity snapshot prune     Remove retained migration safety snapshots
 continuity version     Print version information
 ```
 
@@ -283,6 +285,29 @@ continuity retract mem://user/preferences/old-style \
 Retracted memories stay in the tree — nothing is silently erased. Pass `--include-retracted` to `show` or `tree` to inspect them. The reason text is sequestered behind that flag (absent from default responses, not empty or redacted), so confronting your own past retraction is a deliberate act.
 
 The verb exists for the agent to curate its own substrate. Operators don't run it. The trust contract is what governs the substrate, not architectural enforcement.
+
+### Migration safety snapshots
+
+Migrations are the one place Continuity knowingly performs potentially destructive operations against the user's substrate. SQLite's transaction guarantees catch most failure modes (power loss, disk full, syntax errors all abort cleanly), but they cannot catch a buggy migration that successfully commits the wrong state — a column-order misalignment in an `INSERT SELECT *` rebuild, say.
+
+For that narrow class of failure, Continuity takes an automatic safety snapshot immediately before each migration explicitly marked risky (currently the two full-table rebuilds, v6 and v9). The snapshot is an atomic copy of the live database written via `VACUUM INTO`, named `continuity-pre-vN-<RFC3339>.db`, and lives in `~/.continuity/snapshots/`.
+
+**This is not a backup system.** It is a one-shot safety net during the upgrade window. The policy is intentionally narrow:
+
+- Only migrations marked `Risky` in the source trigger snapshots. Additive migrations (`ALTER TABLE ADD COLUMN`) do not.
+- Only the **most recent** risky-migration snapshot is retained. A newer risky migration replaces the older snapshot.
+- Snapshots **auto-delete** after a small number of successful `continuity serve` boots (default: 3). The presumption is that if the new schema were going to break, it would have broken by then.
+- If snapshot creation fails for any reason (disk full, permission denied, etc.), the migration **does not proceed**. The operator can set `CONTINUITY_NO_MIGRATION_SNAPSHOT=1` to skip — a deliberate, knowing tradeoff.
+- There is **no automated restore**. Restoration is manual: stop the server, `cp` the snapshot file over `~/.continuity/continuity.db`, restart.
+
+Inspect or remove snapshots:
+
+```bash
+continuity snapshot list   # show retained snapshots, auto-delete countdown
+continuity snapshot prune  # remove all retained snapshots immediately
+```
+
+Operators are still expected to maintain their own backup strategy (e.g., `restic`, `tar`, filesystem snapshots) — this safety net does not relieve that responsibility, and the lifecycle bounds are tight enough that it should not lull anyone into thinking otherwise.
 
 ## API
 

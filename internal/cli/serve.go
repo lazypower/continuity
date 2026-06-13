@@ -72,6 +72,23 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
+	// Tick the migration-snapshot retention counter. Each `continuity serve`
+	// start counts as one boot against any retained safety snapshots; after
+	// SnapshotRetentionBoots successful boots, snapshots auto-delete.
+	// Deliberately NOT in store.Open so CLI subcommands that inspect or
+	// prune snapshots don't advance the counter.
+	if err := db.TickSnapshotRetention(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: snapshot retention tick failed: %v\n", err)
+	}
+	if snaps, _ := db.ListMigrationSnapshots(); len(snaps) > 0 {
+		for _, s := range snaps {
+			fmt.Fprintf(os.Stderr,
+				"migration safety snapshot retained: %s (auto-deletes after %d more successful boots)\n",
+				s.Path, store.SnapshotRetentionBoots-s.BootsSince,
+			)
+		}
+	}
+
 	// Create LLM client and engine
 	var eng *engine.Engine
 	llmClient, err := llm.NewClient(cfg.LLM)
