@@ -1,7 +1,13 @@
 package store
 
 import (
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestOpenMemory(t *testing.T) {
@@ -109,6 +115,113 @@ func TestSessionsConstraints(t *testing.T) {
 	`)
 	if err == nil {
 		t.Error("expected error for invalid status, got nil")
+	}
+}
+
+// TestMigrate_RejectsFutureSchemaVersion pins the forward-compat guard. A
+// continuity binary built at schema head H must refuse to operate against a
+// DB whose schema_versions table records a version > H — a newer binary
+// previously migrated that DB, and silently ignoring the newer invariants
+// would risk on-disk corruption (CHECK constraints we don't understand,
+// foreign-key shapes that may have changed, etc.).
+//
+// The scenario this test reproduces: user upgrades continuity, runs `serve`
+// once (which applies a future migration), then downgrades to the older
+// binary. Without the guard, the older binary would proceed quietly; with
+// the guard, the older binary fails fast with a clear remediation message.
+func TestMigrate_RejectsFutureSchemaVersion(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "future.db")
+
+	// Step 1: produce a DB at current head so subsequent reopens are valid.
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("initial open: %v", err)
+	}
+	current, err := db.SchemaVersion()
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if current != headVersion() {
+		t.Fatalf("initial schema version = %d, want head %d", current, headVersion())
+	}
+	db.Close()
+
+	// Step 2: stamp a fake "future" migration into schema_versions. This is
+	// what a newer binary would have left behind after applying its own
+	// migrations.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	const futureVersion = 9999
+	_, err = raw.Exec(
+		`INSERT INTO schema_versions (version, description) VALUES (?, ?)`,
+		futureVersion, "from a future continuity build",
+	)
+	if err != nil {
+		raw.Close()
+		t.Fatalf("stamp future version: %v", err)
+	}
+	raw.Close()
+
+	// Step 3: reopen with the current binary. The guard MUST fire.
+	_, err = Open(dbPath)
+	if err == nil {
+		t.Fatal("Open succeeded; the guard must refuse a future schema version")
+	}
+
+	var typed *ErrSchemaTooNew
+	if !errors.As(err, &typed) {
+		t.Fatalf("error is not *ErrSchemaTooNew: %v", err)
+	}
+	if typed.Found != futureVersion {
+		t.Errorf("ErrSchemaTooNew.Found = %d, want %d", typed.Found, futureVersion)
+	}
+	if typed.Supported != headVersion() {
+		t.Errorf("ErrSchemaTooNew.Supported = %d, want head %d", typed.Supported, headVersion())
+	}
+
+	// Operator-facing message: must name both versions and offer a path
+	// forward. This contract drives what shows up on stderr when serve
+	// fails to start, and agents/operators read it. Pin the substrings
+	// rather than the exact text so phrasing tweaks remain frictionless.
+	msg := err.Error()
+	for _, substr := range []string{
+		"9999",                // the version we found
+		"max 9",               // the version we support (head is 9 today)
+		"upgrade continuity",  // explicit remediation
+		"restore a backup",    // alternative remediation
+	} {
+		if !strings.Contains(msg, substr) {
+			t.Errorf("error message missing %q\nfull message: %s", substr, msg)
+		}
+	}
+}
+
+// TestMigrate_AcceptsHeadVersion is the regression guard for the
+// forward-compat check: a DB at exactly head must NOT be rejected. The guard
+// uses `> head` rather than `>= head` — this test pins that boundary.
+func TestMigrate_AcceptsHeadVersion(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	v, err := db.SchemaVersion()
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if v != headVersion() {
+		t.Fatalf("schema version = %d, want head %d (test setup bug)", v, headVersion())
+	}
+
+	// A second migrate against the head-version DB is exactly the path
+	// every restart of `continuity serve` takes. Must be a no-op, not a
+	// "too new" rejection.
+	if err := db.migrate(); err != nil {
+		t.Errorf("migrate against head-version DB should succeed; got %v", err)
 	}
 }
 
