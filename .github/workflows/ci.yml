@@ -29,6 +29,22 @@ jobs:
       - name: Test
         run: go test ./... -v
 
+  # e2e exercises subprocess tests with -tags noembed so this job never depends
+  # on the npm/UI pipeline. It's the contract guard for tests that build their
+  # own binary at runtime (internal/cli/retract_e2e_test.go etc.); if the
+  # noembed path silently breaks, this job fails even when `test` is green.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run subprocess e2e tests
+        run: go test -tags noembed -v -count=1 -timeout 5m -run 'E2E|Subprocess' ./internal/...
+
   build:
     runs-on: ubuntu-latest
     steps:
