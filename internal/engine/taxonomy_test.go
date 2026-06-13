@@ -1,6 +1,10 @@
 package engine
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/lazypower/continuity/internal/store"
+)
 
 // Issue #24 added `feedback` and `reference` as first-class categories. Pin
 // owner routing so neither one ever silently flips to the agent-side tree.
@@ -26,9 +30,10 @@ func TestOwnerForCategory(t *testing.T) {
 	}
 }
 
-// Pin merge rules for every category. feedback is mergeable (consolidate
-// near-duplicate rules); reference is NOT (each pointer is a distinct entry,
-// merging would corrupt the lookup).
+// Pin merge rules for every category, routed through the single source of
+// truth (store.IsMergeable). feedback is mergeable (consolidate near-duplicate
+// rules); reference is NOT (each pointer is a distinct entry, merging would
+// corrupt the lookup).
 func TestMergeableCategory(t *testing.T) {
 	tests := []struct {
 		category string
@@ -46,8 +51,8 @@ func TestMergeableCategory(t *testing.T) {
 		{"bogus", false},
 	}
 	for _, tt := range tests {
-		if got := mergeableCategory(tt.category); got != tt.want {
-			t.Errorf("mergeableCategory(%q) = %v, want %v", tt.category, got, tt.want)
+		if got := store.IsMergeable(tt.category); got != tt.want {
+			t.Errorf("store.IsMergeable(%q) = %v, want %v", tt.category, got, tt.want)
 		}
 	}
 }

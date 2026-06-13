@@ -438,20 +438,6 @@ func (e *Engine) evictRedundantMoment(ctx context.Context) (string, error) {
 	return evictURI, nil
 }
 
-// mergeableCategory returns whether the given category supports in-place merging.
-// "feedback" is mergeable: near-duplicate rules ("be terse", "stay concise") should
-// consolidate rather than accrete (issue #24). "reference" is NOT mergeable: each
-// external pointer (a Linear project, a Grafana board, a Slack channel) is a
-// distinct entry, like entities — merging across-purpose corrupts the lookup.
-func mergeableCategory(category string) bool {
-	switch category {
-	case "profile", "preferences", "patterns", "feedback":
-		return true
-	default:
-		return false
-	}
-}
-
 // ExtractSignal processes a user-flagged signal prompt and creates a memory immediately.
 // This is designed to be called asynchronously (in a goroutine).
 func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) error {

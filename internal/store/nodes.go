@@ -85,8 +85,8 @@ func (n *MemNode) IsRetracted() bool {
 }
 
 // mergeableCategories defines which categories support in-place merging.
-// Must stay in lockstep with engine.mergeableCategory; the store layer reads
-// this when deciding whether UpsertNode should merge or create a new node.
+// This is the single source of truth — read it via IsMergeable. The
+// previous engine.mergeableCategory mirror is gone; do not reintroduce it.
 // feedback joined v0.6.0 (issue #24) — near-duplicate rules ("be terse" /
 // "stay concise") should consolidate, not accrete. reference deliberately
 // stays out: each external pointer is distinct, like entities.
@@ -97,12 +97,20 @@ var mergeableCategories = map[string]bool{
 	"feedback":    true,
 }
 
+// IsMergeable reports whether the given category supports in-place merging.
+// This is the single source of truth consulted by UpsertNode and any
+// upstream policy checks; the map itself stays unexported so callers can
+// neither mutate it nor diverge from it.
+func IsMergeable(category string) bool {
+	return mergeableCategories[category]
+}
+
 // CreateNode inserts a new mem_node. Sets mergeable based on category.
 // Automatically ensures parent directory nodes exist.
 func (db *DB) CreateNode(node *MemNode) error {
 	now := time.Now().UnixMilli()
 	mergeable := 0
-	if mergeableCategories[node.Category] {
+	if IsMergeable(node.Category) {
 		mergeable = 1
 	}
 
@@ -128,7 +136,7 @@ func (db *DB) CreateNode(node *MemNode) error {
 
 	id, _ := result.LastInsertId()
 	node.ID = id
-	node.Mergeable = mergeableCategories[node.Category]
+	node.Mergeable = IsMergeable(node.Category)
 	node.Relevance = 1.0
 	node.CreatedAt = now
 	node.UpdatedAt = now
