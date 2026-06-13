@@ -159,6 +159,41 @@ func TestValidateCandidate_MomentsCategory(t *testing.T) {
 	}
 }
 
+// Issue #24 added feedback and reference. The validator treats them like any
+// other category — no special structural enforcement at this layer (the
+// rule + Why + How-to-apply shape lives in the extraction prompt, not here).
+func TestValidateCandidate_FeedbackCategory(t *testing.T) {
+	c := memoryCandidate{
+		Category: "feedback",
+		URIHint:  "terse-summaries",
+		L0:       "User wants terse responses with no trailing summaries.",
+		L1:       "Rule: terse responses, no trailing summaries. Why: user can read the diff and the summary is wasted tokens. How to apply: omit closing recap unless user asks.",
+	}
+	vc, err := validateCandidate(c)
+	if err != nil {
+		t.Fatalf("unexpected error for feedback category: %v", err)
+	}
+	if vc.Category != "feedback" {
+		t.Errorf("Category = %q, want feedback", vc.Category)
+	}
+}
+
+func TestValidateCandidate_ReferenceCategory(t *testing.T) {
+	c := memoryCandidate{
+		Category: "reference",
+		URIHint:  "linear-ingest",
+		L0:       "Pipeline bugs are tracked in Linear project INGEST.",
+		L1:       "Linear project 'INGEST' is the canonical home for pipeline bug reports.",
+	}
+	vc, err := validateCandidate(c)
+	if err != nil {
+		t.Fatalf("unexpected error for reference category: %v", err)
+	}
+	if vc.Category != "reference" {
+		t.Errorf("Category = %q, want reference", vc.Category)
+	}
+}
+
 func TestTruncateClean(t *testing.T) {
 	s := "hello world this is a test string"
 	result := truncateClean(s, 15)

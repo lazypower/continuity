@@ -159,16 +159,18 @@ Deterministic access: `continuity tree mem://user/profile/` shows all profile no
 
 ## 5. Memory Taxonomy
 
-Six categories with explicit merge rules. Stolen from OpenViking's insight that profile data should be updated but historical events should be preserved.
+Eight first-class categories with explicit merge rules (plus `moments`, documented separately — a small diversity-sampled pool injected into every session). Stolen from OpenViking's insight that profile data should be updated but historical events should be preserved; the `feedback` and `reference` rows were added in v0.6.0 (issue #24) to give *directional guidance about how to work* and *pointers to external systems* their own home rather than smuggling them into `preferences`.
 
 | Category | Owner | Mergeable | Description |
 |----------|-------|-----------|-------------|
 | **profile** | user | yes | Identity attributes: coding style, tool preferences, communication patterns. Updated as understanding deepens. |
-| **preferences** | user | yes | Changeable choices: "uses bun not npm", "prefers Go over Rust". Overwritten when preferences change. |
+| **preferences** | user | yes | Changeable configurational choices: "uses bun not npm", "prefers Go over Rust". Settings/knobs. Overwritten when preferences change. |
+| **feedback** | user | yes | Directional guidance the user gave about HOW to approach work — corrections AND confirmations, each with a why. L1 carries `<rule>. Why: <reason>. How to apply: <when>.` Boundary: "do/don't X (behavior) + why" → feedback; "X is always Y (setting)" → preference; "the technique for X is Y (knowledge)" → pattern. |
 | **entities** | user | no | People, projects, services, APIs the user works with. Each is a distinct node. Never merged — `acme-api` and `beta-service` stay separate. |
 | **events** | user | no | Completed actions with timestamps: deployments, bug fixes, decisions. Immutable historical record. |
 | **patterns** | agent | yes | Reusable techniques: "this codebase uses X pattern for Y". Merged as understanding refines. |
 | **cases** | agent | no | Problem→solution pairs: "SQLite migration failed because SessionStore has its own chain". Immutable reference. |
+| **reference** | user | no | Pointers to external systems and team rituals: "pipeline bugs tracked in Linear project INGEST", "oncall watches grafana.internal/d/api-latency". Each pointer is distinct; merging across-purpose corrupts the lookup. |
 
 ### 5.1 Extraction Pipeline
 

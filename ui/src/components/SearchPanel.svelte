@@ -34,7 +34,7 @@
     if (e.key === 'Enter') doSearch();
   }
 
-  const categories = ['', 'profile', 'preferences', 'entities', 'events', 'patterns', 'cases'];
+  const categories = ['', 'profile', 'preferences', 'feedback', 'entities', 'events', 'patterns', 'cases', 'reference'];
 </script>
 
 <div class="p-6 max-w-4xl mx-auto">

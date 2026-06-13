@@ -59,13 +59,15 @@ export interface HealthResponse {
   db: boolean;
 }
 
-export type Category = 'profile' | 'preferences' | 'entities' | 'events' | 'patterns' | 'cases';
+export type Category = 'profile' | 'preferences' | 'feedback' | 'entities' | 'events' | 'patterns' | 'cases' | 'reference';
 
 export const categoryColors: Record<Category, string> = {
   profile: 'var(--color-profile)',
   preferences: 'var(--color-preferences)',
+  feedback: 'var(--color-feedback)',
   entities: 'var(--color-entities)',
   events: 'var(--color-events)',
   patterns: 'var(--color-patterns)',
   cases: 'var(--color-cases)',
+  reference: 'var(--color-reference)',
 };

@@ -23,7 +23,7 @@ Continuity gives Claude Code (and eventually any AI agent) memory that persists 
 
 - **Memory Tree**: Hierarchical memory organized as a virtual filesystem with `mem://` URIs. Not a flat vector store — a browsable tree.
 - **L0/L1/L2 Tiering**: Every memory has three representations: ~100 token abstract (search surface), ~2K token overview (context injection), full content (on-demand). Agents get shape without weight.
-- **6-Category Taxonomy**: profile (mergeable), preferences (mergeable), entities (immutable), events (immutable), patterns (mergeable), cases (immutable). Merge rules prevent memory corruption.
+- **8-Category Taxonomy**: profile (mergeable), preferences (mergeable), feedback (mergeable), entities (immutable), events (immutable), patterns (mergeable), cases (immutable), reference (immutable). Merge rules prevent memory corruption. `feedback` holds directional guidance the user gave about how to approach work, shaped as `<rule>. Why: <reason>. How to apply: <when>.`; `reference` holds pointers to external systems and team rituals (Linear, Grafana, Slack, standups). Moments are a separate diversity-sampled category injected into every session.
 - **Relational Profiling**: Extracts *how the user works* (feedback style, autonomy level, corrections given) as a compounding profile. No other tool does this.
 - **Smart Decay**: 90-day half-life without access. Retrieval boosts relevance. Stale memories fade but never disappear.
 - **Signal Keywords**: "remember this", "always use X", "bug was" trigger immediate capture at user-message time, not just session end.

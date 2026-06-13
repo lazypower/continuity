@@ -176,14 +176,29 @@ func TestSearchFallsBackToFind(t *testing.T) {
 }
 
 func TestCategoryBoost(t *testing.T) {
-	if got := categoryBoost("moments"); got != 1.3 {
-		t.Errorf("categoryBoost(moments) = %f, want 1.3", got)
+	// Only moments get the 1.3× boost. feedback already ranks above patterns
+	// via the context-injection ordering (issue #24), so it gets the default
+	// 1.0 here; reference is low-signal locator data and must not jump on
+	// marginal similarity.
+	tests := []struct {
+		category string
+		want     float64
+	}{
+		{"moments", 1.3},
+		{"profile", 1.0},
+		{"preferences", 1.0},
+		{"feedback", 1.0},
+		{"events", 1.0},
+		{"patterns", 1.0},
+		{"cases", 1.0},
+		{"entities", 1.0},
+		{"reference", 1.0},
+		{"", 1.0},
 	}
-	if got := categoryBoost("profile"); got != 1.0 {
-		t.Errorf("categoryBoost(profile) = %f, want 1.0", got)
-	}
-	if got := categoryBoost("events"); got != 1.0 {
-		t.Errorf("categoryBoost(events) = %f, want 1.0", got)
+	for _, tt := range tests {
+		if got := categoryBoost(tt.category); got != tt.want {
+			t.Errorf("categoryBoost(%q) = %f, want %f", tt.category, got, tt.want)
+		}
 	}
 }
 

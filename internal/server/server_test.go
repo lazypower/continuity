@@ -260,6 +260,59 @@ func TestBuildContextNoMoments(t *testing.T) {
 	}
 }
 
+// TestBuildContextFeedbackInProfileSection pins the issue #24 rendering rule:
+// feedback memories collapse into the "Your Profile" section (no [category]
+// tag), because they shape *action* — not labelled memory you'd browse, but
+// identity-shaping guidance. Reference memories land in "Recent Memories"
+// with their tag, like other locator data.
+func TestBuildContextFeedbackInProfileSection(t *testing.T) {
+	srv := testServer(t)
+
+	err := srv.db.UpsertNode(&store.MemNode{
+		URI:        "mem://user/feedback/terse-summaries",
+		NodeType:   "leaf",
+		Category:   "feedback",
+		L0Abstract: "Terse responses, no trailing summaries.",
+		L1Overview: "Rule: terse responses, no trailing summaries. Why: diff carries the info. How to apply: never recap.",
+		Relevance:  0.95,
+	})
+	if err != nil {
+		t.Fatalf("upsert feedback: %v", err)
+	}
+
+	err = srv.db.UpsertNode(&store.MemNode{
+		URI:        "mem://user/reference/linear-ingest",
+		NodeType:   "leaf",
+		Category:   "reference",
+		L0Abstract: "Pipeline bugs tracked in Linear INGEST project.",
+		L1Overview: "Linear project INGEST is canonical for pipeline bug reports.",
+		Relevance:  0.95,
+	})
+	if err != nil {
+		t.Fatalf("upsert reference: %v", err)
+	}
+
+	ctx := srv.buildContext("")
+
+	if !strings.Contains(ctx, "Terse responses, no trailing summaries.") {
+		t.Errorf("feedback L0 missing from context:\n%s", ctx)
+	}
+	// Feedback must not carry a [feedback] tag — it rides with profile.
+	if strings.Contains(ctx, "[feedback]") {
+		t.Errorf("feedback should NOT carry a category tag in context — it rides with profile:\n%s", ctx)
+	}
+
+	// Reference SHOULD carry a [reference] tag; it's in the Recent Memories block.
+	if !strings.Contains(ctx, "[reference]") {
+		t.Errorf("reference should carry [reference] tag in Recent Memories:\n%s", ctx)
+	}
+
+	// The Your Profile section must appear since at least one feedback item is present.
+	if !strings.Contains(ctx, "### Your Profile") {
+		t.Errorf("Your Profile section missing despite feedback item:\n%s", ctx)
+	}
+}
+
 func TestBuildContextSessionTone(t *testing.T) {
 	srv := testServer(t)
 

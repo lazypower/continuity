@@ -72,10 +72,12 @@
     const map: Record<string, string> = {
       profile: 'glow-profile',
       preferences: 'glow-preferences',
+      feedback: 'glow-feedback',
       entities: 'glow-entities',
       events: 'glow-events',
       patterns: 'glow-patterns',
       cases: 'glow-cases',
+      reference: 'glow-reference',
     };
     return map[cat] || '';
   }

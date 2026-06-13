@@ -28,6 +28,10 @@ type memoryCandidate struct {
 }
 
 // ownerForCategory returns the URI owner for a given category.
+// "feedback" and "reference" intentionally take the default "user" branch:
+// feedback captures guidance the user has given (issue #24), and reference
+// captures pointers to systems the user works in (Linear, dashboards, rituals).
+// An agent-side feedback tree is deferred to a later issue.
 func ownerForCategory(category string) string {
 	switch category {
 	case "patterns", "cases":
@@ -41,7 +45,7 @@ func ownerForCategory(category string) string {
 var validCategories = map[string]bool{
 	"profile": true, "preferences": true, "entities": true,
 	"events": true, "patterns": true, "cases": true,
-	"moments": true,
+	"moments": true, "feedback": true, "reference": true,
 }
 
 // findSimilarNode searches existing nodes for one semantically similar to the given

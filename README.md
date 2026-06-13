@@ -193,16 +193,18 @@ Agents get shape without weight. The right memories surface at the right time.
 
 ## Architecture
 
-**7 memory categories**, each with merge rules:
+**9 memory categories**, each with merge rules:
 
 | Category | Owner | Mergeable | Decay | Example |
 |----------|-------|-----------|-------|---------|
 | `profile` | user | yes | yes | Coding style, skills, identity |
 | `preferences` | user | yes | yes | Tools, workflows, conventions |
+| `feedback` | user | yes | yes | Directional guidance (`<rule>. Why: …. How to apply: ….`) — corrections and confirmations |
 | `entities` | user | no | yes | Projects, people, services |
 | `events` | user | no | yes | Decisions, deployments |
 | `patterns` | agent | yes | yes | Reusable techniques, solutions |
 | `cases` | agent | no | yes | Bug→fix pairs |
+| `reference` | user | no | yes | Pointers to external systems and team rituals (Linear, Grafana, standups) |
 | `moments` | user | no | **no** | Relational anchors — texture, not facts |
 
 **Smart decay**: 90-day half-life without access. Retrieval boosts relevance back to 1.0. Stale memories fade but never disappear — floor of 0.1. Moments and the relational profile are exempt.

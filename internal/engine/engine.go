@@ -438,16 +438,6 @@ func (e *Engine) evictRedundantMoment(ctx context.Context) (string, error) {
 	return evictURI, nil
 }
 
-// mergeableCategory returns whether the given category supports in-place merging.
-func mergeableCategory(category string) bool {
-	switch category {
-	case "profile", "preferences", "patterns":
-		return true
-	default:
-		return false
-	}
-}
-
 // ExtractSignal processes a user-flagged signal prompt and creates a memory immediately.
 // This is designed to be called asynchronously (in a goroutine).
 func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) error {

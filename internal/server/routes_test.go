@@ -209,6 +209,52 @@ func TestRememberRoute(t *testing.T) {
 	}
 }
 
+// TestRememberRouteFeedbackAndReference confirms the POST /api/memories
+// endpoint accepts the categories added in issue #24. Without an end-to-end
+// API test, a regression that breaks one of these categories in extraction
+// or validation could land silently — the CLI would surface it but only
+// after a release.
+func TestRememberRouteFeedbackAndReference(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantURI string
+	}{
+		{
+			name:    "feedback",
+			body:    `{"category":"feedback","name":"terse-summaries","summary":"User wants terse responses with no trailing summaries.","body":"Rule: terse responses, no trailing summaries. Why: diff carries the info. How to apply: never recap."}`,
+			wantURI: "mem://user/feedback/terse-summaries",
+		},
+		{
+			name:    "reference",
+			body:    `{"category":"reference","name":"linear-ingest","summary":"Pipeline bugs tracked in Linear project INGEST.","body":"Linear project INGEST is the canonical home for pipeline bug reports — file there, do not use GitHub Issues."}`,
+			wantURI: "mem://user/reference/linear-ingest",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := testServerWithEngine(t)
+
+			req := newTestRequest("POST", "/api/memories", strings.NewReader(tt.body))
+			w := httptest.NewRecorder()
+			srv.ServeHTTP(w, req)
+
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusCreated, w.Body.String())
+			}
+
+			var resp map[string]string
+			json.Unmarshal(w.Body.Bytes(), &resp)
+			if resp["status"] != "created" {
+				t.Errorf("status = %q, want created", resp["status"])
+			}
+			if resp["uri"] != tt.wantURI {
+				t.Errorf("uri = %q, want %q", resp["uri"], tt.wantURI)
+			}
+		})
+	}
+}
+
 func TestRememberRouteUpdate(t *testing.T) {
 	srv := testServerWithEngine(t)
 

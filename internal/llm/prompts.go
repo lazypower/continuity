@@ -18,14 +18,21 @@ TRANSCRIPT:
 
 Categories:
 - profile: Who the user IS — identity, skills, non-negotiable preferences (e.g., "Senior Go developer, requires spec-first workflow")
-- preferences: Tools, workflows, changeable choices (e.g., "Uses devbox for all development")
+- preferences: Tools, workflows, changeable choices, configurational settings (e.g., "Uses devbox for all development", "use sonnet for eval analysis")
+- feedback: Directional guidance the user gave about HOW TO APPROACH WORK — corrections AND confirmations, with a why grounded in incident or stance. L1 MUST be shaped as: "<rule>. Why: <reason/incident>. How to apply: <when this kicks in>". (e.g., "Don't say 'locked the door' in release notes — say 'dialing in on security'", "Yeah, the bundled PR was the right call here")
 - entities: People, projects, services that will be referenced again (e.g., "Fiona: companion AI agent at /Users/chuck/Code/habitat/")
 - events: Significant decisions or milestones (e.g., "Deployed v2.1 to production") — NOT routine coding actions
 - patterns: Reusable techniques the user has validated (e.g., "Embed Svelte SPA via go:embed for single-binary distribution")
 - cases: Non-obvious problem→solution pairs worth remembering (e.g., "SQLite UNIQUE constraint on session init: query first, reactivate if exists")
+- reference: Pointers to external systems, dashboards, team rituals where information lives (e.g., "Pipeline bugs are tracked in Linear project INGEST", "Oncall watches grafana.internal/d/api-latency")
+
+feedback vs preferences vs patterns — the boundary rule:
+- "do/don't X (behavior)" + a why → feedback
+- "X is always set to Y (configurational knob/setting)" → preferences
+- "the technique for X is Y (transferable knowledge)" → patterns
 
 URI scheme: mem://{owner}/{category}/{slug}
-- owner is "user" for profile, preferences, entities, events
+- owner is "user" for profile, preferences, feedback, entities, events, reference
 - owner is "agent" for patterns, cases
 
 BUDGET: Maximum 3 memories per session. Most sessions produce 0-1.
@@ -52,10 +59,10 @@ Rules:
 
 Return a JSON array:
 [{
-  "category": "profile|preferences|entities|events|patterns|cases",
+  "category": "profile|preferences|feedback|entities|events|patterns|cases|reference",
   "uri_hint": "slug-name",
   "l0": "single sentence abstract",
-  "l1": "structured overview",
+  "l1": "structured overview (for feedback: <rule>. Why: <reason>. How to apply: <when>.)",
   "l2": "full content",
   "merge_target": "mem://... or empty"
 }]
@@ -119,14 +126,21 @@ USER MESSAGE:
 
 Categorize into one of:
 - profile: User identity, skills, coding style
-- preferences: Tools, workflows, changeable choices
+- preferences: Tools, workflows, changeable configurational choices (e.g., "always use devbox")
+- feedback: Directional guidance the user gave about HOW to approach work, with a why (corrections + confirmations). L1 MUST be shaped as: "<rule>. Why: <reason>. How to apply: <when this kicks in>".
 - entities: People, projects, services
 - events: Decisions, deployments, actions
-- patterns: Reusable techniques, solutions
+- patterns: Reusable techniques, transferable solutions
 - cases: Problem→solution pairs
+- reference: Pointers to external systems, dashboards, team rituals (e.g., "bugs tracked in Linear project X")
+
+feedback vs preferences vs patterns — the boundary:
+- "do/don't X (behavior)" + a why → feedback
+- "X is always set to Y (setting)" → preferences
+- "the technique for X is Y (knowledge)" → patterns
 
 URI scheme: mem://{owner}/{category}/{slug}
-- owner is "user" for profile, preferences, entities, events
+- owner is "user" for profile, preferences, feedback, entities, events, reference
 - owner is "agent" for patterns, cases
 
 Rules:
@@ -138,10 +152,10 @@ Rules:
 
 Return a JSON array:
 [{
-  "category": "profile|preferences|entities|events|patterns|cases",
+  "category": "profile|preferences|feedback|entities|events|patterns|cases|reference",
   "uri_hint": "slug-name",
   "l0": "single sentence, max 200 chars",
-  "l1": "structured overview, max 2000 chars",
+  "l1": "structured overview, max 2000 chars (for feedback: <rule>. Why: <reason>. How to apply: <when>.)",
   "l2": "full content, max 40000 chars",
   "merge_target": "mem://... or empty"
 }]`, InternalSentinel, prompt)
