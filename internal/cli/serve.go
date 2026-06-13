@@ -86,6 +86,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 					eng.SetEmbedder(emb)
 				}
 				fmt.Fprintf(os.Stderr, "  embedder: tfidf (fallback)\n")
+				// TFIDF is best-effort by construction (the corpus IS the
+				// model). Surface the consequence once at startup so operators
+				// know what tradeoff they're running with, with a one-line
+				// pointer to the upgrade paths. The README's "Embedding
+				// backends" section has the full three-tier story
+				// (Ollama / TFIDF / paid). Issue #22.
+				fmt.Fprintln(os.Stderr, "  ! tfidf: retraction-dedup recall is best-effort; see README \"Embedding backends\" for Ollama / paid alternatives")
 			}
 		}
 

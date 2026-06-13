@@ -105,19 +105,37 @@ func ProbeOllama(url, model string) bool {
 }
 
 // TFIDFEmbedder generates TF-IDF bag-of-words embeddings as a fallback.
+//
+// Best-effort by construction: the corpus IS the model. Every retraction or
+// new write that introduces vocabulary not yet in the IDF table shifts the
+// vector space. We minimize the most load-bearing variant of that drift —
+// retraction-induced drift — by including retracted nodes in the corpus
+// (see NewTFIDFEmbedder). Ollama users have a static pre-trained model and
+// don't have this problem; the README's "Embedding backends" section
+// recommends Ollama for any setup that needs strong dedup-against-retracted
+// recall.
 type TFIDFEmbedder struct {
-	vocab []string            // ordered vocabulary (top terms by doc frequency)
-	idf   map[string]float64  // inverse document frequency per term
+	vocab []string           // ordered vocabulary (top terms by doc frequency)
+	idf   map[string]float64 // inverse document frequency per term
 	dims  int
 }
 
 // NewTFIDFEmbedder builds a TF-IDF embedder from existing L0 abstracts.
+//
+// The corpus deliberately INCLUDES retracted leaves (issue #22). Excluding
+// them would cause the IDF vocabulary to drift between process restarts that
+// straddle a retraction: previously-stored vectors were embedded against a
+// corpus that contained the now-retracted node's terms, while fresh
+// embeddings would be computed against a corpus that no longer does. Cosine
+// similarity between the two becomes incoherent, silently degrading
+// findRetractedMatches recall and defeating the PII-re-introduction guard.
+// Including retracted nodes keeps the vector space stable across retractions.
 func NewTFIDFEmbedder(db *store.DB, maxTerms int) (*TFIDFEmbedder, error) {
 	if maxTerms <= 0 {
 		maxTerms = 512
 	}
 
-	leaves, err := db.ListLeaves()
+	leaves, err := db.ListLeavesIncludingRetracted()
 	if err != nil {
 		return nil, fmt.Errorf("list leaves for tfidf: %w", err)
 	}
@@ -142,7 +160,16 @@ func NewTFIDFEmbedder(db *store.DB, maxTerms int) (*TFIDFEmbedder, error) {
 		}
 	}
 
-	// Sort terms by document frequency (descending), take top maxTerms
+	// Sort terms by document frequency (descending), take top maxTerms.
+	//
+	// Tie-break alphabetically (issue #22): Go map iteration is randomized
+	// and sort.Slice isn't stable, so without an explicit tiebreaker the same
+	// corpus produces vocabularies in different orders across constructions.
+	// That puts identical terms at different vector positions, making cosine
+	// similarity between vectors from two NewTFIDFEmbedder() calls effectively
+	// random — even when the corpus didn't change. The asymmetric loss falls
+	// hardest on dedup-against-retracted, which relies on the vector space
+	// being stable across process restarts.
 	type termFreq struct {
 		term string
 		freq int
@@ -152,7 +179,10 @@ func NewTFIDFEmbedder(db *store.DB, maxTerms int) (*TFIDFEmbedder, error) {
 		terms = append(terms, termFreq{t, f})
 	}
 	sort.Slice(terms, func(i, j int) bool {
-		return terms[i].freq > terms[j].freq
+		if terms[i].freq != terms[j].freq {
+			return terms[i].freq > terms[j].freq
+		}
+		return terms[i].term < terms[j].term
 	})
 
 	dims := maxTerms
