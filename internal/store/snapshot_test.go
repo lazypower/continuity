@@ -262,6 +262,114 @@ func TestSnapshot_FailureBlocksMigration(t *testing.T) {
 }
 
 // =========================================================================
+// VACUUM INTO contract — protects against a future maintainer replacing
+// the snapshot with a naïve file copy
+// =========================================================================
+
+// TestSnapshot_CapturesWALActiveData pins the WAL/source-locking contract
+// that the snapshot code depends on. In WAL mode (Continuity's default —
+// see configurePragmas), committed data may live in the <path>-wal sidecar
+// until a checkpoint moves it into the main .db file. A file-level copy
+// (os.Rename, io.Copy, `cp`, `tar`) of <path> alone would silently miss
+// that data — the snapshot would look intact but be missing the most
+// recent writes.
+//
+// VACUUM INTO routes through the SQLite engine and walks a consistent
+// transaction view that includes the WAL. This test demonstrates the
+// difference would matter: a WAL-resident row written via a held-open
+// connection MUST appear in the snapshot. If a future maintainer
+// replaces VACUUM INTO with a file copy, this test fails — and the
+// comment on snapshotBeforeRiskyMigration explains why before the
+// reviewer even reads the test.
+func TestSnapshot_CapturesWALActiveData(t *testing.T) {
+	t.Setenv(EnvNoMigrationSnapshot, "")
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	buildDBAtVersion(t, dbPath, 8) // pre-v9 so v9 (risky) triggers the snapshot
+
+	// Open a keeper connection in WAL mode and write a row. Keep the
+	// connection OPEN so its close-time checkpoint does not quietly
+	// migrate the row into the main DB file before the snapshot runs.
+	// The row must still be WAL-resident when the snapshot is taken.
+	keeper, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("keeper open: %v", err)
+	}
+	defer keeper.Close()
+
+	for _, pragma := range []string{
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA synchronous=NORMAL`,
+	} {
+		if _, err := keeper.Exec(pragma); err != nil {
+			t.Fatalf("%s: %v", pragma, err)
+		}
+	}
+
+	const walResidentURI = "mem://user/events/wal-resident-row"
+	const walResidentBody = "lives in WAL until checkpoint"
+	if _, err := keeper.Exec(`
+		INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
+		VALUES (?, 'leaf', 'events', ?, 1000, 1000)
+	`, walResidentURI, walResidentBody); err != nil {
+		t.Fatalf("insert WAL-resident row: %v", err)
+	}
+
+	// Sanity precondition: the WAL sidecar should exist now. If it doesn't,
+	// the runtime SQLite checkpointed eagerly and the WAL path isn't
+	// being exercised — skip rather than pass for the wrong reason.
+	if info, err := os.Stat(dbPath + "-wal"); err != nil || info.Size() == 0 {
+		t.Skipf("WAL sidecar not populated (err=%v); environment did not exercise the WAL path", err)
+	}
+
+	// Trigger the production snapshot via store.Open → migrate() → v9 →
+	// VACUUM INTO. The keeper connection stays open during this, which
+	// is the realistic scenario (a user's hooks may be holding connections
+	// when serve restarts and migrates).
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open during keeper hold: %v", err)
+	}
+	defer db.Close()
+
+	snaps, err := db.ListMigrationSnapshots()
+	if err != nil {
+		t.Fatalf("ListMigrationSnapshots: %v", err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("expected 1 snapshot from v9 migration, got %d", len(snaps))
+	}
+
+	// The load-bearing assertion: a row that was WAL-resident at snapshot
+	// time MUST land in the snapshot file. A naïve file copy of the .db
+	// would have produced a snapshot missing this row.
+	snap, err := sql.Open("sqlite", snaps[0].Path)
+	if err != nil {
+		t.Fatalf("open snapshot file: %v", err)
+	}
+	defer snap.Close()
+
+	var gotBody string
+	err = snap.QueryRow(
+		`SELECT l0_abstract FROM mem_nodes WHERE uri = ?`,
+		walResidentURI,
+	).Scan(&gotBody)
+	if err == sql.ErrNoRows {
+		t.Fatal("WAL-resident row missing from snapshot — VACUUM INTO did not " +
+			"capture WAL state. This is the failure mode a future replacement of " +
+			"VACUUM INTO with a file copy would produce. See the comment block on " +
+			"snapshotBeforeRiskyMigration for why VACUUM INTO is load-bearing here.")
+	}
+	if err != nil {
+		t.Fatalf("read WAL row from snapshot: %v", err)
+	}
+	if gotBody != walResidentBody {
+		t.Errorf("WAL row content mangled in snapshot: got %q, want %q", gotBody, walResidentBody)
+	}
+}
+
+// =========================================================================
 // Content fidelity
 // =========================================================================
 

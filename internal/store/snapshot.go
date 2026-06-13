@@ -92,9 +92,36 @@ func (db *DB) snapshotBeforeRiskyMigration(m migration) (string, error) {
 	snapName := fmt.Sprintf("continuity-pre-v%d-%s.db", m.Version, timestamp)
 	snapPath := filepath.Join(snapDir, snapName)
 
-	// VACUUM INTO is the SQLite-blessed atomic copy. It produces a complete,
-	// self-contained DB file in one statement, page-by-page from a consistent
-	// snapshot, while the source DB stays open and readable.
+	// VACUUM INTO is the SQLite-blessed atomic copy. DO NOT replace this with
+	// a file-level copy (os.Rename / io.Copy / `cp` / `tar` / etc.). Reasons:
+	//
+	//   1. WAL mode is on by default (see configurePragmas), which means the
+	//      main .db file is INCOMPLETE on its own. Recent commits live in
+	//      <path>-wal until a checkpoint moves them into the main file. A
+	//      naïve file copy of <path> alone would silently drop everything in
+	//      the WAL — the snapshot would look intact but be missing the most
+	//      recent writes (which is exactly the data the user most cares
+	//      about preserving across a risky migration).
+	//
+	//   2. Copying all three files (.db, .db-wal, .db-shm) together does NOT
+	//      fix the problem: another connection can be writing at any byte
+	//      offset, and a copy that interleaves with writes yields a torn
+	//      image. Acquiring an OS file lock doesn't help — SQLite uses
+	//      cooperative locking through its own engine, not OS-level file
+	//      locks.
+	//
+	//   3. VACUUM INTO routes through the SQLite engine. It acquires the
+	//      correct shared read lock on the source, walks page-by-page from a
+	//      consistent transaction view that INCLUDES the WAL, and emits a
+	//      single self-contained destination file with no separate WAL or
+	//      SHM. Source writers are not blocked (concurrent reads + writes
+	//      continue normally during VACUUM INTO). This is the contract;
+	//      rely on it.
+	//
+	// TestSnapshot_CapturesWALActiveData pins this behavior against
+	// regression — it writes a row that lives only in the WAL, takes a
+	// snapshot, and asserts the row landed in the snapshot. A naïve file
+	// copy would fail that test.
 	if _, err := db.Exec("VACUUM INTO ?", snapPath); err != nil {
 		return "", fmt.Errorf("vacuum into %s: %w", snapPath, err)
 	}
