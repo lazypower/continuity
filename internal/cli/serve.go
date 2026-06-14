@@ -89,10 +89,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 				// TFIDF is best-effort by construction (the corpus IS the
 				// model). Surface the consequence once at startup so operators
 				// know what tradeoff they're running with, with a one-line
-				// pointer to the upgrade paths. The README's "Embedding
-				// backends" section has the full three-tier story
-				// (Ollama / TFIDF / paid). Issue #22.
-				fmt.Fprintln(os.Stderr, "  ! tfidf: retraction-dedup recall is best-effort; see README \"Embedding backends\" for Ollama / paid alternatives")
+				// pointer to the upgrade path. The README's "Embedding
+				// backends" section spells out the two shipped paths
+				// (Ollama / TFIDF). Issue #22.
+				fmt.Fprintln(os.Stderr, "  ! tfidf: retraction-dedup recall is best-effort; install Ollama (nomic-embed-text) for stronger guarantees — see README \"Embedding backends\"")
 			}
 		}
 

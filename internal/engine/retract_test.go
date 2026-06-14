@@ -321,9 +321,15 @@ func TestFindRetractedMatches_TFIDFCorpusCoherent(t *testing.T) {
 	}
 	eng.SetEmbedder(embedderA)
 	for _, uri := range []string{live, retracted} {
-		n, _ := db.GetNodeByURI(uri)
+		n, err := db.GetNodeByURI(uri)
+		if err != nil {
+			t.Fatalf("GetNodeByURI(%s): %v", uri, err)
+		}
+		if n == nil {
+			t.Fatalf("GetNodeByURI(%s): node not found after seed", uri)
+		}
 		if err := eng.EmbedNode(ctx, n); err != nil {
-			t.Fatal(err)
+			t.Fatalf("EmbedNode(%s): %v", uri, err)
 		}
 	}
 

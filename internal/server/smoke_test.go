@@ -133,7 +133,7 @@ func TestSmoke_MigrationAndRetractAgainstRealDB(t *testing.T) {
 		// between the prior embedding and this rebuild still produces residual
 		// drift — that's the broader TFIDF limitation we accept as best-effort
 		// rather than chase. The asserted regression test for the fix lives at
-		// engine/retract_test.go::TestFindRetractedMatches_TFIDFCorpusCoherent.
-		t.Logf("dedup gate did not fire (err=%v); residual TFIDF drift on real data — install Ollama or a paid embedder for stronger guarantees", err)
+		// internal/engine/retract_test.go::TestFindRetractedMatches_TFIDFCorpusCoherent.
+		t.Logf("dedup gate did not fire (err=%v); residual TFIDF drift on real data — install Ollama for stronger guarantees", err)
 	})
 }
