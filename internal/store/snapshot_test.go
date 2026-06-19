@@ -931,3 +931,71 @@ func TestSnapshot_ListSurfacesRealQueryErrors(t *testing.T) {
 		t.Error("PruneMigrationSnapshots must refuse to run when the snapshot table is unreadable")
 	}
 }
+
+// TestSnapshot_DeletesNeverEscapeNamespace pins the deletion-side cross-DB
+// guard. Tracking rows store absolute paths, so a database COPIED or RENAMED
+// from another (the repo's own smoke test does `cp continuity.db scratch.db`)
+// inherits rows pointing at the ORIGINAL's snapshot files. Neither prune nor
+// the retention tick may unlink a file outside this DB's own namespace, no
+// matter what a stale row claims.
+func TestSnapshot_DeletesNeverEscapeNamespace(t *testing.T) {
+	t.Setenv(EnvNoMigrationSnapshot, "")
+
+	dir := t.TempDir()
+	origPath := filepath.Join(dir, "continuity.db")
+	buildSnapshotDBAtVersion(t, origPath, 8)
+	orig, err := Open(origPath) // v9 risky → snapshot under snapshots/continuity.db/
+	if err != nil {
+		t.Fatal(err)
+	}
+	origSnaps, _ := orig.ListMigrationSnapshots()
+	if len(origSnaps) != 1 {
+		t.Fatalf("setup: orig should have 1 snapshot, got %d", len(origSnaps))
+	}
+	origSnapPath := origSnaps[0].Path
+
+	// Two consistent copies (VACUUM INTO), each inheriting orig's tracking row.
+	pruneCopy := filepath.Join(dir, "prune-scratch.db")
+	tickCopy := filepath.Join(dir, "tick-scratch.db")
+	if _, err := orig.Exec("VACUUM INTO ?", pruneCopy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orig.Exec("VACUUM INTO ?", tickCopy); err != nil {
+		t.Fatal(err)
+	}
+	orig.Close()
+
+	// Prune the copy: clears its stale row but must NOT unlink orig's file.
+	pc, err := OpenNoMigrate(pruneCopy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ss, _ := pc.ListMigrationSnapshots(); len(ss) != 1 || ss[0].Path != origSnapPath {
+		t.Fatalf("setup: prune copy should carry orig's stale row pointing at %s", origSnapPath)
+	}
+	if _, err := pc.PruneMigrationSnapshots(); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := pc.ListMigrationSnapshots(); len(after) != 0 {
+		t.Errorf("copy's stale row should be cleared; got %d", len(after))
+	}
+	pc.Close()
+	if _, err := os.Stat(origSnapPath); err != nil {
+		t.Errorf("prune on a copied DB deleted the ORIGINAL's snapshot: %v", err)
+	}
+
+	// Retention tick on the other copy: drive past threshold; same guarantee.
+	tc, err := OpenNoMigrate(tickCopy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < SnapshotRetentionBoots+1; i++ {
+		if err := tc.TickSnapshotRetention(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tc.Close()
+	if _, err := os.Stat(origSnapPath); err != nil {
+		t.Errorf("retention tick on a copied DB deleted the ORIGINAL's snapshot: %v", err)
+	}
+}

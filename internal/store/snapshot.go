@@ -47,6 +47,18 @@ func snapshotDirForDB(dbPath string) string {
 	return filepath.Join(filepath.Dir(dbPath), "snapshots", filepath.Base(dbPath))
 }
 
+// ownsSnapshotPath reports whether a tracked snapshot path actually belongs to
+// THIS database — i.e. it sits directly in this DB's namespaced snapshot dir.
+// Tracking rows store absolute paths, so a database that was copied or renamed
+// (e.g. `cp continuity.db scratch.db`, then CONTINUITY_DB=scratch.db) inherits
+// rows pointing at the ORIGINAL DB's snapshot files. Unlinking those during
+// prune or retention would destroy another database's rollback point. This is
+// the deletion-side complement to namespaced creation: never unlink a file we
+// can't prove is ours, no matter what a stale row claims.
+func (db *DB) ownsSnapshotPath(p string) bool {
+	return filepath.Dir(p) == snapshotDirForDB(db.Path)
+}
+
 // ensureSnapshotStateTable creates the sidecar tracking table. Called from
 // migrate() before the migration loop so the table is available whether or
 // not any prior migration has touched it. Deliberately NOT part of the
@@ -239,14 +251,19 @@ func (db *DB) TickSnapshotRetention() error {
 	rows.Close()
 
 	for _, p := range expired {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			// Removal genuinely failed (permission denied, a snapshot DB held
-			// open on Windows, etc.). Keep the tracking row so the file stays
-			// visible to `snapshot list/prune` and a future retention tick can
-			// retry the delete. Dropping the row here would strand the file on
-			// disk, untracked and unreclaimable.
-			fmt.Fprintf(os.Stderr, "warning: could not delete expired snapshot %s: %v (will retry next boot)\n", p, err)
-			continue
+		// Only unlink files that are genuinely ours. An out-of-namespace path
+		// is a stale pointer inherited from a copied/renamed DB; clear the row
+		// (it is meaningless for this DB) but never touch the foreign file.
+		if db.ownsSnapshotPath(p) {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				// Removal genuinely failed (permission denied, a snapshot DB held
+				// open on Windows, etc.). Keep the tracking row so the file stays
+				// visible to `snapshot list/prune` and a future retention tick can
+				// retry the delete. Dropping the row here would strand the file on
+				// disk, untracked and unreclaimable.
+				fmt.Fprintf(os.Stderr, "warning: could not delete expired snapshot %s: %v (will retry next boot)\n", p, err)
+				continue
+			}
 		}
 		if _, err := db.Exec(`DELETE FROM migration_snapshots WHERE snapshot_path = ?`, p); err != nil {
 			return fmt.Errorf("remove expired row: %w", err)
@@ -318,6 +335,13 @@ func (db *DB) PruneMigrationSnapshots() (int, error) {
 		return 0, err
 	}
 	for _, s := range snaps {
+		// Never unlink a file outside this DB's namespace: the row may be a
+		// stale pointer carried in from a copied/renamed DB and the file may be
+		// another database's live rollback point. The row is still cleared by
+		// the table wipe below — this DB has no business retaining it.
+		if !db.ownsSnapshotPath(s.Path) {
+			continue
+		}
 		if err := os.Remove(s.Path); err != nil && !os.IsNotExist(err) {
 			return len(removed), fmt.Errorf("remove snapshot %s: %w", s.Path, err)
 		}
