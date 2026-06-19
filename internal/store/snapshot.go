@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -358,6 +359,78 @@ func hashFile(path string) (string, int64, error) {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
+// =========================================================================
+// Owned temp files (creation proves ownership — Finding 7)
+//
+// Cleanup of PID-named temps is unsafe: a different process may legitimately
+// hold a temp with the same PID-derived name (PIDs are reused), so removing a
+// pre-existing temp could clobber a sibling's in-flight work. Instead we create
+// every temp/staging file with O_CREATE|O_EXCL and a random token: the create
+// SUCCEEDING proves we own that exact path, and we only ever remove paths we
+// created. An O_EXCL collision yields a fresh random name rather than trusting
+// or removing the existing file.
+// =========================================================================
+
+// tempTokenAttempts bounds the O_EXCL retry loop. With a 64-bit random token a
+// single attempt practically never collides; the loop only guards against the
+// astronomically unlikely case (or a hostile pre-creation), failing closed.
+const tempTokenAttempts = 64
+
+// randomToken returns a short random hex token for unique temp names.
+func randomToken() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("snapshot: random token: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// createOwnedTemp creates and opens a fresh file "<dir>/<prefix><token><suffix>"
+// with O_CREATE|O_EXCL|O_WRONLY (0600). The returned path is proven owned by
+// this process (the exclusive create succeeded). On the vanishingly rare O_EXCL
+// collision it retries with a new token; it NEVER removes or truncates a
+// pre-existing file. Caller is responsible for removing the path it gets back.
+func createOwnedTemp(dir, prefix, suffix string) (*os.File, string, error) {
+	for i := 0; i < tempTokenAttempts; i++ {
+		tok, err := randomToken()
+		if err != nil {
+			return nil, "", err
+		}
+		path := filepath.Join(dir, fmt.Sprintf("%s%d.%s%s", prefix, os.Getpid(), tok, suffix))
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			return f, path, nil
+		}
+		if !os.IsExist(err) {
+			return nil, "", err
+		}
+		// Collision (someone holds that exact name): pick a fresh token, never
+		// touch the existing file.
+	}
+	return nil, "", fmt.Errorf("snapshot: could not create a unique temp in %s", dir)
+}
+
+// reserveOwnedTempName returns a path that is proven free AND owned by this
+// process for a primitive (like VACUUM INTO) that must create the file itself.
+// It O_EXCL-creates a placeholder to prove ownership, then removes that
+// placeholder (safe: we just created it) and returns the now-free path. A
+// caller that hands this path to VACUUM INTO will fail closed if a racing
+// process re-creates it in the meantime — never a clobber of foreign data.
+func reserveOwnedTempName(dir, prefix, suffix string) (string, error) {
+	f, path, err := createOwnedTemp(dir, prefix, suffix)
+	if err != nil {
+		return "", err
+	}
+	if cerr := f.Close(); cerr != nil {
+		_ = os.Remove(path)
+		return "", cerr
+	}
+	if rerr := os.Remove(path); rerr != nil {
+		return "", rerr
+	}
+	return path, nil
+}
+
 // lineageFingerprint computes sha256 over the DB's per-instance identity AND
 // the schema_versions rows with version <= upTo, ordered by version.
 //
@@ -467,6 +540,32 @@ func (db *DB) ensureUpgradeRestorePoint(preVersion int) error {
 	return nil
 }
 
+// ensureUpgradeRestorePointLocked is ensureUpgradeRestorePoint's body for the
+// case migrate() has ALREADY taken the operation lock (the risky-upgrade path).
+// It performs the same eligibility/opt-out gating but calls the lock-free
+// createRestorePointLocked so the single op-lock spans both restore-point
+// creation and the subsequent migration DDL. Callers must hold the op-lock.
+func (db *DB) ensureUpgradeRestorePointLocked(preVersion int) error {
+	if preVersion <= 0 {
+		return nil
+	}
+	firstRisky, hasRisky := firstPendingRiskyVersion(preVersion)
+	if !hasRisky {
+		return nil
+	}
+	// Eligibility + opt-out were already checked by migrate() before taking the
+	// lock (this path is only entered for an eligible, non-opt-out risky upgrade),
+	// but re-assert eligibility defensively rather than assume.
+	if !snapshotEligiblePath(db.Path) {
+		return fmt.Errorf("%w: %q", ErrSnapshotUnsupportedPath, db.Path)
+	}
+	target := headVersion()
+	if err := db.createRestorePointLocked(preVersion, target, firstRisky); err != nil {
+		return fmt.Errorf("create restore point before risky migration: %w", err)
+	}
+	return nil
+}
+
 // firstPendingRiskyVersion returns the version of the first risky migration
 // strictly greater than preVersion (i.e. pending), and whether any exists.
 func firstPendingRiskyVersion(preVersion int) (int, bool) {
@@ -478,8 +577,11 @@ func firstPendingRiskyVersion(preVersion int) (int, bool) {
 	return 0, false
 }
 
-// createRestorePoint writes (or reuses) the sidecar restore point. The DB is
-// expected to be open at preVersion and NOT yet migrated.
+// createRestorePoint writes (or reuses) the sidecar restore point, ACQUIRING
+// the sidecar operation lock for the duration. The DB is expected to be open at
+// preVersion and NOT yet migrated. Used by tests and any caller that does not
+// already hold the op-lock; migrate()'s risky-upgrade path takes the lock once
+// and uses createRestorePointLocked so the lock also spans the migration DDL.
 func (db *DB) createRestorePoint(preVersion, target, firstRisky int) error {
 	sidecar, err := sidecarPath(db.Path)
 	if err != nil {
@@ -496,6 +598,19 @@ func (db *DB) createRestorePoint(preVersion, target, firstRisky int) error {
 	}
 	defer releaseOp()
 
+	return db.createRestorePointLocked(preVersion, target, firstRisky)
+}
+
+// createRestorePointLocked is createRestorePoint's body for callers that ALREADY
+// hold the sidecar operation lock (migrate()'s risky-upgrade path). It must not
+// acquire the lock again — the in-process op mutex is not re-entrant, so a
+// second acquire from the same goroutine would deadlock.
+func (db *DB) createRestorePointLocked(preVersion, target, firstRisky int) error {
+	sidecar, err := sidecarPath(db.Path)
+	if err != nil {
+		return err
+	}
+
 	// Reuse path: a fully valid manifest for THIS lineage already exists.
 	// Never overwrite — this is what preserves the pre-v6 snapshot across a
 	// later v9 migration in the same run, and across crash/retry.
@@ -509,21 +624,35 @@ func (db *DB) createRestorePoint(preVersion, target, firstRisky int) error {
 			// unrelated sidecar here. Fail closed rather than clobber it.
 			return fmt.Errorf("%w: existing manifest belongs to a different DB lineage", ErrSnapshotSidecarCorrupt)
 		}
-		// Same lineage, but only reuse if the existing restore point matches
-		// THIS upgrade window: its pre-version must equal the current
-		// pre-version. A stale completed restore point from an EARLIER upgrade
-		// (e.g. a pre-v5 point left around when we are now upgrading from v9)
-		// does not protect this run. Reusing it would lie about what the
-		// restore point rolls back to; overwriting it would destroy recovery
-		// material from the earlier window. Fail closed and make the operator
-		// restore or prune explicitly.
-		if existing.PreSchemaVersion != preVersion {
-			return fmt.Errorf(
-				"%w: an existing restore point captures pre-v%d, but this upgrade starts at v%d; "+
-					"run 'continuity snapshot restore --confirm' or 'continuity snapshot prune --confirm' first",
-				ErrSnapshotSidecarCorrupt, existing.PreSchemaVersion, preVersion)
+		// Same lineage. Reuse the existing restore point when it still COVERS this
+		// upgrade run — i.e. it captures a pre-version at or below ours, its target
+		// reaches at least as far as this run's target, and the upgrade it protects
+		// is NOT yet complete (current schema below the existing target). This is
+		// the interrupted-upgrade case: a crash after v6 commits but before v9
+		// leaves preVersion=6 while the valid pre-v5 point (target>=9) still rolls
+		// the whole v5→v9 window back. Continuing under it is correct — re-snapshot
+		// at pre-v6 would lie about the rollback target and overwrite recovery
+		// material; the point already covers us.
+		//
+		// preVersion is the current on-disk schema version (== maxApplied), so
+		// "current schema" is preVersion here.
+		covers := existing.PreSchemaVersion <= preVersion &&
+			existing.TargetSchemaVersion >= target &&
+			preVersion < existing.TargetSchemaVersion
+		if covers {
+			return nil // reuse — same lineage AND the existing point still covers us
 		}
-		return nil // reuse — same lineage AND same upgrade window
+		// Otherwise the existing point does NOT protect this run: it is either for
+		// an ALREADY-COMPLETED upgrade (current schema >= existing target) or a
+		// different/older window that does not cover this target. Reusing it would
+		// lie about what the restore point rolls back to; overwriting it would
+		// destroy recovery material from the earlier window. Fail closed and make
+		// the operator restore or prune explicitly.
+		return fmt.Errorf(
+			"%w: an existing restore point captures pre-v%d→v%d, but this upgrade is at v%d→v%d; "+
+				"run 'continuity snapshot restore --confirm' or 'continuity snapshot prune --confirm' first",
+			ErrSnapshotSidecarCorrupt,
+			existing.PreSchemaVersion, existing.TargetSchemaVersion, preVersion, target)
 	} else if !errors.Is(lerr, ErrNoRestorePoint) {
 		// Present-but-corrupt sidecar: fail closed, do not overwrite.
 		return lerr
@@ -545,16 +674,33 @@ func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky i
 	}
 	_ = os.Chmod(sidecar, 0o700)
 
+	// Establish the per-DB instance identity HERE — only after the sidecar is
+	// proven usable (not a symlink, dir creatable), and BEFORE the VACUUM INTO so
+	// the snapshot image captures the same instance_id. Doing it here (rather than
+	// unconditionally in migrate()) keeps the DB UNMUTATED when the sidecar is
+	// blocked/fail-closed: a v5 DB with a regular-file or symlinked sidecar gets
+	// NO continuity_meta write, because we never reach this point. Idempotent: a
+	// DB that already carries an instance_id keeps it (so a copy and its source
+	// agree), which is exactly what the lineage fingerprint below relies on.
+	if err := db.ensureInstanceID(); err != nil {
+		return fmt.Errorf("snapshot: ensure instance identity: %w", err)
+	}
+
 	// Compute lineage fingerprint from the live (pre-migration) DB.
 	fingerprint, err := lineageFingerprint(db, preVersion)
 	if err != nil {
 		return err
 	}
 
-	// VACUUM INTO a temp file inside the sidecar. PID-tagged so a stale temp
-	// from a crashed run is distinguishable and never mistaken for final.
-	tmpSnap := filepath.Join(sidecar, fmt.Sprintf("snapshot.tmp.%d", os.Getpid()))
-	_ = os.Remove(tmpSnap) // clear our own stale temp if present
+	// VACUUM INTO a temp file inside the sidecar. The name is reserved via an
+	// O_EXCL placeholder (proves ownership, then removed) so we never clobber a
+	// pre-existing snapshot.tmp from another process; VACUUM INTO then creates the
+	// file at that proven-free path. A racing re-create makes VACUUM fail closed
+	// rather than overwrite foreign data (Finding 7).
+	tmpSnap, terr := reserveOwnedTempName(sidecar, "snapshot.tmp.", "")
+	if terr != nil {
+		return terr
+	}
 	if _, err := db.Exec(`VACUUM INTO ?`, tmpSnap); err != nil {
 		_ = os.Remove(tmpSnap)
 		return fmt.Errorf("snapshot: VACUUM INTO: %w", err)
@@ -631,8 +777,9 @@ func writeManifestAtomic(sidecar string, m *Manifest) error {
 	if err != nil {
 		return fmt.Errorf("snapshot: marshal manifest: %w", err)
 	}
-	tmp := filepath.Join(sidecar, fmt.Sprintf("manifest.tmp.%d", os.Getpid()))
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// O_EXCL-create the temp (proves ownership) so we never truncate a
+	// pre-existing manifest.tmp from another process (Finding 7).
+	f, tmp, err := createOwnedTemp(sidecar, "manifest.tmp.", "")
 	if err != nil {
 		return fmt.Errorf("snapshot: open manifest temp: %w", err)
 	}

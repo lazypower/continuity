@@ -238,6 +238,42 @@ func TestSnapshotE2E_SecondServeRefusesWhileFirstLive(t *testing.T) {
 	testharness.WaitForReady(t, url3+"/api/health")
 }
 
+// TestSnapshotE2E_FirstRunServeIntoMissingDir is the Finding 3 regression: the
+// serve lock is now acquired BEFORE store.Open, and the lock file lives beside
+// the DB. A first-ever serve whose CONTINUITY_DB sits in a not-yet-created
+// (nested) directory must still create that directory before acquiring the
+// lock, so serve boots instead of dying on "open lock: no such file or
+// directory". Before the fix the lock acquire ran against a missing parent dir.
+func TestSnapshotE2E_FirstRunServeIntoMissingDir(t *testing.T) {
+	if testing.Short() {
+		t.Skip("snapshot e2e: skipped under -short")
+	}
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := t.TempDir()
+
+	// Deeply nested, non-existent DB parent — nothing has created it yet.
+	dbPath := filepath.Join(workDir, "nested", "deeper", "continuity.db")
+	if _, err := os.Stat(filepath.Dir(dbPath)); !os.IsNotExist(err) {
+		t.Fatalf("precondition: db dir should not exist yet (err=%v)", err)
+	}
+
+	url, env := testharness.HermeticEnv(t, workDir, dbPath, 0)
+	srv := testharness.StartServeProcess(t, bin, env)
+	t.Cleanup(srv.Stop)
+	// If the parent dir was created before the lock, serve binds and is ready.
+	testharness.WaitForReady(t, url+"/api/health")
+
+	// The DB (and a fresh schema at head) must now exist on disk.
+	db, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("first-run serve did not create the DB: %v", err)
+	}
+	defer db.Close()
+	if v, _ := db.SchemaVersion(); v != headVersion() {
+		t.Errorf("first-run DB schema = v%d, want head v%d", v, headVersion())
+	}
+}
+
 // TestSnapshotE2E_ExpiresAfterThreeBoots boots the binary three times against
 // the same DB; after the third successful bind the sidecar files are gone and
 // the DB itself is untouched (still at head).

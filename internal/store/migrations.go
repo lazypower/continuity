@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"os"
 )
 
 type migration struct {
@@ -272,14 +273,14 @@ func (db *DB) migrate() error {
 		return fmt.Errorf("create schema_versions: %w", err)
 	}
 
-	// Per-DB instance identity: created/backfilled exactly once for both fresh
-	// and existing DBs. It anchors the lineage fingerprint to THIS physical
-	// database so a sidecar transplanted next to an unrelated DB is refused on
-	// restore (see instance.go / snapshot.go). Must run before any restore
-	// point is taken so the fingerprint can read it.
-	if err := db.ensureInstanceID(); err != nil {
-		return fmt.Errorf("ensure instance identity: %w", err)
-	}
+	// NOTE: the per-DB instance identity is intentionally NOT written here.
+	// Writing continuity_meta unconditionally on every Open would MUTATE the DB
+	// even when a restore point cannot be secured (e.g. a blocked/regular-file
+	// sidecar). Instead it is established inside writeRestorePoint, after the
+	// sidecar is proven usable and before the VACUUM INTO, so a fail-closed
+	// upgrade leaves the DB completely unmutated. The identity legitimately lives
+	// in the DB (per-DB, intentionally copyable); only the ORDERING relative to
+	// fail-closed matters (see instance.go / snapshot.go, Finding 5).
 
 	// Forward-compat guard: refuse to operate against a DB that has been
 	// stamped with a schema version this binary does not know. The newer
@@ -297,17 +298,53 @@ func (db *DB) migrate() error {
 		return &ErrSchemaTooNew{Found: maxApplied, Supported: head}
 	}
 
-	// Upgrade restore point: if this is an existing on-disk DB (current
-	// version > 0) and the pending migration set contains at least one risky
-	// migration, take ONE restore point of the pre-upgrade state before any
-	// pending migration runs. Fails closed — if the snapshot is required but
-	// cannot be created/validated, abort the migration with no schema change.
-	// Skipped for fresh installs (maxApplied == 0), :memory:, and SQLite
-	// URI/DSN paths (see ensureUpgradeRestorePoint).
+	// Upgrade restore point + risky migration DDL must be SERIALIZED end-to-end.
+	// If this is an existing on-disk DB (version > 0) and the pending set contains
+	// at least one risky migration, hold the sidecar operation lock from BEFORE
+	// the restore point is created THROUGH the entire migration loop. Holding the
+	// op-lock across the DDL (not just across sidecar creation) is what makes two
+	// concurrent direct opens serialize: the loser waits briefly then fails closed
+	// rather than racing into the destructive CREATE/COPY/DROP/RENAME migration
+	// (Finding 6). Fails closed — if the snapshot is required but cannot be
+	// created/validated, abort with no schema change. Skipped for fresh installs
+	// (maxApplied == 0), :memory:, and SQLite URI/DSN paths.
+	_, hasRisky := firstPendingRiskyVersion(maxApplied)
+	riskyUpgrade := maxApplied > 0 && hasRisky &&
+		snapshotEligiblePath(db.Path) && os.Getenv(envDisableSnapshot) != "1"
+
+	if riskyUpgrade {
+		sidecar, serr := sidecarPath(db.Path)
+		if serr != nil {
+			return serr
+		}
+		releaseOp, lerr := acquireSnapshotOpLock(sidecar)
+		if lerr != nil {
+			return lerr
+		}
+		defer releaseOp()
+
+		// Restore point first (lock already held — no re-acquire), then the DDL,
+		// all under the same op-lock so no concurrent opener can interleave.
+		if err := db.ensureUpgradeRestorePointLocked(maxApplied); err != nil {
+			return err
+		}
+		return db.runPendingMigrations()
+	}
+
+	// No risky migration pending (or opt-out / ineligible path): the restore-point
+	// helper still handles the opt-out/ineligible warnings, but no op-lock is held
+	// — non-risky ALTER-only migrations do not rewrite tables and are safe to run
+	// without cross-process serialization.
 	if err := db.ensureUpgradeRestorePoint(maxApplied); err != nil {
 		return err
 	}
+	return db.runPendingMigrations()
+}
 
+// runPendingMigrations applies every not-yet-recorded migration in order, each
+// in its own transaction. Split out of migrate() so it can run either under the
+// held operation lock (risky upgrade) or directly (non-risky path).
+func (db *DB) runPendingMigrations() error {
 	for _, m := range migrations {
 		var count int
 		err := db.QueryRow("SELECT COUNT(*) FROM schema_versions WHERE version = ?", m.Version).Scan(&count)

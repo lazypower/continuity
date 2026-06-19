@@ -274,19 +274,6 @@ func readServeLockOwner(path string) (pid int, alive bool, err error) {
 	return pid, processAlive(pid), nil
 }
 
-// serveLockHeld reports whether a live serve process holds dbPath's lock. A
-// lock whose PID no longer exists is treated as stale (not held).
-func serveLockHeld(dbPath string) (bool, error) {
-	path, err := serveLockPath(dbPath)
-	if err != nil {
-		return false, err
-	}
-	_, alive, err := readServeLockOwner(path)
-	if err != nil {
-		return false, err
-	}
-	return alive, nil
-}
 
 // =========================================================================
 // Restore
@@ -312,8 +299,26 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		return "", err
 	}
 
+	// ACQUIRE the serve lock EXCLUSIVELY and hold it for the ENTIRE restore —
+	// through marker write, the moves, publish, cleanup, and marker removal.
+	// Merely checking the lock (the prior round's behavior) was a TOCTOU hole: a
+	// serve/Open could start mid-restore and resume the same marker. Holding the
+	// lock makes restore mutually exclusive with serve/Open and with another
+	// restore. A LIVE foreign holder means a serve owns the DB → refuse; a stale
+	// (dead-PID) lock is reclaimed automatically by AcquireServeLock.
+	releaseLock, lockErr := AcquireServeLock(dbPath)
+	if lockErr != nil {
+		if errors.Is(lockErr, ErrServeLockHeld) {
+			return "", errors.New("restore: a continuity serve appears to be running against this DB; stop it first")
+		}
+		return "", fmt.Errorf("restore: acquire serve lock: %w", lockErr)
+	}
+	defer releaseLock()
+
 	// Drive any torn restore from a previous crash to a clean state first; a
-	// fresh restore must never start on top of an in-progress one.
+	// fresh restore must never start on top of an in-progress one. We already
+	// hold the serve lock, so resume runs under it (no re-acquire) and no other
+	// process can race the recovery.
 	if rerr := resumeRestoreIfPending(dbPath); rerr != nil {
 		return "", fmt.Errorf("restore: resume prior restore: %w", rerr)
 	}
@@ -321,13 +326,6 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	m, err := loadValidManifest(sidecar)
 	if err != nil {
 		return "", err // ErrNoRestorePoint or corrupt — both refuse
-	}
-
-	// Refuse if a live serve holds the DB.
-	if held, herr := serveLockHeld(dbPath); herr != nil {
-		return "", fmt.Errorf("restore: check serve lock: %w", herr)
-	} else if held {
-		return "", errors.New("restore: a continuity serve appears to be running against this DB; stop it first")
 	}
 
 	snapPath := snapshotDBPathIn(sidecar)
@@ -379,9 +377,16 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	dbDir := filepath.Dir(resolvedDB)
 
 	// Stage the snapshot to a temp file in the DB dir, then verify its hash
-	// at the staged location before any destructive move.
-	staged := filepath.Join(dbDir, fmt.Sprintf(".restore.staged.%d.db", os.Getpid()))
-	_ = os.Remove(staged)
+	// at the staged location before any destructive move. The staged name is
+	// O_EXCL-created (proves ownership) so we never copy over a foreign
+	// .restore.staged temp; copyFile then writes into our own proven file
+	// (Finding 7). The ".restore.staged." prefix is also what resume validates a
+	// marker's staged path against.
+	stagedFile, staged, terr := createOwnedTemp(dbDir, ".restore.staged.", ".db")
+	if terr != nil {
+		return "", fmt.Errorf("restore: reserve staged temp: %w", terr)
+	}
+	_ = stagedFile.Close()
 	if err := copyFile(snapPath, staged); err != nil {
 		_ = os.Remove(staged)
 		return "", fmt.Errorf("restore: stage snapshot: %w", err)
@@ -425,6 +430,19 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		return "", err
 	}
 
+	// In-process canonical view for the rollback paths below. Every field here
+	// was computed locally from the resolved DB (not read back from the marker),
+	// so it is already trusted; finishPendingRestore consumes the same shape that
+	// resume reconstructs from disk.
+	cr := &canonicalRestore{
+		resolvedDB: resolvedDB,
+		sidecar:    sidecar,
+		staged:     staged,
+		backup:     movedAsidePrefix,
+		moved:      movedSuffixes,
+		published:  false,
+	}
+
 	// Move the current triplet aside to the unique pre-restore names. We do NOT
 	// delete them — they are crash material and an operator escape hatch.
 	for _, suffix := range movedSuffixes {
@@ -432,7 +450,7 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		dst := movedAsidePrefix + suffix
 		if err := os.Rename(src, dst); err != nil {
 			// Roll back whatever we already moved, then clear the marker.
-			_ = finishPendingRestore(sidecar, mk)
+			_ = finishPendingRestore(cr)
 			_ = os.Remove(staged)
 			return "", fmt.Errorf("restore: move %s aside: %w", src, err)
 		}
@@ -441,7 +459,7 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	// Rename the staged snapshot into the live DB path (atomic on same dir).
 	if err := os.Rename(staged, resolvedDB); err != nil {
 		// DB not yet published — roll back to the moved-aside originals.
-		_ = finishPendingRestore(sidecar, mk)
+		_ = finishPendingRestore(cr)
 		_ = os.Remove(staged)
 		return "", fmt.Errorf("restore: publish restored db: %w", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -515,6 +516,80 @@ func TestMigrateFailsClosedOnCorruptSidecar(t *testing.T) {
 	}
 }
 
+// TestMigrateBlockedSidecarLeavesDBUnmutated is the ROUND 2 Finding 5
+// regression: a v5 DB whose sidecar is BLOCKED (a regular file where the dir
+// should go) must fail closed AND leave the DB entirely UNMUTATED — in
+// particular, no continuity_meta / instance_id row may be written. The prior
+// ordering wrote instance_id in migrate() before the restore point was secured,
+// so a fail-closed upgrade still mutated the DB. instance_id is now established
+// inside writeRestorePoint (after the sidecar is proven usable), so a blocked
+// sidecar never touches the DB.
+func TestMigrateBlockedSidecarLeavesDBUnmutated(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+
+	// Build a v5 DB WITHOUT seeding an instance_id, so we can prove the DB is
+	// untouched (no continuity_meta) after a fail-closed open.
+	{
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`
+			CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER);
+		`); err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range migrations {
+			if m.Version > 5 {
+				break
+			}
+			if _, err := raw.Exec(m.SQL); err != nil {
+				t.Fatalf("apply v%d: %v", m.Version, err)
+			}
+			if _, err := raw.Exec(`INSERT INTO schema_versions (version, description, applied_at) VALUES (?, ?, 0)`,
+				m.Version, m.Description); err != nil {
+				t.Fatalf("record v%d: %v", m.Version, err)
+			}
+		}
+		raw.Close()
+	}
+
+	// Block the sidecar: a regular FILE where the dir would go.
+	sidecar, _ := sidecarPath(dbPath)
+	if err := os.WriteFile(sidecar, []byte("not a dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open must fail closed (the risky upgrade needs a restore point it can't make).
+	if _, err := Open(dbPath); err == nil {
+		t.Fatal("expected Open to fail closed on a blocked sidecar")
+	}
+
+	// The DB must be UNMUTATED: still v5, and NO continuity_meta table written.
+	raw, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var maxV int
+	if err := raw.QueryRow(`SELECT COALESCE(MAX(version),0) FROM schema_versions`).Scan(&maxV); err != nil {
+		t.Fatal(err)
+	}
+	if maxV != 5 {
+		t.Errorf("schema advanced to v%d despite fail-closed; want v5", maxV)
+	}
+	var metaCount int
+	if err := raw.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, metaTableName,
+	).Scan(&metaCount); err != nil {
+		t.Fatal(err)
+	}
+	if metaCount != 0 {
+		t.Errorf("blocked-sidecar fail-closed mutated the DB: %s table was created", metaTableName)
+	}
+}
+
 // TestOptOutSkipsSnapshot: with the opt-out env set, migrate proceeds without
 // a restore point and reaches head.
 func TestOptOutSkipsSnapshot(t *testing.T) {
@@ -813,7 +888,11 @@ func TestRestore_RefusesLineageMismatch(t *testing.T) {
 	}
 }
 
-// TestRestore_RefusesWhileServeLockHeld: a live serve lock blocks restore.
+// TestRestore_RefusesWhileServeLockHeld: a LIVE serve lock held by ANOTHER
+// process blocks restore. Restore now ACQUIRES the serve lock (Finding 2), so a
+// foreign live holder makes the acquire fail closed. We plant PID 1 (always
+// alive) to stand in for a separate live serve — using our own PID would let
+// Restore re-acquire its own lock, which is the legitimate same-process case.
 func TestRestore_RefusesWhileServeLockHeld(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
@@ -824,22 +903,19 @@ func TestRestore_RefusesWhileServeLockHeld(t *testing.T) {
 	}
 	db.Close()
 
-	// Acquire a lock recording THIS process's PID (alive) → restore refuses.
-	release, err := AcquireServeLock(dbPath)
-	if err != nil {
+	// Plant a serve lock owned by a DIFFERENT live process (PID 1) → restore must
+	// refuse rather than swap the DB under a running server.
+	lp, _ := serveLockPath(dbPath)
+	if err := os.WriteFile(lp, []byte("1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer release()
-
 	if _, err := Restore(dbPath); err == nil {
-		t.Fatal("expected restore to refuse while serve lock held")
+		t.Fatal("expected restore to refuse while a foreign live serve lock is held")
 	} else if !contains(err.Error(), "serve") {
 		t.Errorf("err = %v, want serve-lock refusal", err)
 	}
 
-	// A stale lock (dead PID) must NOT block restore.
-	release()
-	lp, _ := serveLockPath(dbPath)
+	// A stale lock (dead PID) must NOT block restore — it is reclaimed.
 	if err := os.WriteFile(lp, []byte("999999999\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1009,15 +1085,19 @@ func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 	sidecar, _ := sidecarPath(dbPath)
 
 	// Manufacture the torn state: move the live DB triplet aside, stage a copy,
-	// write a not-yet-published marker, then leave the live DB MISSING.
-	backupPrefix := dbPath + ".pre-restore.crashtest"
-	staged := filepath.Join(dir, ".restore.staged.crash.db")
+	// write a not-yet-published marker, then leave the live DB MISSING. Use the
+	// RESOLVED DB path for all marker fields, exactly as production Restore does —
+	// resume recomputes the canonical set from this resolved path and refuses any
+	// marker field outside it.
+	resolved, _ := resolveDBPath(dbPath)
+	backupPrefix := resolved + ".pre-restore.crashtest"
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.crash.db")
 	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
 		t.Fatal(err)
 	}
 	var moved []string
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		src := dbPath + suffix
+		src := resolved + suffix
 		if _, statErr := os.Lstat(src); statErr != nil {
 			continue
 		}
@@ -1027,11 +1107,11 @@ func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 		moved = append(moved, suffix)
 	}
 	// Plant a stale -wal at the live name to prove rollback scrubs/handles it.
-	if err := os.WriteFile(dbPath+"-wal", []byte("stale"), 0o600); err != nil {
+	if err := os.WriteFile(resolved+"-wal", []byte("stale"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	mk := &restoreMarker{
-		Version: 1, RestoredDBPath: dbPath, StagedPath: staged,
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
@@ -1074,7 +1154,8 @@ func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
 
 	// The DB at dbPath is already the (head) live DB; pretend it is the freshly
 	// published restored image. Plant a stale -wal/-shm at the live names and a
-	// published marker.
+	// published marker. Marker fields use the RESOLVED DB path as production does.
+	resolved, _ := resolveDBPath(dbPath)
 	if err := os.WriteFile(dbPath+"-wal", []byte("stale-wal"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1082,8 +1163,8 @@ func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	mk := &restoreMarker{
-		Version: 1, RestoredDBPath: dbPath, StagedPath: "",
-		BackupPrefix: dbPath + ".pre-restore.x", MovedSuffixes: []string{"", "-wal", "-shm"},
+		Version: 1, RestoredDBPath: resolved, StagedPath: "",
+		BackupPrefix: resolved + ".pre-restore.x", MovedSuffixes: []string{"", "-wal", "-shm"},
 		DBPublished: true,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
@@ -1108,6 +1189,311 @@ func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
 		t.Fatalf("DB not openable after complete-resume: %v", err)
 	}
 	rdb.Close()
+}
+
+// ---------------------------------------------------------------------------
+// ROUND 2 Finding 1: a planted/corrupt restore marker must never act
+// destructively on marker-controlled paths. Resume recomputes EVERY path from
+// the canonical resolved DB + sidecar and refuses any marker field that names a
+// path outside that set — without touching the out-of-set file.
+// ---------------------------------------------------------------------------
+
+// TestRestoreMarker_HostileBackupPrefixRefusedAndUntouched plants a marker whose
+// backup_prefix points at an unrelated victim file OUTSIDE the canonical set.
+// Resume (rollback phase) must FAIL CLOSED and must NOT rename/move the victim
+// over the live DB path.
+func TestRestoreMarker_HostileBackupPrefixRefusedAndUntouched(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// A victim file in a SIBLING directory the attacker wants pulled into the DB
+	// path (or deleted). It is outside "<resolvedDB>.pre-restore.".
+	victimDir := t.TempDir()
+	victim := filepath.Join(victimDir, "victim.secret")
+	if err := os.WriteFile(victim, []byte("attacker target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Plant a not-yet-published marker whose backup prefix is the victim path —
+	// rollback would naively os.Rename(victim, liveDB). Resume must refuse.
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: "",
+		BackupPrefix: victim, MovedSuffixes: []string{""}, DBPublished: false,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	err = resumeRestoreIfPending(dbPath)
+	if err == nil {
+		t.Fatal("expected resume to fail closed on a marker backup prefix outside the canonical set")
+	}
+	if !errors.Is(err, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", err)
+	}
+	// The victim file must be byte-intact and never moved into the DB path.
+	got, rerr := os.ReadFile(victim)
+	if rerr != nil || string(got) != "attacker target" {
+		t.Errorf("hostile marker disturbed the victim file: data=%q err=%v", got, rerr)
+	}
+	// And the live DB must NOT have been overwritten by the victim.
+	if data, _ := os.ReadFile(resolved); string(data) == "attacker target" {
+		t.Error("victim file was pulled into the live DB path")
+	}
+}
+
+// TestRestoreMarker_HostileStagedPathRefusedAndUntouched plants a marker whose
+// staged_path points at an unrelated victim file (outside the DB dir). On the
+// COMPLETE phase resume would os.Remove(stagedPath); it must refuse instead and
+// leave the victim intact.
+func TestRestoreMarker_HostileStagedPathRefusedAndUntouched(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	victimDir := t.TempDir()
+	victim := filepath.Join(victimDir, "victim.db")
+	if err := os.WriteFile(victim, []byte("do not delete"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Published marker so the COMPLETE path runs (which removes staged). The
+	// staged path is the victim, in another directory — must be refused.
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: victim,
+		BackupPrefix: "", MovedSuffixes: nil, DBPublished: true,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	err = resumeRestoreIfPending(dbPath)
+	if err == nil {
+		t.Fatal("expected resume to fail closed on a staged path outside the db dir")
+	}
+	if !errors.Is(err, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", err)
+	}
+	if _, serr := os.Stat(victim); serr != nil {
+		t.Errorf("hostile staged path caused victim deletion: %v", serr)
+	}
+}
+
+// TestRestoreMarker_SymlinkedSidecarRefusedOnResume plants a SYMLINK where the
+// sidecar dir should be. Resume must assertNotSymlink the sidecar (derived
+// canonically from the DB path) and fail closed — never follow the link to read
+// or remove a marker through it.
+func TestRestoreMarker_SymlinkedSidecarRefusedOnResume(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	// Point the sidecar path at an attacker-controlled directory via a symlink.
+	evil := t.TempDir()
+	sidecar, _ := sidecarPath(dbPath)
+	if err := os.Symlink(evil, sidecar); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a marker inside the link target so a naive resume would read it.
+	mk := &restoreMarker{Version: 1, RestoredDBPath: dbPath, DBPublished: true}
+	if err := writeRestoreMarkerAtomic(evil, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	err := resumeRestoreIfPending(dbPath)
+	if err == nil {
+		t.Fatal("expected resume to refuse a symlinked sidecar")
+	}
+	if !errors.Is(err, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", err)
+	}
+	// The symlinked marker must NOT have been removed through the link.
+	if _, serr := os.Stat(restoreMarkerPathIn(evil)); serr != nil {
+		t.Errorf("resume followed the symlinked sidecar and removed the marker: %v", serr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ROUND 2 Finding 2: restore/resume mutual exclusion via the serve lock.
+// A pending marker must NOT be resumed by a routine Open while ANOTHER live
+// process holds the serve lock (a restore/serve is in progress). Resume must
+// SKIP and leave the marker (and the moved-aside originals) untouched.
+// ---------------------------------------------------------------------------
+
+// TestResume_SkipsWhileForeignLiveServeLockHeld plants a not-yet-published
+// marker (originals moved aside) AND a serve lock owned by a DIFFERENT live
+// process. An Open-side resume must skip recovery (the live holder owns it) —
+// it must NOT roll back the originals, so the in-progress restore is not
+// corrupted from underneath the active restorer.
+func TestResume_SkipsWhileForeignLiveServeLockHeld(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Manufacture the torn (pre-publish) state: move the triplet aside, stage a
+	// copy, write a not-yet-published marker. Leave the live DB MISSING — exactly
+	// the window an active restorer occupies.
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.excl.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+	backupPrefix := resolved + ".pre-restore.excl"
+	var moved []string
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := resolved + suffix
+		if _, statErr := os.Lstat(src); statErr != nil {
+			continue
+		}
+		if err := os.Rename(src, backupPrefix+suffix); err != nil {
+			t.Fatal(err)
+		}
+		moved = append(moved, suffix)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// A DIFFERENT live process holds the serve lock (the active restorer).
+	lp, _ := serveLockPath(resolved)
+	if err := os.WriteFile(lp, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Routine Open-side resume must SKIP: it must not roll the originals back.
+	if err := resumeRestoreIfPending(dbPath); err != nil {
+		t.Fatalf("resume should skip (not error) under a foreign live lock: %v", err)
+	}
+	// Marker still present (untouched), originals still moved aside, live DB
+	// still missing — the active restorer's state is undisturbed.
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); err != nil {
+		t.Errorf("resume removed the marker despite a live foreign lock: %v", err)
+	}
+	if _, err := os.Stat(backupPrefix); err != nil {
+		t.Errorf("resume disturbed the moved-aside original despite a live lock: %v", err)
+	}
+	if _, err := os.Stat(resolved); !os.IsNotExist(err) {
+		t.Errorf("resume re-materialized the live DB despite a live lock (err=%v)", err)
+	}
+
+	// Once the foreign holder is GONE (stale lock), resume recovers.
+	if err := os.WriteFile(lp, []byte("999999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := resumeRestoreIfPending(dbPath); err != nil {
+		t.Fatalf("resume after holder gone: %v", err)
+	}
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("marker survived resume after holder gone")
+	}
+	rdb, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("DB not recovered after holder gone: %v", err)
+	}
+	rdb.Close()
+}
+
+// ---------------------------------------------------------------------------
+// ROUND 2 Finding 8: resume through a DANGLING DB symlink still finds the
+// sidecar under the REAL DB and recovers (rolls back) — it must not fall back to
+// "<link>.snapshot" and skip recovery, which would let a fresh DB be fabricated.
+// ---------------------------------------------------------------------------
+
+// TestRestoreMarker_ResumeThroughDanglingSymlinkRecovers simulates a restore
+// that crashed (before publish) THROUGH a symlinked CONTINUITY_DB after the real
+// DB was moved aside: the link now dangles. Opening via the dangling link must
+// resolve the real DB's sidecar (via os.Readlink), find the marker there, and
+// roll the originals back.
+func TestRestoreMarker_ResumeThroughDanglingSymlinkRecovers(t *testing.T) {
+	realDir := t.TempDir()
+	realDB := filepath.Join(realDir, "real.db")
+	buildDBAtVersionStandalone(t, realDB, 5)
+	db, err := Open(realDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(realDB)
+	resolvedReal, _ := resolveDBPath(realDB)
+
+	// Stage a copy and move the real DB triplet aside (the not-yet-published torn
+	// state), writing the marker under the REAL DB's sidecar.
+	staged := filepath.Join(filepath.Dir(resolvedReal), ".restore.staged.dangle.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+	backupPrefix := resolvedReal + ".pre-restore.dangle"
+	var moved []string
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := resolvedReal + suffix
+		if _, statErr := os.Lstat(src); statErr != nil {
+			continue
+		}
+		if err := os.Rename(src, backupPrefix+suffix); err != nil {
+			t.Fatal(err)
+		}
+		moved = append(moved, suffix)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolvedReal, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now the real DB is gone → a symlink pointing at it DANGLES. Resume through
+	// the dangling link must still find the marker under the real sidecar.
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "link.db")
+	if err := os.Symlink(realDB, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, serr := os.Stat(link); serr == nil {
+		t.Fatal("link unexpectedly resolves; real DB should be moved aside (dangling)")
+	}
+
+	if err := resumeRestoreIfPending(link); err != nil {
+		t.Fatalf("resume through dangling symlink: %v", err)
+	}
+	// The real DB is back (rollback moved the originals back).
+	rdb, err := OpenNoMigrate(realDB)
+	if err != nil {
+		t.Fatalf("dangling-symlink resume did not recover the real DB: %v", err)
+	}
+	rdb.Close()
+	// Marker and staged file cleared under the real sidecar.
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("marker survived dangling-symlink resume")
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Errorf("staged file survived dangling-symlink resume")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,37 +1549,93 @@ func TestRestore_NeverOverwritesExistingBackup(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 6: a stale restore point from an earlier upgrade window fails closed
+// ROUND 2 Finding 4: an interrupted upgrade continues under the still-covering
+// restore point (reuse), and a COMPLETED/non-covering point fails closed.
 // ---------------------------------------------------------------------------
 
-// TestCreateRestorePoint_StalePreVersionFailsClosed: a valid same-lineage
-// manifest whose pre_schema_version does NOT match the current upgrade's
-// pre-version must NOT be reused and must NOT be overwritten — createRestorePoint
-// fails closed so the operator restores or prunes explicitly.
-func TestCreateRestorePoint_StalePreVersionFailsClosed(t *testing.T) {
+// TestCreateRestorePoint_InterruptedUpgradeReusesCoveringPoint is the
+// crash-after-v6-before-v9 regression. A pre-v5→v9 point is taken, then v6
+// commits and the process crashes before v9. On the next run preVersion=6, but
+// the existing pre-v5 point still COVERS the v5→v9 window (pre<=6, target>=9,
+// current<target). The prior round wrongly rejected this (existing.Pre != pre)
+// and aborted the upgrade. It must now REUSE the point and NOT overwrite it.
+func TestCreateRestorePoint_InterruptedUpgradeReusesCoveringPoint(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
 	buildDBAtVersionStandalone(t, dbPath, 5)
 	sidecar, _ := sidecarPath(dbPath)
 
-	// Create a restore point recording pre-v5 (the existing window).
 	db := openWritableNoMigrate(t, dbPath)
 	defer db.Close()
-	if err := db.createRestorePoint(5, headVersion(), 6); err != nil {
-		t.Fatalf("seed restore point: %v", err)
-	}
 
-	// Snapshot the on-disk manifest bytes so we can prove no overwrite.
+	// Take the pre-v5 restore point (target = head = 9), as the v5→v9 run does
+	// before the first risky migration (v6).
+	if err := db.createRestorePoint(5, headVersion(), 6); err != nil {
+		t.Fatalf("seed pre-v5 restore point: %v", err)
+	}
 	before, err := os.ReadFile(manifestPathIn(sidecar))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Now a DIFFERENT upgrade run starts at pre-v8 (same DB lineage). Reuse must
-	// be refused because the existing point captures pre-v5, not pre-v8.
-	err = db.createRestorePoint(8, headVersion(), 9)
+	// Simulate the crash window: v6 has committed, so the on-disk schema is now
+	// v6 and the next-pending risky migration is v9. Record v6 as applied.
+	if _, err := db.Exec(
+		`INSERT INTO schema_versions (version, description) VALUES (6, 'crash-after-v6')`,
+	); err != nil {
+		t.Fatalf("mark v6 applied: %v", err)
+	}
+
+	// The resumed v5→v9 run re-enters createRestorePoint with preVersion=6,
+	// firstRisky=9. The pre-v5→v9 point still covers it → REUSE (no error, no
+	// overwrite).
+	if err := db.createRestorePoint(6, headVersion(), 9); err != nil {
+		t.Fatalf("interrupted upgrade should reuse the covering pre-v5 point, got: %v", err)
+	}
+	after, err := os.ReadFile(manifestPathIn(sidecar))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("covering restore point was overwritten on reuse")
+	}
+	// The point must still capture pre-v5 (the true rollback target), not pre-v6.
+	m, err := loadValidManifest(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.PreSchemaVersion != 5 {
+		t.Errorf("reused point pre_schema_version = %d, want 5 (must still roll back to pre-v5)", m.PreSchemaVersion)
+	}
+}
+
+// TestCreateRestorePoint_CompletedUpgradeFailsClosed: a valid same-lineage point
+// whose upgrade is ALREADY COMPLETE (current schema >= existing target) must NOT
+// be reused or overwritten — createRestorePoint fails closed so the operator
+// restores or prunes explicitly before a new upgrade window is opened.
+func TestCreateRestorePoint_CompletedUpgradeFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	db := openWritableNoMigrate(t, dbPath)
+	defer db.Close()
+
+	// Existing pre-v5→v9 point.
+	if err := db.createRestorePoint(5, headVersion(), 6); err != nil {
+		t.Fatalf("seed restore point: %v", err)
+	}
+	before, err := os.ReadFile(manifestPathIn(sidecar))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The upgrade has completed: current schema is now at head (>= existing
+	// target 9). A fresh createRestorePoint for this window must fail closed.
+	err = db.createRestorePoint(headVersion(), headVersion(), headVersion())
 	if err == nil {
-		t.Fatal("expected fail-closed when existing restore point is from a different upgrade window")
+		t.Fatal("expected fail-closed when the existing restore point's upgrade is already complete")
 	}
 	if !errors.Is(err, ErrSnapshotSidecarCorrupt) {
 		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", err)
@@ -1203,7 +1645,7 @@ func TestCreateRestorePoint_StalePreVersionFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(before) != string(after) {
-		t.Errorf("stale restore point was overwritten on fail-closed")
+		t.Errorf("completed-upgrade restore point was overwritten on fail-closed")
 	}
 }
 
@@ -1301,6 +1743,184 @@ func TestCreateRestorePoint_ConcurrentSerializes(t *testing.T) {
 	// Exactly one valid restore point, intact.
 	if _, err := loadValidManifest(sidecar); err != nil {
 		t.Fatalf("post-concurrency manifest invalid: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ROUND 2 Finding 6: the op-lock spans the migration DDL, not just sidecar
+// creation. Concurrent opens of a v5 DB must serialize through the whole risky
+// upgrade: exactly one performs the destructive migration, the rest see it done
+// (or fail closed), and no torn state results.
+// ---------------------------------------------------------------------------
+
+// TestMigrate_ConcurrentRiskyUpgradeSerializes races migrate() (restore point +
+// the v6/v9 table-rebuild DDL) across N pre-opened handles on one v5 DB. Before
+// Finding 6 the op-lock dropped after sidecar creation, so two opens could both
+// enter the destructive CREATE/COPY/DROP/RENAME loop concurrently. Holding the
+// lock across the DDL must serialize them: the DB ends at head with the seeded
+// row intact, exactly one restore point exists, and every migrate() either
+// succeeds, fails closed on the op-lock, or hits a transient SQLITE_BUSY — never
+// a torn/half-applied schema.
+//
+// Handles are opened SERIALLY first (the journal_mode=WAL pragma contends
+// in-process across concurrent sql.Open and is not what we are testing); the DDL
+// serialization is.
+func TestMigrate_ConcurrentRiskyUpgradeSerializes(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	// Seed a v5 row so a torn/double rebuild would lose or duplicate it.
+	{
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`
+			INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
+			VALUES ('mem://user/events/concurrent-marker', 'leaf', 'events', 'survive', 1, 1)`); err != nil {
+			t.Fatal(err)
+		}
+		raw.Close()
+	}
+
+	const n = 6
+	handles := make([]*DB, n)
+	for i := range handles {
+		handles[i] = openWritableNoMigrate(t, dbPath)
+		defer handles[i].Close()
+	}
+
+	var wg sync.WaitGroup
+	var start sync.WaitGroup
+	start.Add(1)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			start.Wait() // release all at once for maximum contention
+			errs[idx] = handles[idx].migrate()
+		}(i)
+	}
+	start.Done()
+	wg.Wait()
+
+	// Every migrate() must have either succeeded, failed CLOSED on the op-lock
+	// (ErrSnapshotOpLocked), or hit a transient SQLITE_BUSY — never a torn-schema
+	// error from two rebuilds interleaving.
+	for i, e := range errs {
+		if e == nil || errors.Is(e, ErrSnapshotOpLocked) {
+			continue
+		}
+		if contains(e.Error(), "database is locked") || contains(e.Error(), "SQLITE_BUSY") {
+			continue
+		}
+		t.Errorf("goroutine %d: unexpected error (want success / op-lock fail-closed / SQLITE_BUSY): %v", i, e)
+	}
+
+	// Final DB is at head, the seeded row survives exactly once, and exactly one
+	// valid restore point exists.
+	fin, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fin.Close()
+	if v, _ := fin.SchemaVersion(); v != headVersion() {
+		t.Errorf("final schema = v%d, want head v%d", v, headVersion())
+	}
+	var cnt int
+	if err := fin.QueryRow(
+		`SELECT COUNT(*) FROM mem_nodes WHERE uri='mem://user/events/concurrent-marker'`).Scan(&cnt); err != nil {
+		t.Fatalf("read marker after concurrent upgrade: %v", err)
+	}
+	if cnt != 1 {
+		t.Errorf("seeded row count = %d after concurrent upgrade, want exactly 1 (torn/double rebuild)", cnt)
+	}
+	sidecar, _ := sidecarPath(dbPath)
+	if _, err := loadValidManifest(sidecar); err != nil {
+		t.Errorf("post-concurrency restore point invalid: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ROUND 2 Finding 7: temp/staging files are created O_EXCL (creation proves
+// ownership). A pre-existing PID-named temp from another process must NEVER be
+// clobbered/removed — the new code picks a fresh random name instead.
+// ---------------------------------------------------------------------------
+
+// TestRestore_NeverClobbersForeignStagedTemp plants a file at the EXACT legacy
+// PID-named staged-temp path the prior code created-with-O_TRUNC and removed
+// (.restore.staged.<pid>.db), then drives a real restore. The foreign file must
+// be byte-intact afterward: O_EXCL + a random token mean restore stages into a
+// name it proved it owns, never the squatted PID-named one (Finding 7).
+func TestRestore_NeverClobbersForeignStagedTemp(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // creates a valid restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// A "foreign" in-flight staged temp squatting the legacy PID-named path that
+	// the prior code would have os.Remove'd before copying over it.
+	resolved, _ := resolveDBPath(dbPath)
+	legacyStaged := filepath.Join(filepath.Dir(resolved), fmt.Sprintf(".restore.staged.%d.db", os.Getpid()))
+	const foreign = "FOREIGN IN-FLIGHT STAGED TEMP — DO NOT TOUCH"
+	if err := os.WriteFile(legacyStaged, []byte(foreign), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Restore(dbPath); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	// The foreign staged temp must be byte-intact — restore used its own O_EXCL
+	// name and never touched this one.
+	got, err := os.ReadFile(legacyStaged)
+	if err != nil {
+		t.Fatalf("foreign staged temp was removed by restore: %v", err)
+	}
+	if string(got) != foreign {
+		t.Errorf("foreign staged temp was clobbered by restore: %q", got)
+	}
+}
+
+// TestCreateOwnedTemp_ExclusiveOwnership verifies the helper itself: it returns
+// a freshly-created, previously-absent path, and never hands back (or truncates)
+// a name that already exists.
+func TestCreateOwnedTemp_ExclusiveOwnership(t *testing.T) {
+	dir := t.TempDir()
+
+	f, path, err := createOwnedTemp(dir, "x.tmp.", ".db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if filepath.Dir(path) != dir {
+		t.Errorf("temp not in requested dir: %s", path)
+	}
+	// A second call must produce a DIFFERENT path (random token), never reuse the
+	// existing one.
+	f2, path2, err := createOwnedTemp(dir, "x.tmp.", ".db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2.Close()
+	if path2 == path {
+		t.Errorf("createOwnedTemp returned a colliding path twice: %s", path2)
+	}
+
+	// reserveOwnedTempName returns a proven-free path (file removed after the
+	// O_EXCL placeholder), suitable for VACUUM INTO.
+	reserved, err := reserveOwnedTempName(dir, "v.tmp.", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(reserved); !os.IsNotExist(err) {
+		t.Errorf("reserved temp name is not free: %v", err)
 	}
 }
 

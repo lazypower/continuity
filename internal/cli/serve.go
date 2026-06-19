@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -65,6 +66,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 		dbPath, err = store.DefaultDBPath()
 		if err != nil {
 			return fmt.Errorf("resolve db path: %w", err)
+		}
+	}
+
+	// Ensure the DB parent directory exists BEFORE acquiring the serve lock. The
+	// lock file lives beside the DB, so a first-ever serve into a missing parent
+	// (default ~/.continuity, or a nested CONTINUITY_DB) would otherwise fail to
+	// create the lock and serve would exit before ever opening the DB. Open()
+	// also creates this dir, but the lock is acquired first now (see below), so
+	// the dir must exist first. 0700 mirrors store.Open's MkdirAll perms.
+	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create db dir: %w", err)
 		}
 	}
 
