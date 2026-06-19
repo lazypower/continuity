@@ -156,3 +156,60 @@ func TestTFIDFEmbedderEmpty(t *testing.T) {
 		t.Errorf("vec length = %d, want %d", len(vec), embedder.Dimensions())
 	}
 }
+
+// TestNewTFIDFEmbedder_IncludesRetractedInCorpus pins the issue #22 fix.
+// Pre-fix: NewTFIDFEmbedder called db.ListLeaves() which excludes retracted
+// nodes, so the IDF table lost terms that lived only on the retracted node.
+// Stored vectors (computed when that node was live) then lived in a different
+// vector space than fresh embeddings, silently degrading findRetractedMatches
+// recall. The fix loads from ListLeavesIncludingRetracted; this test asserts
+// the retracted node's unique vocabulary survives in the rebuilt IDF.
+func TestNewTFIDFEmbedder_IncludesRetractedInCorpus(t *testing.T) {
+	db := testDB(t)
+
+	// Seed two leaves with deliberately disjoint distinctive vocabulary so we
+	// can tell whether the retracted node's terms are present in the IDF.
+	if err := db.CreateNode(&store.MemNode{
+		URI: "mem://user/events/live", NodeType: "leaf", Category: "events",
+		L0Abstract: "ordinary common shared common words appear here",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateNode(&store.MemNode{
+		URI: "mem://user/events/will-retract", NodeType: "leaf", Category: "events",
+		L0Abstract: "zebraqua quixotic glyphwerks distinctive unusual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Retract one node. Pre-fix, "zebraqua/quixotic/glyphwerks/distinctive/unusual"
+	// would vanish from the IDF.
+	if _, err := db.RetractNode("mem://user/events/will-retract", "test", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	emb, err := NewTFIDFEmbedder(db, 512)
+	if err != nil {
+		t.Fatalf("NewTFIDFEmbedder: %v", err)
+	}
+
+	for _, term := range []string{"zebraqua", "quixotic", "glyphwerks", "distinctive", "unusual"} {
+		if _, ok := emb.idf[term]; !ok {
+			t.Errorf("IDF vocab missing retracted-only term %q after rebuild — corpus drift not contained", term)
+		}
+	}
+
+	// Functional check: embedding a string of retracted-only terms must yield
+	// a non-zero vector. Pre-fix this would be all-zero (every term is OOV).
+	vec, err := emb.Embed(context.Background(), "zebraqua quixotic glyphwerks")
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	var sumSquares float64
+	for _, x := range vec {
+		sumSquares += x * x
+	}
+	if sumSquares == 0 {
+		t.Error("embedding of retracted-only vocabulary is all-zero — IDF table lost the terms")
+	}
+}

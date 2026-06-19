@@ -30,6 +30,13 @@ const (
 	envServeEmbedder = "CONTINUITY_EMBEDDER" // "tfidf" | "ollama" | "none" | "" (auto)
 )
 
+// tfidfBestEffortNotice is surfaced once at startup whenever TFIDF is the active
+// embedder (forced or fallback). TFIDF is best-effort by construction — the
+// corpus IS the model — so operators should know the tradeoff they're running
+// with, plus a one-line pointer to the upgrade path. The README's "Embedding
+// backends" section spells out the two shipped paths (Ollama / TFIDF). Issue #22.
+const tfidfBestEffortNotice = "  ! tfidf: retraction-dedup recall is best-effort; install Ollama (nomic-embed-text) for stronger guarantees — see README \"Embedding backends\""
+
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start the HTTP API server",
@@ -105,6 +112,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 					eng.SetEmbedder(emb)
 				}
 				fmt.Fprintf(os.Stderr, "  embedder: tfidf (forced)\n")
+				fmt.Fprintln(os.Stderr, tfidfBestEffortNotice)
 			}
 		case "none":
 			fmt.Fprintln(os.Stderr, "  embedder: none (forced; dedup-against-retracted gate inactive)")
@@ -125,6 +133,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 						eng.SetEmbedder(emb)
 					}
 					fmt.Fprintf(os.Stderr, "  embedder: tfidf (fallback)\n")
+					fmt.Fprintln(os.Stderr, tfidfBestEffortNotice)
 				}
 			}
 		}

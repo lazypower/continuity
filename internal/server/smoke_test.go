@@ -126,8 +126,14 @@ func TestSmoke_MigrationAndRetractAgainstRealDB(t *testing.T) {
 		if isMatch, _ := engine.IsRetractedMatch(err); isMatch {
 			return
 		}
-		// If the gate didn't fire, log it but don't fail — depends on TFIDF
-		// recall against the live corpus, which is fuzzy on real data.
-		t.Logf("dedup gate did not fire (err=%v); embedder recall on real data is fuzzy — manual confirmation may be needed", err)
+		// If the gate didn't fire, log it but don't fail. Issue #22 closed the
+		// retraction-induced corpus-shift component of TFIDF drift (the
+		// embedder is now built from ListLeavesIncludingRetracted, so the
+		// vector space stays coherent across retractions). But corpus growth
+		// between the prior embedding and this rebuild still produces residual
+		// drift — that's the broader TFIDF limitation we accept as best-effort
+		// rather than chase. The asserted regression test for the fix lives at
+		// internal/engine/retract_test.go::TestFindRetractedMatches_TFIDFCorpusCoherent.
+		t.Logf("dedup gate did not fire (err=%v); residual TFIDF drift on real data — install Ollama for stronger guarantees", err)
 	})
 }
