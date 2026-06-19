@@ -47,8 +47,23 @@ func init() {
 	snapshotCmd.AddCommand(snapshotPruneCmd)
 }
 
+// openDBForSnapshot opens the configured database (honoring CONTINUITY_DB, like
+// openDB) but WITHOUT running migrations. Inspecting or pruning snapshots must
+// not trigger a schema upgrade — see store.OpenNoMigrate for why.
+func openDBForSnapshot() (*store.DB, error) {
+	dbPath := os.Getenv("CONTINUITY_DB")
+	if dbPath == "" {
+		var err error
+		dbPath, err = store.DefaultDBPath()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return store.OpenNoMigrate(dbPath)
+}
+
 func runSnapshotList(cmd *cobra.Command, args []string) error {
-	db, err := openDB()
+	db, err := openDBForSnapshot()
 	if err != nil {
 		return err
 	}
@@ -73,12 +88,15 @@ func runSnapshotList(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 	fmt.Println("To restore from a snapshot, stop the server and:")
-	fmt.Println("  cp <snapshot-path> ~/.continuity/continuity.db")
+	// Print the DB actually opened, not a hardcoded default — with
+	// CONTINUITY_DB set, the default path would point the operator at the
+	// wrong file and risk overwriting an unrelated database.
+	fmt.Printf("  cp <snapshot-path> %s\n", db.Path)
 	return nil
 }
 
 func runSnapshotPrune(cmd *cobra.Command, args []string) error {
-	db, err := openDB()
+	db, err := openDBForSnapshot()
 	if err != nil {
 		return err
 	}

@@ -761,3 +761,99 @@ func TestSnapshot_PruneNoOpOnEmpty(t *testing.T) {
 		t.Errorf("prune on empty returned %d", n)
 	}
 }
+
+// TestSnapshot_PruneReclaimsUntrackedFiles pins that prune scans the snapshots/
+// directory and removes our snapshot files that have no tracking row — the
+// stranded-file case that arises when recording fails after a migration commits
+// or a superseded-file delete fails. Tracked-only pruning would leak these full
+// DB copies forever, contradicting prune's promise to reclaim the safety net.
+func TestSnapshot_PruneReclaimsUntrackedFiles(t *testing.T) {
+	t.Setenv(EnvNoMigrationSnapshot, "")
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	buildSnapshotDBAtVersion(t, dbPath, 8) // v9 risky → one tracked snapshot
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	snaps, _ := db.ListMigrationSnapshots()
+	if len(snaps) != 1 {
+		t.Fatalf("setup: expected 1 tracked snapshot, got %d", len(snaps))
+	}
+
+	// Strand an untracked snapshot file in snapshots/ — a real DB copy with no
+	// row, plus a foreign file prune must NOT touch.
+	snapDir := filepath.Join(dir, "snapshots")
+	orphan := filepath.Join(snapDir, "continuity-pre-v6-2020-01-01T00-00-00Z.db")
+	if err := os.WriteFile(orphan, []byte("orphaned snapshot copy"), 0o600); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+	foreign := filepath.Join(snapDir, "operator-notes.txt")
+	if err := os.WriteFile(foreign, []byte("do not delete"), 0o600); err != nil {
+		t.Fatalf("write foreign: %v", err)
+	}
+
+	removed, err := db.PruneMigrationSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Tracked snapshot + the orphan = 2.
+	if removed != 2 {
+		t.Errorf("prune count = %d, want 2 (1 tracked + 1 untracked)", removed)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("untracked snapshot file should be reclaimed; stat: %v", err)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Errorf("prune must not touch non-snapshot files; foreign file gone: %v", err)
+	}
+	after, _ := db.ListMigrationSnapshots()
+	if len(after) != 0 {
+		t.Errorf("rows should be cleared; got %+v", after)
+	}
+}
+
+// TestSnapshot_PruneViaNoMigrateOpenDoesNotMigrate pins the New-1 contract:
+// inspecting/cleaning snapshots must not upgrade the schema. Opening a
+// pre-head DB with OpenNoMigrate and pruning must NOT run the pending risky
+// migration — which would manufacture a snapshot and then immediately delete
+// it, silently discarding the only rollback point.
+func TestSnapshot_PruneViaNoMigrateOpenDoesNotMigrate(t *testing.T) {
+	t.Setenv(EnvNoMigrationSnapshot, "")
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	buildSnapshotDBAtVersion(t, dbPath, 8) // pre-v9; v9 is risky
+
+	db, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// No migration ran on open, so schema is still v8.
+	if v, err := db.SchemaVersion(); err != nil || v != 8 {
+		t.Fatalf("schema version = %d (err %v); OpenNoMigrate must not migrate (want 8)", v, err)
+	}
+
+	n, err := db.PruneMigrationSnapshots()
+	if err != nil {
+		t.Fatalf("prune on never-migrated DB must tolerate missing sidecar table: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("prune removed %d; a pre-migration DB has no snapshots to remove", n)
+	}
+
+	// Crucially: no snapshots/ directory full of a just-created-then-deleted
+	// snapshot. The schema stayed put, so no risky migration fired.
+	if entries, err := os.ReadDir(filepath.Join(dir, "snapshots")); err == nil && len(entries) > 0 {
+		t.Errorf("prune manufactured snapshots via migration: %d file(s) in snapshots/", len(entries))
+	}
+	if v, _ := db.SchemaVersion(); v != 8 {
+		t.Errorf("schema advanced to v%d during prune; must stay v8", v)
+	}
+}

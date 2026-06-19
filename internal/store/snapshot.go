@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -284,17 +285,64 @@ func (db *DB) ListMigrationSnapshots() ([]MigrationSnapshot, error) {
 // safety net is gone after this — so the CLI surface should make that clear
 // to the operator.
 func (db *DB) PruneMigrationSnapshots() (int, error) {
+	removed := make(map[string]bool)
+
+	// 1. Tracked snapshots: delete the file for every row we know about.
 	snaps, err := db.ListMigrationSnapshots()
 	if err != nil {
 		return 0, err
 	}
 	for _, s := range snaps {
 		if err := os.Remove(s.Path); err != nil && !os.IsNotExist(err) {
-			return 0, fmt.Errorf("remove snapshot %s: %w", s.Path, err)
+			return len(removed), fmt.Errorf("remove snapshot %s: %w", s.Path, err)
+		}
+		removed[s.Path] = true
+	}
+
+	// 2. Untracked snapshot files: scan the snapshots/ directory for full DB
+	//    copies that have no tracking row. These get stranded when recording a
+	//    snapshot fails after its migration commits, or when a superseded-file
+	//    delete fails — paths that leave the file on disk with no row. Pruning
+	//    only tracked rows would leave these large copies to leak forever,
+	//    contradicting this command's promise to reclaim the safety net fully.
+	if db.Path != "" && db.Path != ":memory:" {
+		snapDir := filepath.Join(filepath.Dir(db.Path), "snapshots")
+		entries, dirErr := os.ReadDir(snapDir)
+		if dirErr != nil && !os.IsNotExist(dirErr) {
+			return len(removed), fmt.Errorf("scan snapshot dir %s: %w", snapDir, dirErr)
+		}
+		for _, e := range entries {
+			// Only touch our own snapshot files; never anything else that
+			// happens to share the directory.
+			name := e.Name()
+			if e.IsDir() || !strings.HasPrefix(name, "continuity-pre-v") || !strings.HasSuffix(name, ".db") {
+				continue
+			}
+			p := filepath.Join(snapDir, name)
+			if removed[p] {
+				continue
+			}
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				return len(removed), fmt.Errorf("remove untracked snapshot %s: %w", p, err)
+			}
+			removed[p] = true
 		}
 	}
-	if _, err := db.Exec(`DELETE FROM migration_snapshots`); err != nil {
-		return 0, fmt.Errorf("clear migration_snapshots: %w", err)
+
+	// 3. Clear tracking rows. Tolerate a missing table: a never-migrated DB
+	//    opened via OpenNoMigrate has no migration_snapshots table, and there
+	//    is nothing to clear in that case.
+	var hasTable int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='migration_snapshots'`,
+	).Scan(&hasTable); err != nil {
+		return len(removed), fmt.Errorf("check migration_snapshots table: %w", err)
 	}
-	return len(snaps), nil
+	if hasTable > 0 {
+		if _, err := db.Exec(`DELETE FROM migration_snapshots`); err != nil {
+			return len(removed), fmt.Errorf("clear migration_snapshots: %w", err)
+		}
+	}
+
+	return len(removed), nil
 }
