@@ -272,6 +272,15 @@ func (db *DB) migrate() error {
 		return fmt.Errorf("create schema_versions: %w", err)
 	}
 
+	// Per-DB instance identity: created/backfilled exactly once for both fresh
+	// and existing DBs. It anchors the lineage fingerprint to THIS physical
+	// database so a sidecar transplanted next to an unrelated DB is refused on
+	// restore (see instance.go / snapshot.go). Must run before any restore
+	// point is taken so the fingerprint can read it.
+	if err := db.ensureInstanceID(); err != nil {
+		return fmt.Errorf("ensure instance identity: %w", err)
+	}
+
 	// Forward-compat guard: refuse to operate against a DB that has been
 	// stamped with a schema version this binary does not know. The newer
 	// version may carry invariants we cannot uphold (CHECK constraints,

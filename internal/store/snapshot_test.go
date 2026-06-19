@@ -3,11 +3,14 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -34,6 +37,12 @@ func buildDBAtVersionStandalone(t *testing.T, path string, target int) {
 		)`); err != nil {
 		t.Fatalf("schema_versions: %v", err)
 	}
+	// Mirror what migrate() does on a real Open: give the DB a random
+	// per-instance identity so the lineage fingerprint is anchored to this
+	// physical DB. A copy of this file (copyFile) carries the same id; an
+	// independently built DB gets a different one — exactly the production
+	// property the lineage check relies on.
+	seedInstanceID(t, sqlDB)
 	for _, m := range migrations {
 		if m.Version > target {
 			break
@@ -54,6 +63,46 @@ func buildDBAtVersionStandalone(t *testing.T, path string, target int) {
 		if err := tx.Commit(); err != nil {
 			t.Fatalf("commit v%d: %v", m.Version, err)
 		}
+	}
+}
+
+// openWritableNoMigrate opens a writable *DB handle at path WITHOUT running
+// migrate(). Used by tests that must create a restore point against a DB pinned
+// at a specific schema version (createRestorePoint needs to VACUUM INTO, which
+// the read-only OpenNoMigrate cannot do).
+func openWritableNoMigrate(t *testing.T, path string) *DB {
+	t.Helper()
+	sqlDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open writable: %v", err)
+	}
+	db := &DB{DB: sqlDB, Path: path}
+	if err := db.configurePragmas(); err != nil {
+		sqlDB.Close()
+		t.Fatalf("pragmas: %v", err)
+	}
+	return db
+}
+
+// seedInstanceID creates the continuity_meta table and writes a fresh random
+// instance_id, mirroring ensureInstanceID() for DBs manufactured outside the
+// Open path. crypto/rand so two manufactured DBs never collide.
+func seedInstanceID(t *testing.T, sqlDB *sql.DB) {
+	t.Helper()
+	if _, err := sqlDB.Exec(
+		`CREATE TABLE IF NOT EXISTS continuity_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+	); err != nil {
+		t.Fatalf("create continuity_meta: %v", err)
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	if _, err := sqlDB.Exec(
+		`INSERT OR IGNORE INTO continuity_meta (key, value) VALUES ('instance_id', ?)`,
+		hex.EncodeToString(b[:]),
+	); err != nil {
+		t.Fatalf("seed instance_id: %v", err)
 	}
 }
 
@@ -142,13 +191,14 @@ func TestSidecarPath_RejectsMemoryAndDSN(t *testing.T) {
 
 func TestManifestValidateShape_RejectsBadFields(t *testing.T) {
 	good := Manifest{
-		Kind:                manifestKind,
-		FormatVersion:       manifestFormatVersion,
-		SnapshotFile:        snapshotFileName,
-		PreSchemaVersion:    5,
-		TargetSchemaVersion: 9,
-		LineageFingerprint:  "sha256:aa",
-		SnapshotSHA256:      "sha256:bb",
+		Kind:                        manifestKind,
+		FormatVersion:               manifestFormatVersion,
+		SnapshotFile:                snapshotFileName,
+		PreSchemaVersion:            5,
+		TargetSchemaVersion:         9,
+		LineageFingerprint:          "sha256:aa",
+		SnapshotSHA256:              "sha256:bb",
+		ExpiresAfterSuccessfulBoots: defaultExpiresAfterBoots,
 	}
 	if err := good.validateShape(); err != nil {
 		t.Fatalf("good manifest rejected: %v", err)
@@ -166,6 +216,10 @@ func TestManifestValidateShape_RejectsBadFields(t *testing.T) {
 		"target below pre":   func(m *Manifest) { m.TargetSchemaVersion = 4 },
 		"empty fingerprint":  func(m *Manifest) { m.LineageFingerprint = "" },
 		"empty hash":         func(m *Manifest) { m.SnapshotSHA256 = "" },
+		// Finding 8: a missing/zero retention must fail closed so the first
+		// boot does not delete the restore point.
+		"zero retention":     func(m *Manifest) { m.ExpiresAfterSuccessfulBoots = 0 },
+		"negative retention": func(m *Manifest) { m.ExpiresAfterSuccessfulBoots = -1 },
 	}
 	for name, mutate := range cases {
 		m := good
@@ -182,6 +236,16 @@ func TestManifestValidateShape_RejectsBadFields(t *testing.T) {
 // Lineage fingerprint
 // ---------------------------------------------------------------------------
 
+// TestLineageFingerprint_StableAcrossCopy_MismatchUnrelated is the Finding 1
+// regression. Before the per-DB instance identity, the fingerprint hashed only
+// schema_versions(version,description) — identical across every normal
+// continuity DB — so two unrelated DBs FALSE-MATCHED and a sidecar transplanted
+// onto another DB would restore the WRONG database.
+//
+// The required property now:
+//   - a COPY of a DB (cp/VACUUM INTO preserve instance_id) MATCHES its source,
+//   - an INDEPENDENTLY-created DB MISMATCHES, even though its schema_versions
+//     rows are byte-identical.
 func TestLineageFingerprint_StableAcrossCopy_MismatchUnrelated(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.db")
@@ -197,7 +261,8 @@ func TestLineageFingerprint_StableAcrossCopy_MismatchUnrelated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Copy a.db → c.db; fingerprint must be identical (same schema history).
+	// Copy a.db → c.db; the instance_id travels in the bytes, so the
+	// fingerprint must be IDENTICAL (a snapshot must match its source DB).
 	c := filepath.Join(dir, "c.db")
 	if err := copyFile(a, c); err != nil {
 		t.Fatal(err)
@@ -215,32 +280,51 @@ func TestLineageFingerprint_StableAcrossCopy_MismatchUnrelated(t *testing.T) {
 		t.Errorf("fingerprint changed across copy:\n a=%s\n c=%s", fpA1, fpC)
 	}
 
-	// An UNRELATED DB built independently still has the same fixed migration
-	// descriptions, so its fingerprint matches by design — the lineage check
-	// guards against a *different schema history*, which our deterministic
-	// migrations don't produce. To prove mismatch sensitivity, tamper a
-	// description row.
+	// An UNRELATED DB built independently has the SAME fixed migration
+	// descriptions but a DIFFERENT random instance_id, so its fingerprint MUST
+	// differ. This is what refuses a transplanted sidecar.
 	b := filepath.Join(dir, "b.db")
 	buildDBAtVersionStandalone(t, b, 5)
-	dbB, err := sql.Open("sqlite", b)
+	dbB, err := OpenNoMigrate(b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dbB.Exec(`UPDATE schema_versions SET description = 'tampered' WHERE version = 3`); err != nil {
-		t.Fatal(err)
-	}
+	fpB, err := lineageFingerprint(dbB, 5)
 	dbB.Close()
-	dbB2, err := OpenNoMigrate(b)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fpB, err := lineageFingerprint(dbB2, 5)
-	dbB2.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fpB == fpA1 {
-		t.Errorf("tampered DB produced identical fingerprint; lineage check is insensitive")
+		t.Errorf("independent DB produced identical fingerprint; lineage check false-matches unrelated DBs")
+	}
+}
+
+// TestLineageFingerprint_MissingInstanceIDFailsClosed: a DB lacking the
+// continuity_meta instance identity (legacy/corrupt/wrong-file) must make the
+// fingerprint FAIL CLOSED rather than fabricate a match.
+func TestLineageFingerprint_MissingInstanceIDFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "noident.db")
+	// Build a DB WITHOUT seeding an instance_id by hand.
+	raw, err := sql.Open("sqlite", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TABLE schema_versions (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at INTEGER);
+		INSERT INTO schema_versions (version, description, applied_at) VALUES (1, 'x', 0);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	db, err := OpenNoMigrate(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := lineageFingerprint(db, 1); !errors.Is(err, ErrInstanceIDMissing) {
+		t.Errorf("fingerprint on DB without instance id: err=%v, want ErrInstanceIDMissing", err)
 	}
 }
 
@@ -334,10 +418,7 @@ func TestExistingValidManifestReused(t *testing.T) {
 	// DB forward only to v6 (still risky-pending: v9). Simulate by opening at
 	// v5 and directly invoking createRestorePoint, then mutating boots, then
 	// re-running create to assert no overwrite.
-	db, err := OpenNoMigrate(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openWritableNoMigrate(t, dbPath)
 	if err := db.createRestorePoint(5, headVersion(), 6); err != nil {
 		db.Close()
 		t.Fatalf("first createRestorePoint: %v", err)
@@ -390,12 +471,9 @@ func TestCorruptSidecarFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err := OpenNoMigrate(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := openWritableNoMigrate(t, dbPath)
 	defer db.Close()
-	err = db.createRestorePoint(5, headVersion(), 6)
+	err := db.createRestorePoint(5, headVersion(), 6)
 	if err == nil {
 		t.Fatal("expected createRestorePoint to fail closed on corrupt sidecar")
 	}
@@ -688,8 +766,12 @@ func TestRestore_RoundTripsData(t *testing.T) {
 	}
 }
 
-// TestRestore_RefusesLineageMismatch: a sidecar copied next to an unrelated DB
-// must be refused on lineage fingerprint mismatch.
+// TestRestore_RefusesLineageMismatch is the Finding 1 restore-side regression:
+// a sidecar transplanted next to an INDEPENDENTLY-created DB must be refused.
+// No tampering is needed — the unrelated DB carries a different instance_id, so
+// its recomputed lineage fingerprint cannot match the transplanted manifest.
+// Before the per-DB identity this transplant would have FALSE-MATCHED and
+// restored the wrong database.
 func TestRestore_RefusesLineageMismatch(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
@@ -701,13 +783,10 @@ func TestRestore_RefusesLineageMismatch(t *testing.T) {
 	db.Close()
 	sidecar, _ := sidecarPath(dbPath)
 
-	// Build an unrelated sibling DB and copy the sidecar next to it, then
-	// tamper the sibling's lineage so it differs from the manifest.
+	// Build an unrelated sibling DB (its own random instance_id) and transplant
+	// the first DB's sidecar next to it verbatim — no edits.
 	other := filepath.Join(dir, "other.db")
 	buildDBAtVersionStandalone(t, other, 5)
-	raw, _ := sql.Open("sqlite", other)
-	raw.Exec(`UPDATE schema_versions SET description='tampered' WHERE version=2`)
-	raw.Close()
 
 	otherSidecar, _ := sidecarPath(other)
 	if err := os.MkdirAll(otherSidecar, 0o700); err != nil {
@@ -722,10 +801,15 @@ func TestRestore_RefusesLineageMismatch(t *testing.T) {
 
 	_, err = Restore(other)
 	if err == nil {
-		t.Fatal("expected restore to refuse on lineage mismatch")
+		t.Fatal("expected restore to refuse a sidecar transplanted onto an unrelated DB")
 	}
 	if !contains(err.Error(), "lineage") {
 		t.Errorf("err = %v, want lineage mismatch", err)
+	}
+
+	// And the unrelated DB must be UNTOUCHED — no pre-restore backup created.
+	if matches, _ := filepath.Glob(other + ".pre-restore.*"); len(matches) != 0 {
+		t.Errorf("refused restore still moved the target DB aside: %v", matches)
 	}
 }
 
@@ -761,6 +845,462 @@ func TestRestore_RefusesWhileServeLockHeld(t *testing.T) {
 	}
 	if _, err := Restore(dbPath); err != nil {
 		t.Errorf("restore refused despite stale (dead-PID) lock: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 2: serve lock exclusion + dead-PID reclaim + own-PID release
+// ---------------------------------------------------------------------------
+
+// TestServeLock_ExclusionReclaimAndOwnRelease covers all three serve-lock
+// hardening properties:
+//   - a SECOND acquire while a LIVE lock is held is refused (ErrServeLockHeld),
+//     so a second serve cannot clobber the first's lock;
+//   - a STALE (dead-PID) lock is reclaimed by a new acquire;
+//   - release removes the lock ONLY if we still own it (a foreign-PID lock that
+//     we did not write is left intact).
+func TestServeLock_ExclusionReclaimAndOwnRelease(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	lp, _ := serveLockPath(dbPath)
+
+	// First acquire (our live PID) succeeds.
+	rel1, err := AcquireServeLock(dbPath)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+
+	// Simulate a SECOND, different live process by planting a lock with another
+	// live PID (the test process's parent is alive; use PID 1 which always is).
+	if err := os.WriteFile(lp, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcquireServeLock(dbPath); !errors.Is(err, ErrServeLockHeld) {
+		t.Errorf("acquire over live foreign lock: err=%v, want ErrServeLockHeld", err)
+	}
+
+	// rel1 must NOT remove the foreign lock (we no longer own it: it records
+	// PID 1, not us).
+	rel1()
+	if _, err := os.Stat(lp); err != nil {
+		t.Errorf("release removed a lock we no longer own: %v", err)
+	}
+
+	// Replace with a STALE (dead) PID; a new acquire must reclaim it.
+	if err := os.WriteFile(lp, []byte("999999999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rel2, err := AcquireServeLock(dbPath)
+	if err != nil {
+		t.Fatalf("acquire over stale lock should reclaim: %v", err)
+	}
+	// The reclaimed lock must now record OUR pid.
+	owner, alive, _ := readServeLockOwner(lp)
+	if owner != os.Getpid() || !alive {
+		t.Errorf("reclaimed lock owner=%d alive=%v, want our live pid", owner, alive)
+	}
+	// And our release removes it (we own it).
+	rel2()
+	if _, err := os.Stat(lp); !os.IsNotExist(err) {
+		t.Errorf("own-lock release did not remove the lock (err=%v)", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 3: restore operates on the canonical (resolved) DB, not a symlink
+// ---------------------------------------------------------------------------
+
+// TestRestore_SymlinkedDBHitsRealFile points CONTINUITY_DB at a SYMLINK to the
+// real DB and restores. The real file must be replaced (and moved aside), and
+// the symlink must still point at a valid restored DB — never renamed itself.
+func TestRestore_SymlinkedDBHitsRealFile(t *testing.T) {
+	realDir := t.TempDir()
+	realDB := filepath.Join(realDir, "real.db")
+	buildDBAtVersionStandalone(t, realDB, 5)
+
+	// Seed a v5 marker so we can prove the real file was restored.
+	{
+		raw, err := sql.Open("sqlite", realDB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`
+			INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
+			VALUES ('mem://user/events/sym-marker', 'leaf', 'events', 'pre', 1, 1)`); err != nil {
+			t.Fatal(err)
+		}
+		raw.Close()
+	}
+
+	// Migrate the REAL DB to head via its real path (creates the sidecar at the
+	// resolved path), then mutate post-migration.
+	db, err := Open(realDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
+		VALUES ('mem://user/feedback/sym-post', 'leaf', 'feedback', 'vanish', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Now restore THROUGH a symlink in a different directory.
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "link.db")
+	if err := os.Symlink(realDB, link); err != nil {
+		t.Fatal(err)
+	}
+
+	movedAside, err := Restore(link)
+	if err != nil {
+		t.Fatalf("restore via symlink: %v", err)
+	}
+	// The moved-aside backup must be next to the REAL (resolved) DB, not the
+	// link. Resolve realDB too — on macOS /var is itself a symlink, so compare
+	// against the canonical directory.
+	resolvedRealDB, _ := resolveDBPath(realDB)
+	if filepath.Dir(movedAside) != filepath.Dir(resolvedRealDB) {
+		t.Errorf("moved-aside backup not beside real DB: %s (real dir %s)", movedAside, filepath.Dir(resolvedRealDB))
+	}
+	// The link itself must still BE a symlink pointing at the real DB.
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat link: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("symlink was renamed/replaced instead of the real file")
+	}
+
+	// The real file is now the restored v5 image: marker present, post-row gone.
+	rdb, err := OpenNoMigrate(realDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdb.Close()
+	if v, _ := rdb.SchemaVersion(); v != 5 {
+		t.Errorf("real DB schema after restore = v%d, want v5", v)
+	}
+	var n int
+	rdb.QueryRow(`SELECT COUNT(*) FROM mem_nodes WHERE uri='mem://user/feedback/sym-post'`).Scan(&n)
+	if n != 0 {
+		t.Errorf("post-upgrade row survived restore through symlink")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 4: restore marker drives resume/rollback after a simulated crash
+// ---------------------------------------------------------------------------
+
+// TestRestoreMarker_RollbackAfterCrashBeforePublish simulates a crash AFTER the
+// originals were moved aside but BEFORE the staged snapshot was published
+// (DBPublished=false): the live DB is missing. resumeRestoreIfPending must ROLL
+// BACK — move the originals back and leave NO stale -wal/-shm at the live name.
+func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+
+	// Manufacture the torn state: move the live DB triplet aside, stage a copy,
+	// write a not-yet-published marker, then leave the live DB MISSING.
+	backupPrefix := dbPath + ".pre-restore.crashtest"
+	staged := filepath.Join(dir, ".restore.staged.crash.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+	var moved []string
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := dbPath + suffix
+		if _, statErr := os.Lstat(src); statErr != nil {
+			continue
+		}
+		if err := os.Rename(src, backupPrefix+suffix); err != nil {
+			t.Fatal(err)
+		}
+		moved = append(moved, suffix)
+	}
+	// Plant a stale -wal at the live name to prove rollback scrubs/handles it.
+	if err := os.WriteFile(dbPath+"-wal", []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: dbPath, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resume: must roll back.
+	if err := resumeRestoreIfPending(dbPath); err != nil {
+		t.Fatalf("resume rollback: %v", err)
+	}
+	// The original DB is back and openable.
+	rdb, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("original DB not restored by rollback: %v", err)
+	}
+	rdb.Close()
+	// Marker gone; staged gone.
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("marker survived rollback")
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Errorf("staged file survived rollback")
+	}
+}
+
+// TestRestoreMarker_CompleteAfterCrashAfterPublish simulates a crash AFTER the
+// staged snapshot was published (DBPublished=true) but BEFORE wal/shm scrub and
+// marker removal. resumeRestoreIfPending must COMPLETE: keep the restored DB,
+// scrub any stale live -wal/-shm, and clear the marker.
+func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+
+	// The DB at dbPath is already the (head) live DB; pretend it is the freshly
+	// published restored image. Plant a stale -wal/-shm at the live names and a
+	// published marker.
+	if err := os.WriteFile(dbPath+"-wal", []byte("stale-wal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dbPath+"-shm", []byte("stale-shm"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: dbPath, StagedPath: "",
+		BackupPrefix: dbPath + ".pre-restore.x", MovedSuffixes: []string{"", "-wal", "-shm"},
+		DBPublished: true,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := resumeRestoreIfPending(dbPath); err != nil {
+		t.Fatalf("resume complete: %v", err)
+	}
+	// Stale wal/shm scrubbed.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(dbPath + suffix); !os.IsNotExist(err) {
+			t.Errorf("stale %s survived complete-resume", suffix)
+		}
+	}
+	// Marker cleared; DB still openable.
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("marker survived complete-resume")
+	}
+	rdb, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("DB not openable after complete-resume: %v", err)
+	}
+	rdb.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Finding 5: a pre-restore backup is never overwritten
+// ---------------------------------------------------------------------------
+
+// TestRestore_NeverOverwritesExistingBackup pre-creates a file at the
+// same-second pre-restore backup name that the next restore would naively pick,
+// then runs a restore. The pre-existing file must remain byte-intact and the
+// restore must move its originals to a DIFFERENT, unique name.
+func TestRestore_NeverOverwritesExistingBackup(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// uniquePreRestorePrefix must never return a prefix whose names already
+	// exist. Occupy the first candidate exactly, then assert the next call
+	// returns a different, free prefix.
+	resolved, _ := resolveDBPath(dbPath)
+	first, err := uniquePreRestorePrefix(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := []byte("DO NOT CLOBBER")
+	if err := os.WriteFile(first, sentinel, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := uniquePreRestorePrefix(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == first {
+		t.Fatalf("uniquePreRestorePrefix returned an occupied name: %s", second)
+	}
+
+	// A full restore must pick a free name and leave the sentinel intact.
+	movedAside, err := Restore(dbPath)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if movedAside == first {
+		t.Errorf("restore reused the occupied backup name %s", first)
+	}
+	got, err := os.ReadFile(first)
+	if err != nil || string(got) != string(sentinel) {
+		t.Errorf("pre-existing backup was clobbered: data=%q err=%v", got, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 6: a stale restore point from an earlier upgrade window fails closed
+// ---------------------------------------------------------------------------
+
+// TestCreateRestorePoint_StalePreVersionFailsClosed: a valid same-lineage
+// manifest whose pre_schema_version does NOT match the current upgrade's
+// pre-version must NOT be reused and must NOT be overwritten — createRestorePoint
+// fails closed so the operator restores or prunes explicitly.
+func TestCreateRestorePoint_StalePreVersionFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	// Create a restore point recording pre-v5 (the existing window).
+	db := openWritableNoMigrate(t, dbPath)
+	defer db.Close()
+	if err := db.createRestorePoint(5, headVersion(), 6); err != nil {
+		t.Fatalf("seed restore point: %v", err)
+	}
+
+	// Snapshot the on-disk manifest bytes so we can prove no overwrite.
+	before, err := os.ReadFile(manifestPathIn(sidecar))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now a DIFFERENT upgrade run starts at pre-v8 (same DB lineage). Reuse must
+	// be refused because the existing point captures pre-v5, not pre-v8.
+	err = db.createRestorePoint(8, headVersion(), 9)
+	if err == nil {
+		t.Fatal("expected fail-closed when existing restore point is from a different upgrade window")
+	}
+	if !errors.Is(err, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", err)
+	}
+	after, err := os.ReadFile(manifestPathIn(sidecar))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("stale restore point was overwritten on fail-closed")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 7: restore on a missing live DB fails closed (never fabricates one)
+// ---------------------------------------------------------------------------
+
+// TestRestore_MissingLiveDBFailsClosed deletes the live DB after a restore point
+// exists, then restores. OpenNoMigrate must return ErrDBMissing and restore must
+// refuse — never silently create an empty DB.
+func TestRestore_MissingLiveDBFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Remove the live DB triplet; the sidecar (restore point) remains.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Remove(dbPath + suffix)
+	}
+
+	if _, err := Restore(dbPath); err == nil {
+		t.Fatal("expected restore to fail closed on a missing live DB")
+	} else if !errors.Is(err, ErrDBMissing) {
+		t.Errorf("err = %v, want ErrDBMissing", err)
+	}
+	// The DB must NOT have been fabricated.
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		t.Errorf("restore fabricated a DB at %s despite missing live DB", dbPath)
+	}
+}
+
+// TestOpenNoMigrate_MissingFileFailsClosed: the read-only inspection open must
+// not lazily create an empty DB for a missing path.
+func TestOpenNoMigrate_MissingFileFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "nope.db")
+	if _, err := OpenNoMigrate(missing); !errors.Is(err, ErrDBMissing) {
+		t.Errorf("OpenNoMigrate(missing) err=%v, want ErrDBMissing", err)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Errorf("OpenNoMigrate fabricated a file at %s", missing)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 9: concurrent restore-point creation serializes (no double-publish)
+// ---------------------------------------------------------------------------
+
+// TestCreateRestorePoint_ConcurrentSerializes runs many createRestorePoint calls
+// against the same DB concurrently. The operation lock must serialize them so
+// exactly one publishes and the rest reuse — never a corrupt/double-published
+// sidecar — and the final manifest is valid.
+func TestCreateRestorePoint_ConcurrentSerializes(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	const n = 8
+	// Open the writable handles SERIALLY first (the DB is already WAL from Open;
+	// concurrently re-running journal_mode pragmas only contends in-process and
+	// is not what we are testing). Then race createRestorePoint across them —
+	// the operation lock must serialize the publishers.
+	handles := make([]*DB, n)
+	for i := range handles {
+		handles[i] = openWritableNoMigrate(t, dbPath)
+		defer handles[i].Close()
+	}
+
+	var wg sync.WaitGroup
+	var start sync.WaitGroup
+	start.Add(1)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			start.Wait() // release all at once for maximum contention
+			errs[idx] = handles[idx].createRestorePoint(5, headVersion(), 6)
+		}(i)
+	}
+	start.Done()
+	wg.Wait()
+
+	for i, e := range errs {
+		if e != nil {
+			t.Errorf("goroutine %d: createRestorePoint failed: %v", i, e)
+		}
+	}
+	// Exactly one valid restore point, intact.
+	if _, err := loadValidManifest(sidecar); err != nil {
+		t.Fatalf("post-concurrency manifest invalid: %v", err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -204,6 +205,15 @@ func (m *Manifest) validateShape() error {
 	if m.LineageFingerprint == "" || m.SnapshotSHA256 == "" {
 		return fmt.Errorf("%w: empty fingerprint/hash", ErrSnapshotSidecarCorrupt)
 	}
+	// Retention must be present and sane. A missing/zero
+	// expires_after_successful_boots would otherwise default to 0 and make the
+	// FIRST successful boot expire (delete) the restore point — so a corrupt or
+	// hand-edited manifest that dropped this field must fail closed, not silently
+	// self-destruct.
+	if m.ExpiresAfterSuccessfulBoots < 1 {
+		return fmt.Errorf("%w: expires_after_successful_boots %d < 1",
+			ErrSnapshotSidecarCorrupt, m.ExpiresAfterSuccessfulBoots)
+	}
 	return nil
 }
 
@@ -348,11 +358,24 @@ func hashFile(path string) (string, int64, error) {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
-// lineageFingerprint computes sha256 over the schema_versions rows with
-// version <= upTo, ordered by version. Stable across the actual upgrade and
-// across a copy of the DB; differs for an unrelated DB. Formatted
+// lineageFingerprint computes sha256 over the DB's per-instance identity AND
+// the schema_versions rows with version <= upTo, ordered by version.
+//
+// schema_versions rows are identical across every normal continuity DB, so
+// hashing them alone false-matches unrelated databases. We therefore fold in
+// the random instance_id (see instance.go): a COPY of the DB (cp / VACUUM INTO)
+// preserves the instance_id so a snapshot matches its source, while an
+// independently created DB carries a different instance_id and mismatches.
+//
+// A DB with no readable instance identity yields ErrInstanceIDMissing so
+// restore fails closed rather than fabricating a match. Formatted
 // "sha256:<hex>".
 func lineageFingerprint(q queryer, upTo int) (string, error) {
+	instanceID, err := readInstanceID(q)
+	if err != nil {
+		return "", err
+	}
+
 	rows, err := q.Query(
 		`SELECT version, description FROM schema_versions WHERE version <= ? ORDER BY version ASC`,
 		upTo,
@@ -363,6 +386,9 @@ func lineageFingerprint(q queryer, upTo int) (string, error) {
 	defer rows.Close()
 
 	h := sha256.New()
+	// Bind the fingerprint to this physical DB. Length-prefixed so the instance
+	// component can never be confused with a following schema row.
+	fmt.Fprintf(h, "instance:%d:%s\n", len(instanceID), instanceID)
 	any := false
 	for rows.Next() {
 		var v int
@@ -460,6 +486,16 @@ func (db *DB) createRestorePoint(preVersion, target, firstRisky int) error {
 		return err
 	}
 
+	// Serialize concurrent restore-point creation: two migration opens racing
+	// against the same DB could both pass the "no restore point" check and
+	// double-publish. Take a sidecar operation lock; the loser waits briefly
+	// and then fails closed rather than clobbering a sibling's work.
+	releaseOp, lerr := acquireSnapshotOpLock(sidecar)
+	if lerr != nil {
+		return lerr
+	}
+	defer releaseOp()
+
 	// Reuse path: a fully valid manifest for THIS lineage already exists.
 	// Never overwrite — this is what preserves the pre-v6 snapshot across a
 	// later v9 migration in the same run, and across crash/retry.
@@ -468,12 +504,26 @@ func (db *DB) createRestorePoint(preVersion, target, firstRisky int) error {
 		if fpErr != nil {
 			return fpErr
 		}
-		if fp == existing.LineageFingerprint {
-			return nil // reuse
+		if fp != existing.LineageFingerprint {
+			// Valid-shaped manifest but different lineage: someone parked an
+			// unrelated sidecar here. Fail closed rather than clobber it.
+			return fmt.Errorf("%w: existing manifest belongs to a different DB lineage", ErrSnapshotSidecarCorrupt)
 		}
-		// Valid-shaped manifest but different lineage: someone parked an
-		// unrelated sidecar here. Fail closed rather than clobber it.
-		return fmt.Errorf("%w: existing manifest belongs to a different DB lineage", ErrSnapshotSidecarCorrupt)
+		// Same lineage, but only reuse if the existing restore point matches
+		// THIS upgrade window: its pre-version must equal the current
+		// pre-version. A stale completed restore point from an EARLIER upgrade
+		// (e.g. a pre-v5 point left around when we are now upgrading from v9)
+		// does not protect this run. Reusing it would lie about what the
+		// restore point rolls back to; overwriting it would destroy recovery
+		// material from the earlier window. Fail closed and make the operator
+		// restore or prune explicitly.
+		if existing.PreSchemaVersion != preVersion {
+			return fmt.Errorf(
+				"%w: an existing restore point captures pre-v%d, but this upgrade starts at v%d; "+
+					"run 'continuity snapshot restore --confirm' or 'continuity snapshot prune --confirm' first",
+				ErrSnapshotSidecarCorrupt, existing.PreSchemaVersion, preVersion)
+		}
+		return nil // reuse — same lineage AND same upgrade window
 	} else if !errors.Is(lerr, ErrNoRestorePoint) {
 		// Present-but-corrupt sidecar: fail closed, do not overwrite.
 		return lerr
@@ -633,4 +683,102 @@ func snapshotSchemaVersion(path string) (int, error) {
 	}
 	defer sdb.Close()
 	return sdb.SchemaVersion()
+}
+
+// =========================================================================
+// Snapshot operation lock (serializes restore-point creation)
+// =========================================================================
+
+// snapshotOpLockWaitAttempts / snapshotOpLockWaitInterval bound how long the
+// loser of a creation race waits for the winner to finish before failing
+// closed. Kept short: a healthy create is a single VACUUM INTO + manifest
+// write, so a live holder clears quickly; a dead holder is reclaimed on the
+// first attempt via PID liveness.
+const (
+	snapshotOpLockWaitAttempts = 50
+	snapshotOpLockWaitInterval = 100 * time.Millisecond
+)
+
+// ErrSnapshotOpLocked is returned when another process holds the snapshot
+// operation lock for too long. The caller fails closed (no double-publish).
+var ErrSnapshotOpLocked = errors.New("snapshot: another process is creating a restore point")
+
+// snapshotOpLockPath is the operation lock next to the sidecar. It lives beside
+// the sidecar (not inside it) because the sidecar dir may not exist yet when
+// the first creator runs.
+func snapshotOpLockPath(sidecar string) string { return sidecar + ".oplock" }
+
+// snapshotOpLocks serializes restore-point creation WITHIN this process. The
+// on-disk PID lock alone cannot serialize same-process callers (they share a
+// PID, so the file lock can't tell two goroutines apart); the cross-process
+// guarantee comes from the file, the in-process guarantee from this mutex map.
+// Keyed by lock path so distinct DBs don't contend.
+var snapshotOpLocks sync.Map // map[string]*sync.Mutex
+
+func opLockMutex(path string) *sync.Mutex {
+	m, _ := snapshotOpLocks.LoadOrStore(path, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
+// acquireSnapshotOpLock takes an exclusive operation lock around restore-point
+// creation, serializing BOTH same-process goroutines (via an in-process mutex)
+// AND separate processes (via a PID-stamped O_EXCL lockfile). O_EXCL create
+// wins; a live holder makes the loser wait up to the bounded window, then fail
+// closed; a dead holder is reclaimed. Returns a release func that drops the
+// in-process mutex and removes the lockfile only while we still own it.
+func acquireSnapshotOpLock(sidecar string) (func(), error) {
+	path := snapshotOpLockPath(sidecar)
+	myPID := os.Getpid()
+
+	// In-process gate first: only one goroutine of this process contends for
+	// the file lock at a time, so the PID-based file lock is meaningful again.
+	mu := opLockMutex(path)
+	mu.Lock()
+	unlock := func() { mu.Unlock() }
+
+	for attempt := 0; attempt < snapshotOpLockWaitAttempts; attempt++ {
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			_, werr := f.WriteString(fmt.Sprintf("%d\n", myPID))
+			cerr := f.Close()
+			if werr != nil || cerr != nil {
+				_ = os.Remove(path)
+				unlock()
+				if werr != nil {
+					return func() {}, werr
+				}
+				return func() {}, cerr
+			}
+			return func() {
+				if owner, _, oerr := readServeLockOwner(path); oerr == nil && owner == myPID {
+					_ = os.Remove(path)
+				}
+				unlock()
+			}, nil
+		}
+		if !os.IsExist(err) {
+			unlock()
+			return func() {}, err
+		}
+
+		owner, alive, perr := readServeLockOwner(path)
+		if perr != nil {
+			unlock()
+			return func() {}, perr
+		}
+		// owner == myPID here would mean a crashed prior run of THIS process
+		// left a stale file (the in-process mutex guarantees no live sibling
+		// goroutine holds it). Treat as stale and reclaim.
+		if owner == myPID || !alive {
+			if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+				unlock()
+				return func() {}, rmErr
+			}
+			continue
+		}
+		// Live holder in ANOTHER process — wait briefly, then retry.
+		time.Sleep(snapshotOpLockWaitInterval)
+	}
+	unlock()
+	return func() {}, ErrSnapshotOpLocked
 }

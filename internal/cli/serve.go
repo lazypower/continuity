@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -67,6 +68,23 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Acquire the serve lock BEFORE opening the DB. Open() runs migrations,
+	// which may create a restore point and rewrite tables — that whole window
+	// must be covered so a second serve cannot race in (or have the DB swapped
+	// under it by a concurrent restore). A LIVE lock held by another process
+	// means another serve already owns this DB: refuse to start rather than
+	// run two servers against one database. A stale (dead-PID) lock is
+	// reclaimed automatically.
+	release, lockErr := store.AcquireServeLock(dbPath)
+	if lockErr != nil {
+		if errors.Is(lockErr, store.ErrServeLockHeld) {
+			return fmt.Errorf(
+				"%w (db %s); stop the other server first", lockErr, dbPath)
+		}
+		return fmt.Errorf("acquire serve lock: %w", lockErr)
+	}
+	defer release()
+
 	// Record this binary's version in any restore-point manifest the upcoming
 	// Open() writes (it runs migrations, which may create a snapshot).
 	store.SetSnapshotCreatedByVersion("continuity " + VersionString())
@@ -76,15 +94,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("open database: %w", err)
 	}
 	defer db.Close()
-
-	// Hold an advisory serve lock so `continuity snapshot restore` refuses to
-	// swap the DB out from under a live server. Best-effort: a lock-write
-	// failure logs but does not block serving.
-	if release, lockErr := store.AcquireServeLock(dbPath); lockErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not acquire serve lock: %v\n", lockErr)
-	} else {
-		defer release()
-	}
 
 	// Create LLM client and engine
 	var eng *engine.Engine

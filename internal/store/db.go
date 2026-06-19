@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -36,6 +37,15 @@ func Open(path string) (*DB, error) {
 	// permissions on creation, so pre-existing dirs/files need explicit chmod.
 	hardenPermissions(dir, path)
 
+	// Self-heal a restore interrupted by a crash BEFORE opening the DB: a torn
+	// restore can leave a missing DB beside a stale WAL, which sql.Open would
+	// otherwise fabricate over. resumeRestoreIfPending drives the marker to a
+	// clean terminal state (complete or roll back) first. Best-effort path
+	// resolution failures fail closed.
+	if err := resumeRestoreIfPending(path); err != nil {
+		return nil, fmt.Errorf("resume interrupted restore: %w", err)
+	}
+
 	sqlDB, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -53,24 +63,40 @@ func Open(path string) (*DB, error) {
 	return db, nil
 }
 
-// OpenNoMigrate opens (or attaches to) the SQLite database at path and
-// configures pragmas, but does NOT run migrate(). It is the inspection-only
+// ErrDBMissing is returned by OpenNoMigrate when the target file does not
+// exist. Restore relies on this to FAIL CLOSED rather than fabricate an empty
+// DB when the live database is missing.
+var ErrDBMissing = errors.New("store: database file does not exist")
+
+// OpenNoMigrate opens the SQLite database at path READ-ONLY and configures
+// read-side pragmas, but does NOT run migrate(). It is the inspection-only
 // open used by snapshot integrity checks, lineage fingerprinting, and the
-// restore/cleanup commands — none of which should advance the schema of the
-// DB they are examining. The caller MUST Close the returned *DB.
+// restore/cleanup commands — none of which should advance the schema OR mutate
+// the DB they are examining. The caller MUST Close the returned *DB.
 //
-// Unlike Open it does not create the parent directory or harden permissions:
-// it is meant for files that already exist (or, for staged snapshot temps,
-// files the caller created). Opening a missing file lazily creates an empty
-// DB the way sql.Open("sqlite", ...) always does, so callers that care about
-// existence should stat first.
+// Read-only by construction (?mode=ro&immutable=0): modernc/SQLite refuses to
+// create a missing file in mode=ro, but the failure surfaces lazily on first
+// query, not at sql.Open. To FAIL CLOSED with a clear, eager error we stat the
+// file first and return ErrDBMissing when it is absent. This is what stops
+// restore from silently materializing an empty DB over a missing live one.
 func OpenNoMigrate(path string) (*DB, error) {
-	sqlDB, err := sql.Open("sqlite", path)
+	// Existence gate: a missing live DB must fail closed, never be fabricated.
+	// (file:... DSNs and :memory: are not used with OpenNoMigrate.)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: %s", ErrDBMissing, path)
+		}
+		return nil, fmt.Errorf("stat db (no migrate): %w", err)
+	}
+
+	// Open read-only so an inspection can never advance schema or write WAL.
+	dsn := "file:" + path + "?mode=ro"
+	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite (no migrate): %w", err)
 	}
 	db := &DB{DB: sqlDB, Path: path}
-	if err := db.configurePragmas(); err != nil {
+	if err := db.configureReadOnlyPragmas(); err != nil {
 		sqlDB.Close()
 		return nil, err
 	}
@@ -113,6 +139,24 @@ func (db *DB) configurePragmas() error {
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
+		"PRAGMA foreign_keys=ON",
+		"PRAGMA mmap_size=268435456", // 256MB
+		"PRAGMA busy_timeout=5000",
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			return fmt.Errorf("pragma %q: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// configureReadOnlyPragmas applies only the pragmas that are valid against a
+// mode=ro connection. journal_mode/synchronous are writes to DB-level state and
+// would fail (or be silently ignored) on a read-only handle, so they are
+// omitted — an inspection-only open must not attempt to mutate journaling.
+func (db *DB) configureReadOnlyPragmas() error {
+	pragmas := []string{
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA mmap_size=268435456", // 256MB
 		"PRAGMA busy_timeout=5000",

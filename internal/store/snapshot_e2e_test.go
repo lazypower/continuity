@@ -197,6 +197,47 @@ func TestSnapshotE2E_RestoreCLI_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestSnapshotE2E_SecondServeRefusesWhileFirstLive is the Finding 2 behavioral
+// regression: while one serve holds the DB, a second serve against the SAME DB
+// (different port, so the refusal is the LOCK, not a bind clash) must refuse to
+// start and exit non-zero — never run two servers against one database.
+func TestSnapshotE2E_SecondServeRefusesWhileFirstLive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("snapshot e2e: skipped under -short")
+	}
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := t.TempDir()
+
+	dbPath := buildDBAtVersion(t, workDir, 5)
+	seedV5Data(t, dbPath)
+
+	// First serve: boot and wait until ready (holds the live serve lock).
+	url1, _, srv1 := startSubprocessAgainstDB(t, bin, workDir, dbPath)
+	_ = url1
+	t.Cleanup(srv1.Stop)
+
+	// Second serve against the SAME DB but a fresh HOME + different port. It
+	// must refuse on the live serve lock.
+	home2 := t.TempDir()
+	_, env2 := testharness.HermeticEnv(t, home2, dbPath, 0)
+	res := testharness.RunCLI(t, bin, env2, "serve")
+	if res.ExitCode == 0 {
+		t.Errorf("second serve exited 0 while first holds the DB\nstderr:\n%s", res.Stderr)
+	}
+	if !contains(res.Stderr, "already running") && !contains(res.Stderr, "serve lock") {
+		t.Errorf("second serve did not refuse on the serve lock; stderr:\n%s", res.Stderr)
+	}
+
+	// After the first serve stops, a fresh serve must succeed (stale lock
+	// reclaimed), proving the refusal was scoped to the live holder.
+	srv1.Stop()
+	home3 := t.TempDir()
+	url3, env3 := testharness.HermeticEnv(t, home3, dbPath, 0)
+	srv3 := testharness.StartServeProcess(t, bin, env3)
+	t.Cleanup(srv3.Stop)
+	testharness.WaitForReady(t, url3+"/api/health")
+}
+
 // TestSnapshotE2E_ExpiresAfterThreeBoots boots the binary three times against
 // the same DB; after the third successful bind the sidecar files are gone and
 // the DB itself is untouched (still at head).

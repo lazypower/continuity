@@ -173,20 +173,105 @@ func serveLockPath(dbPath string) (string, error) {
 	return resolved + ".serve.lock", nil
 }
 
-// AcquireServeLock writes a lockfile recording the serve PID. It is advisory:
-// restore checks for its presence (and liveness) and refuses while a serve
-// owns the DB. Returns a release func. Best-effort; a failure to write the
-// lock does not block serve (returns a no-op release + the error for logging).
+// ErrServeLockHeld is returned by AcquireServeLock when a LIVE serve already
+// holds the lock for this DB. serve must refuse to start in that case so a
+// second server cannot run against (and have the DB swapped under) the first.
+var ErrServeLockHeld = errors.New("serve: another continuity serve is already running against this DB")
+
+// AcquireServeLock takes an EXCLUSIVE advisory lock recording the serve PID.
+//
+// Semantics (O_CREATE|O_EXCL with stale reclaim):
+//   - If no lock exists, create it atomically (O_EXCL) and own it.
+//   - If a lock exists and its recorded PID is ALIVE, refuse with
+//     ErrServeLockHeld — a live serve owns the DB.
+//   - If a lock exists but its PID is dead (or the lock is unparseable in a way
+//     that proves it stale), reclaim it: remove and recreate with our PID.
+//
+// The returned release func removes the lock ONLY if we still own it (our PID
+// is recorded). This prevents a second serve that clobbered the first's lock
+// from later deleting it on exit and leaving the first server unprotected.
 func AcquireServeLock(dbPath string) (func(), error) {
 	path, err := serveLockPath(dbPath)
 	if err != nil {
 		return func() {}, err
 	}
-	// Overwrite any stale lock; restore checks PID liveness, not exclusivity.
-	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
-		return func() {}, err
+	myPID := os.Getpid()
+
+	for attempt := 0; attempt < 2; attempt++ {
+		// Atomic create-if-absent: only one process wins the O_EXCL race.
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			_, werr := f.WriteString(fmt.Sprintf("%d\n", myPID))
+			cerr := f.Close()
+			if werr != nil {
+				_ = os.Remove(path)
+				return func() {}, werr
+			}
+			if cerr != nil {
+				_ = os.Remove(path)
+				return func() {}, cerr
+			}
+			return makeServeLockReleaser(path, myPID), nil
+		}
+		if !os.IsExist(err) {
+			return func() {}, err
+		}
+
+		// A lock already exists. Decide: live (refuse) or stale (reclaim).
+		owner, alive, perr := readServeLockOwner(path)
+		if perr != nil {
+			return func() {}, perr
+		}
+		if owner == myPID {
+			// We already hold it (re-acquire in the same process).
+			return makeServeLockReleaser(path, myPID), nil
+		}
+		if alive {
+			return func() {}, ErrServeLockHeld
+		}
+		// Stale lock (dead PID): reclaim by removing, then retry the O_EXCL
+		// create. If another process reclaims first, the retry's create fails
+		// and we re-evaluate liveness (and may refuse).
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			return func() {}, rmErr
+		}
 	}
-	return func() { _ = os.Remove(path) }, nil
+	// Lost the reclaim race twice — treat as held to fail closed.
+	return func() {}, ErrServeLockHeld
+}
+
+// makeServeLockReleaser returns a release func that removes the lockfile ONLY
+// while it still records ownerPID. If another process has since reclaimed the
+// lock (recorded a different PID), we leave it alone — never delete a lock we
+// no longer own.
+func makeServeLockReleaser(path string, ownerPID int) func() {
+	return func() {
+		owner, _, err := readServeLockOwner(path)
+		if err != nil {
+			return
+		}
+		if owner == ownerPID {
+			_ = os.Remove(path)
+		}
+	}
+}
+
+// readServeLockOwner reads the lockfile and returns (pid, alive, err). A
+// missing lock returns (0, false, nil). An unparseable lock is reported as
+// (0, true, nil) — treated as a live lock so we fail closed rather than reclaim
+// something we cannot understand.
+func readServeLockOwner(path string) (pid int, alive bool, err error) {
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return 0, false, nil
+		}
+		return 0, false, rerr
+	}
+	if _, serr := fmt.Sscanf(string(data), "%d", &pid); serr != nil || pid <= 0 {
+		return 0, true, nil // unparseable → treat as held (fail closed)
+	}
+	return pid, processAlive(pid), nil
 }
 
 // serveLockHeld reports whether a live serve process holds dbPath's lock. A
@@ -196,30 +281,28 @@ func serveLockHeld(dbPath string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	data, err := os.ReadFile(path)
+	_, alive, err := readServeLockOwner(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
 		return false, err
 	}
-	pid := 0
-	if _, err := fmt.Sscanf(string(data), "%d", &pid); err != nil || pid <= 0 {
-		// Unparseable lock: treat as held to fail closed.
-		return true, nil
-	}
-	return processAlive(pid), nil
+	return alive, nil
 }
 
 // =========================================================================
 // Restore
 // =========================================================================
 
-// Restore replaces the live DB at dbPath with the sidecar snapshot, after
-// validating manifest + hash + integrity + lineage and confirming no live
-// serve holds the DB. The previous db / db-wal / db-shm triplet is renamed
-// ASIDE to timestamped pre-restore names (never deleted). Crash-safety relies
-// on atomic rename ordering only — there is no restore journal in v1.
+// Restore replaces the live DB with the sidecar snapshot, after validating
+// manifest + hash + integrity + lineage and confirming no live serve holds the
+// DB. The previous db / db-wal / db-shm triplet is renamed ASIDE to unique
+// pre-restore names (never deleted, never overwritten).
+//
+// Crash-safety: a minimal restore marker is written into the sidecar BEFORE the
+// first destructive rename, recording the resolved DB path, staged snapshot
+// path, and the chosen pre-restore backup names. A crash at any point leaves a
+// state the next Open/Restore can drive to a clean terminal state (COMPLETE the
+// renames, or ROLL BACK to the moved-aside originals) with no stale -wal/-shm
+// left beside the restored DB. The marker is removed only after success.
 //
 // Returns the directory-prefix of the moved-aside files so the CLI can report
 // where the operator can find the prior DB.
@@ -227,6 +310,12 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	sidecar, err := sidecarPath(dbPath)
 	if err != nil {
 		return "", err
+	}
+
+	// Drive any torn restore from a previous crash to a clean state first; a
+	// fresh restore must never start on top of an in-progress one.
+	if rerr := resumeRestoreIfPending(dbPath); rerr != nil {
+		return "", fmt.Errorf("restore: resume prior restore: %w", rerr)
 	}
 
 	m, err := loadValidManifest(sidecar)
@@ -248,10 +337,21 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		return "", err
 	}
 
+	// Resolve the CANONICAL DB path once and use it for every staging,
+	// backup-aside, rename-into-place, and WAL/SHM cleanup operation below.
+	// With a symlinked CONTINUITY_DB, operating on the raw path would rename
+	// the SYMLINK, not the real DB; resolving here renames the real file.
+	resolvedDB, rerr := resolveDBPath(dbPath)
+	if rerr != nil {
+		return "", fmt.Errorf("restore: resolve db path: %w", rerr)
+	}
+
 	// Open the CURRENT DB without migrating and recompute the lineage
-	// fingerprint over rows <= pre_schema_version. Refuse on mismatch — this
-	// is what blocks a sidecar transplanted next to an unrelated DB.
-	cur, err := OpenNoMigrate(dbPath)
+	// fingerprint over rows <= pre_schema_version. A MISSING live DB fails
+	// closed here (OpenNoMigrate returns ErrDBMissing) — restore never
+	// fabricates a DB. Refuse on lineage mismatch — this blocks a sidecar
+	// transplanted next to an unrelated DB.
+	cur, err := OpenNoMigrate(resolvedDB)
 	if err != nil {
 		return "", fmt.Errorf("restore: open current db: %w", err)
 	}
@@ -276,7 +376,7 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 			curVersion, m.PreSchemaVersion, m.TargetSchemaVersion)
 	}
 
-	dbDir := filepath.Dir(dbPath)
+	dbDir := filepath.Dir(resolvedDB)
 
 	// Stage the snapshot to a temp file in the DB dir, then verify its hash
 	// at the staged location before any destructive move.
@@ -291,38 +391,85 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		return "", err
 	}
 
-	// Move the current triplet aside to timestamped pre-restore names. We do
-	// NOT delete them — they are crash material and an operator escape hatch.
-	stamp := time.Now().UTC().Format("20060102T150405Z")
-	movedAsidePrefix = fmt.Sprintf("%s.pre-restore.%s", dbPath, stamp)
+	// Choose a UNIQUE pre-restore backup prefix that does not already exist for
+	// any suffix. Second-resolution timestamps collide and os.Rename overwrites
+	// on unix, which would clobber an earlier moved-aside DB; uniquify so we
+	// never overwrite prior crash material.
+	movedAsidePrefix, err = uniquePreRestorePrefix(resolvedDB)
+	if err != nil {
+		_ = os.Remove(staged)
+		return "", err
+	}
+
+	// Determine which of the triplet are actually present so the marker records
+	// exactly what we move (recovery moves back exactly these).
+	var movedSuffixes []string
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		src := dbPath + suffix
-		if _, statErr := os.Lstat(src); statErr != nil {
-			continue // not present (e.g. no -wal/-shm) — skip
+		if _, statErr := os.Lstat(resolvedDB + suffix); statErr == nil {
+			movedSuffixes = append(movedSuffixes, suffix)
 		}
+	}
+
+	// Write the restore marker BEFORE the first destructive rename. From here a
+	// crash is recoverable from the sidecar marker.
+	mk := &restoreMarker{
+		Version:        1,
+		RestoredDBPath: resolvedDB,
+		StagedPath:     staged,
+		BackupPrefix:   movedAsidePrefix,
+		MovedSuffixes:  movedSuffixes,
+		DBPublished:    false,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		_ = os.Remove(staged)
+		return "", err
+	}
+
+	// Move the current triplet aside to the unique pre-restore names. We do NOT
+	// delete them — they are crash material and an operator escape hatch.
+	for _, suffix := range movedSuffixes {
+		src := resolvedDB + suffix
 		dst := movedAsidePrefix + suffix
 		if err := os.Rename(src, dst); err != nil {
+			// Roll back whatever we already moved, then clear the marker.
+			_ = finishPendingRestore(sidecar, mk)
 			_ = os.Remove(staged)
 			return "", fmt.Errorf("restore: move %s aside: %w", src, err)
 		}
 	}
 
 	// Rename the staged snapshot into the live DB path (atomic on same dir).
-	if err := os.Rename(staged, dbPath); err != nil {
+	if err := os.Rename(staged, resolvedDB); err != nil {
+		// DB not yet published — roll back to the moved-aside originals.
+		_ = finishPendingRestore(sidecar, mk)
 		_ = os.Remove(staged)
 		return "", fmt.Errorf("restore: publish restored db: %w", err)
 	}
-	_ = os.Chmod(dbPath, 0o600)
+	_ = os.Chmod(resolvedDB, 0o600)
 
-	// Defensive: ensure no stale -wal/-shm remain at the LIVE names. They
-	// were moved aside above, but a crash could have left a fresh one; remove
-	// any that match the live names so the restored DB is not paired with a
-	// foreign WAL.
+	// Mark the DB as published so a crash from here COMPLETES (never rolls back
+	// over the freshly-restored DB).
+	mk.DBPublished = true
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		// We could not record the published state. Scrub stale wal/shm and
+		// surface the error; the DB is restored but the marker is stale, which
+		// the next Open will resolve as a COMPLETE only if it reads published.
+		fmt.Fprintf(os.Stderr, "warning: restore published but marker update failed: %v\n", err)
+	}
+
+	// Ensure no stale -wal/-shm remain at the LIVE names. They were moved aside
+	// above, but a crash could have left a fresh one; remove any that match the
+	// live names so the restored DB is not paired with a foreign WAL.
 	for _, suffix := range []string{"-wal", "-shm"} {
-		live := dbPath + suffix
+		live := resolvedDB + suffix
 		if _, statErr := os.Lstat(live); statErr == nil {
 			_ = os.Remove(live)
 		}
+	}
+
+	// Restore complete — clear the marker.
+	if err := removeRestoreMarker(sidecar); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: restore succeeded but marker cleanup failed: %v\n", err)
 	}
 
 	// Record the restore in the manifest (best-effort).
@@ -334,6 +481,52 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	}
 
 	return movedAsidePrefix, nil
+}
+
+// resolveDBPath returns the canonical (Abs + EvalSymlinks) path for an existing
+// DB, matching the derivation sidecarPath uses. A missing file resolves to its
+// absolute form (EvalSymlinks would error). This is the single resolved path
+// every destructive restore operation works against.
+func resolveDBPath(dbPath string) (string, error) {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return "", err
+	}
+	if _, statErr := os.Stat(abs); statErr == nil {
+		if r, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
+			return r, nil
+		}
+	}
+	return abs, nil
+}
+
+// uniquePreRestorePrefix returns a "<resolvedDB>.pre-restore.<ts>.<pid>[.<n>]"
+// prefix for which NONE of the {"","-wal","-shm"} backup names already exist.
+// This guarantees we never overwrite an earlier moved-aside DB: second-grained
+// timestamps collide and os.Rename overwrites on unix.
+func uniquePreRestorePrefix(resolvedDB string) (string, error) {
+	stamp := time.Now().UTC().Format("20060102T150405Z")
+	base := fmt.Sprintf("%s.pre-restore.%s.%d", resolvedDB, stamp, os.Getpid())
+	for n := 0; n < 1000; n++ {
+		prefix := base
+		if n > 0 {
+			prefix = fmt.Sprintf("%s.%d", base, n)
+		}
+		if prefixFree(prefix) {
+			return prefix, nil
+		}
+	}
+	return "", errors.New("restore: could not find a free pre-restore backup name")
+}
+
+// prefixFree reports whether none of prefix{,"-wal","-shm"} currently exist.
+func prefixFree(prefix string) bool {
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if _, err := os.Lstat(prefix + suffix); err == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // copyFile copies src to dst (dst created 0600, truncated). Used to stage the
