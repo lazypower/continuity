@@ -221,6 +221,36 @@ PRAGMA foreign_keys=ON;
 	},
 }
 
+// headVersion is the highest schema version this binary knows how to apply.
+// Computed lazily; callable from tests for the forward-compat guard.
+func headVersion() int {
+	if len(migrations) == 0 {
+		return 0
+	}
+	return migrations[len(migrations)-1].Version
+}
+
+// ErrSchemaTooNew signals that the database has been migrated by a newer
+// continuity binary than the one currently running. Treated as a fast-fail
+// at startup so the operator sees a clear remediation message instead of
+// the binary silently ignoring invariants it does not understand.
+//
+// Typed error so callers (e.g. a future `continuity doctor` command or a
+// recovery flow) can branch on it without parsing the message string.
+type ErrSchemaTooNew struct {
+	Found    int
+	Supported int
+}
+
+func (e *ErrSchemaTooNew) Error() string {
+	return fmt.Sprintf(
+		"database schema version %d is newer than this binary supports "+
+			"(max %d); upgrade continuity, or restore a backup of the database "+
+			"from before that migration ran",
+		e.Found, e.Supported,
+	)
+}
+
 func (db *DB) migrate() error {
 	// Create schema_versions table if it doesn't exist
 	_, err := db.Exec(`
@@ -232,6 +262,22 @@ func (db *DB) migrate() error {
 	`)
 	if err != nil {
 		return fmt.Errorf("create schema_versions: %w", err)
+	}
+
+	// Forward-compat guard: refuse to operate against a DB that has been
+	// stamped with a schema version this binary does not know. The newer
+	// version may carry invariants we cannot uphold (CHECK constraints,
+	// triggers, foreign-key relationships), and silently ignoring them
+	// would risk corrupting the on-disk state. Fail fast with a clear
+	// operator-facing message instead.
+	var maxApplied int
+	if err := db.QueryRow(
+		`SELECT COALESCE(MAX(version), 0) FROM schema_versions`,
+	).Scan(&maxApplied); err != nil {
+		return fmt.Errorf("read schema_versions: %w", err)
+	}
+	if head := headVersion(); maxApplied > head {
+		return &ErrSchemaTooNew{Found: maxApplied, Supported: head}
 	}
 
 	for _, m := range migrations {
