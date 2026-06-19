@@ -30,17 +30,37 @@ import (
 //   - Otherwise ROLL BACK: move the originals back from backupPrefix and remove
 //     the staged file, restoring the pre-restore state.
 //
+// FAIL-CLOSED RECOVERY MODEL (the post-pivot contract):
+//   - A routine Open()/OpenNoMigrate() NEVER acts on the marker. If a marker is
+//     present (or the sidecar is unsafe, or the marker is corrupt) the open
+//     FAILS CLOSED with ErrRestoreInterrupted and touches nothing. A marker a
+//     crash, corruption, or an attacker can write therefore cannot drive
+//     destructive file moves on an innocent open.
+//   - Recovery runs ONLY from `snapshot restore --confirm` (recoverPendingRestore),
+//     under the serve lock, AFTER a hard marker-schema gate (validateMarkerSchema)
+//     AND the canonical-path gate (resolveCanonicalRestore).
+//
 // SECURITY: the marker is an on-disk file that an attacker (or a corrupt prior
-// run) could plant with arbitrary path fields. Resume therefore TRUSTS NOTHING
+// run) could plant with arbitrary path fields. Recovery therefore TRUSTS NOTHING
 // in the marker except the dbPublished phase bit. Every path it acts on is
 // RECOMPUTED from the canonical resolved DB path + sidecar (see
-// resumeRestoreIfPending), and any marker field that names a path OUTSIDE that
-// canonical set makes resume fail closed rather than touch it. Because the
+// recoverPendingRestore), and any marker field that names a path OUTSIDE that
+// canonical set makes recovery fail closed rather than touch it. Because the
 // originals are moved aside (never deleted) and all paths are canonical, even a
 // flipped phase bit can only mis-sequence within the recoverable canonical set.
 //
-// This is deliberately a marker + resume/rollback, NOT a general journal.
+// This is deliberately a marker + recover/rollback, NOT a general journal.
 // =========================================================================
+
+// ErrRestoreInterrupted signals that a restore marker is PRESENT (or present
+// but corrupt) in the DB's sidecar: a prior restore crashed mid-flight and the
+// DB on disk may be missing, torn, or mid-swap. Open()/OpenNoMigrate() return
+// this and refuse to touch the DB — recovery happens ONLY under explicit
+// operator intent (`continuity snapshot restore --confirm`), never as a side
+// effect of a routine open (Findings 1, 2, 4). A corrupt/partial marker is
+// ALSO ErrRestoreInterrupted: we fail closed rather than erase it or fabricate
+// a DB over it.
+var ErrRestoreInterrupted = errors.New("store: an interrupted restore is pending")
 
 // restoreMarkerName is the marker file inside the sidecar. The ".json" suffix
 // is irrelevant to ownership — the sidecar is path-owned — but keeps it
@@ -105,8 +125,21 @@ func writeRestoreMarkerAtomic(sidecar string, mk *restoreMarker) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("restore: publish marker: %w", err)
 	}
+	// fsync the sidecar dir so the marker rename is DURABLE before the first
+	// destructive rename relies on it (Finding 5): a power loss after the marker
+	// content was synced but its directory entry was not would otherwise leave a
+	// torn restore with NO marker, defeating recovery entirely.
+	if err := fsyncDir(sidecar); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: restore: fsync sidecar dir after marker: %v\n", err)
+	}
 	return nil
 }
+
+// restoreMarkerVersion is the only marker schema version this binary writes and
+// accepts. A marker with a different (or zero) version is rejected as a hard
+// gate by validateMarkerSchema — recovery never acts on a schema it cannot
+// reason about.
+const restoreMarkerVersion = 1
 
 // readRestoreMarker loads the marker if present. Returns (nil, nil) when no
 // marker exists. A present-but-unparseable marker is an error (fail closed:
@@ -124,6 +157,34 @@ func readRestoreMarker(sidecar string) (*restoreMarker, error) {
 		return nil, fmt.Errorf("%w: restore marker: %v", ErrSnapshotSidecarCorrupt, err)
 	}
 	return &mk, nil
+}
+
+// validateMarkerSchema is the hard schema gate the EXPLICIT recovery path runs
+// before it will act on a marker: version must be exactly restoreMarkerVersion
+// and the required fields must be present and well-formed. A corrupt `{}` or
+// partial marker (e.g. version 0, no DB path, a backup prefix but no moved
+// suffixes) fails closed here — recovery never trusts a marker it cannot fully
+// reason about (Finding 4). Path-content constraints (canonical set membership)
+// are still enforced separately by resolveCanonicalRestore; this gate is the
+// SHAPE check that precedes it.
+func validateMarkerSchema(mk *restoreMarker) error {
+	if mk.Version != restoreMarkerVersion {
+		return fmt.Errorf("%w: restore marker version %d != %d",
+			ErrSnapshotSidecarCorrupt, mk.Version, restoreMarkerVersion)
+	}
+	if strings.TrimSpace(mk.RestoredDBPath) == "" {
+		return fmt.Errorf("%w: restore marker missing restored_db_path", ErrSnapshotSidecarCorrupt)
+	}
+	// A not-yet-published marker that recorded moved suffixes MUST carry a backup
+	// prefix to roll them back to; the inverse (a backup prefix but an empty
+	// moved set) is an incoherent partial that we refuse rather than guess.
+	if len(mk.MovedSuffixes) > 0 && strings.TrimSpace(mk.BackupPrefix) == "" {
+		return fmt.Errorf("%w: restore marker moved suffixes without a backup prefix", ErrSnapshotSidecarCorrupt)
+	}
+	if strings.TrimSpace(mk.BackupPrefix) != "" && len(mk.MovedSuffixes) == 0 {
+		return fmt.Errorf("%w: restore marker backup prefix without moved suffixes", ErrSnapshotSidecarCorrupt)
+	}
+	return nil
 }
 
 func removeRestoreMarker(sidecar string) error {
@@ -146,41 +207,13 @@ type canonicalRestore struct {
 	published  bool     // the ONLY field trusted verbatim from the marker
 }
 
-// resolveDBPathSurvivingDangling returns the canonical DB path the way
-// sidecarPath/resolveDBPath do, but it ALSO survives a DANGLING symlink: if the
-// real DB was moved aside mid-restore through a symlinked CONTINUITY_DB, the
-// link target no longer exists, EvalSymlinks fails, and a naive fallback to the
-// link's own ".snapshot" would miss the marker written under the REAL DB's
-// sidecar. We therefore read the link target with os.Readlink (which returns
-// the target even when dangling) and clean/abs it.
+// resolveDBPathSurvivingDangling returns the canonical DB path surviving a
+// dangling/missing target. It delegates to canonicalDBPath so recovery resolves
+// the SAME real DB (and therefore the same sidecar, lock, and backup names) that
+// sidecarPath/serveLockPath use — there is exactly one resolution rule now
+// (Finding 3). The name is kept where recovery reads clearer for the intent.
 func resolveDBPathSurvivingDangling(dbPath string) (string, error) {
-	abs, err := filepath.Abs(dbPath)
-	if err != nil {
-		return "", err
-	}
-	// Existing, resolvable path: behave exactly like resolveDBPath.
-	if _, statErr := os.Stat(abs); statErr == nil {
-		if r, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
-			return r, nil
-		}
-	}
-	// Stat failed (or EvalSymlinks failed). If abs is itself a (possibly
-	// dangling) symlink, follow it via Readlink so a crashed restore through a
-	// symlink still resolves to the REAL DB's sidecar.
-	if li, lerr := os.Lstat(abs); lerr == nil && li.Mode()&os.ModeSymlink != 0 {
-		target, rlErr := os.Readlink(abs)
-		if rlErr == nil {
-			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(abs), target)
-			}
-			return resolveViaParentDir(target), nil
-		}
-	}
-	// The DB itself is gone (mid-restore the real file was moved aside) and abs
-	// is not a symlink. Resolving the PARENT dir still canonicalizes platform
-	// symlinks (e.g. macOS /var → /private/var) so the recomputed sidecar and
-	// backup names match what production wrote with the DB present.
-	return resolveViaParentDir(abs), nil
+	return canonicalDBPath(dbPath)
 }
 
 // resolveViaParentDir canonicalizes path by EvalSymlinks'ing its parent
@@ -265,22 +298,102 @@ func resolveCanonicalRestore(dbPath string, sidecar string, mk *restoreMarker) (
 	}, nil
 }
 
-// resumeRestoreIfPending detects an in-progress restore marker in the DB's
-// sidecar and drives it to a clean terminal state (COMPLETE or ROLL BACK)
-// before normal operation continues. It is invoked from Open() (so a crashed
-// restore self-heals on the next boot) and from Restore() (so a fresh restore
-// never starts on top of a torn one).
+// restoreMarkerPending reports whether a restore marker is PRESENT in the DB's
+// sidecar (a torn restore is pending) WITHOUT acting on it. It is the read-only
+// probe the fail-closed Open path uses.
 //
-// dbPath is the (possibly symlinked, possibly dangling) path the caller knows.
+// Returns:
+//   - (false, nil)            no sidecar / no marker → routine open may proceed
+//   - (true, nil)             a marker is present (parseable or not)
+//   - (false, ErrSnapshot...) the sidecar itself is unsafe (e.g. a symlink)
+//
+// IMPORTANT: a present-but-unparseable marker is reported as PENDING (true), not
+// as an error — Open must fail closed on it, never erase it. The only errors
+// returned here are sidecar-shape problems that already mean "do not touch".
+func restoreMarkerPending(dbPath string) (bool, error) {
+	resolvedDB, err := canonicalDBPath(dbPath)
+	if err != nil {
+		if errors.Is(err, ErrSnapshotUnsupportedPath) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !snapshotEligiblePath(resolvedDB) {
+		return false, nil // :memory:/URI — no sidecar, nothing pending
+	}
+	sidecar := resolvedDB + snapshotSidecarSuffix
+
+	// A planted symlinked sidecar could redirect marker reads elsewhere; refuse
+	// to follow it (fail closed) rather than report "nothing pending".
+	if err := assertNotSymlink(sidecar); err != nil {
+		return false, err
+	}
+	info, statErr := os.Lstat(sidecar)
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			return false, nil // no sidecar dir → no marker
+		}
+		return false, statErr
+	}
+	if !info.IsDir() {
+		// A regular file where the sidecar dir should be is a BLOCKED-snapshot
+		// sabotage case, NOT a pending restore — there is no marker dir to hold a
+		// marker. The migration path fails closed on it separately; a routine open
+		// of the DB itself is unaffected (no restore is in flight).
+		return false, nil
+	}
+	// We deliberately do NOT decode here: a corrupt/partial marker (`{}`, bad
+	// JSON, version 0) must still count as PENDING so Open fails closed and the
+	// operator runs explicit recovery — never silently erased or treated as
+	// recovered (Finding 4). Existence of the marker FILE is sufficient.
+	if _, mErr := os.Lstat(restoreMarkerPathIn(sidecar)); mErr != nil {
+		if os.IsNotExist(mErr) {
+			return false, nil // no marker → routine open
+		}
+		return false, mErr
+	}
+	return true, nil
+}
+
+// detectRestoreInterrupted is the FAIL-CLOSED gate Open()/OpenNoMigrate() run
+// BEFORE any sql.Open or file creation. If a restore marker is present (or the
+// sidecar is unsafe) it returns ErrRestoreInterrupted — the DB is NEVER opened,
+// fabricated, or touched. Recovery is the operator's explicit job; a routine
+// `continuity profile` must not drive destructive file moves off a marker a
+// crash, corruption, or an attacker could have written (Findings 1, 2, 4).
+func detectRestoreInterrupted(dbPath string) error {
+	pending, err := restoreMarkerPending(dbPath)
+	if err != nil {
+		// A sidecar-shape problem (e.g. symlinked sidecar) is itself a reason to
+		// refuse to open: surface it as an interrupted-restore condition so the
+		// operator runs recovery, which fails closed on the same problem.
+		return fmt.Errorf("%w: %v", ErrRestoreInterrupted, err)
+	}
+	if pending {
+		resolvedDB, _ := canonicalDBPath(dbPath)
+		return fmt.Errorf(
+			"%w for %s; run `continuity snapshot restore --confirm` to complete recovery",
+			ErrRestoreInterrupted, resolvedDB)
+	}
+	return nil
+}
+
+// recoverPendingRestore drives a torn restore to a clean terminal state
+// (COMPLETE or ROLL BACK) under FULL validation. It runs ONLY from the explicit
+// `snapshot restore --confirm` path, and ONLY while the caller already holds the
+// serve lock for this DB — recovery is never a side effect of a routine open.
+//
+// dbPath is the (possibly symlinked, possibly dangling) path the operator knows.
 // The canonical resolved path + sidecar are RECOMPUTED here and are the sole
-// authority for every path resume acts on; the marker's path fields are only
-// validated against that canonical set, never trusted as targets.
-func resumeRestoreIfPending(dbPath string) error {
-	// Resolve the canonical DB path FIRST (surviving a dangling symlink), then
-	// derive the sidecar from it — never from a marker field. This is what makes
-	// recovery find the marker under the REAL DB's sidecar even when the live DB
-	// was moved aside through a symlink mid-restore.
-	resolvedDB, err := resolveDBPathSurvivingDangling(dbPath)
+// authority for every path recovery acts on; the marker's path fields are only
+// validated against that canonical set (resolveCanonicalRestore) AFTER the
+// marker passes the schema gate (validateMarkerSchema). A corrupt/partial marker
+// fails closed — it is never erased and no DB is fabricated.
+//
+// Returns nil when there was nothing to recover (no marker), so the caller can
+// proceed to a fresh restore on a clean DB.
+func recoverPendingRestore(dbPath string) error {
+	resolvedDB, err := canonicalDBPath(dbPath)
 	if err != nil {
 		if errors.Is(err, ErrSnapshotUnsupportedPath) {
 			return nil
@@ -288,86 +401,47 @@ func resumeRestoreIfPending(dbPath string) error {
 		return err
 	}
 	if !snapshotEligiblePath(resolvedDB) {
-		return nil // :memory:/URI — no sidecar, nothing to resume
+		return nil
 	}
 	sidecar := resolvedDB + snapshotSidecarSuffix
 
-	// The sidecar on the RESUME path must not be a symlink: a planted symlinked
-	// sidecar could redirect marker reads/removes elsewhere. Fail closed.
+	// The sidecar must not be a symlink: a planted symlinked sidecar could
+	// redirect marker reads/removes elsewhere. Fail closed.
 	if err := assertNotSymlink(sidecar); err != nil {
 		return err
 	}
-	if _, statErr := os.Lstat(sidecar); statErr != nil {
-		return nil // no sidecar dir → no marker
+	info, statErr := os.Lstat(sidecar)
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			return nil // no sidecar dir → no marker
+		}
+		return statErr
+	}
+	if !info.IsDir() {
+		return nil // regular-file sidecar holds no marker → nothing to recover
 	}
 	mk, err := readRestoreMarker(sidecar)
 	if err != nil {
-		return err
+		return err // unparseable marker → fail closed (never erased)
 	}
 	if mk == nil {
-		return nil // routine open: no pending marker → behavior unchanged
+		return nil // no marker → nothing to recover
 	}
 
-	// A marker is pending. Resume is mutually exclusive with an active restore or
-	// serve: if ANOTHER live process holds the serve lock, it is actively
-	// restoring/serving this DB — do NOT interfere; skip resume and let normal
-	// open proceed (the holder owns recovery). Only when there is no live holder
-	// (a stale/dead-PID lock = the crashed restorer, or no lock at all) do we
-	// recover, holding the serve lock for the duration so nothing races in.
-	owner, alive, lerr := serveLockOwnerFor(resolvedDB)
-	if lerr != nil {
-		return lerr
-	}
-	myPID := os.Getpid()
-	if alive && owner != myPID {
-		// Another live process owns the DB — leave the torn restore to it.
-		return nil
-	}
-
-	// We either already hold the serve lock (owner == us, e.g. serve called Open
-	// after acquiring) or no live holder exists. Acquire it for the resume
-	// window unless we already hold it; release only what we acquired.
-	release := func() {}
-	if owner != myPID {
-		rel, aerr := AcquireServeLock(resolvedDB)
-		if aerr != nil {
-			// Lost a race to another process that just acquired — skip resume; the
-			// new holder will recover. Do not fail the Open.
-			if errors.Is(aerr, ErrServeLockHeld) {
-				return nil
-			}
-			return aerr
-		}
-		release = rel
-	}
-	defer release()
-
-	// Re-read the marker now that we hold the lock: a concurrent recoverer may
-	// have already cleared it between our first read and acquiring the lock.
-	mk, err = readRestoreMarker(sidecar)
-	if err != nil {
+	// Hard schema gate: version==1 and required fields present/well-formed. A
+	// corrupt `{}`/partial marker stops here, preserved and un-acted-on.
+	if err := validateMarkerSchema(mk); err != nil {
 		return err
 	}
-	if mk == nil {
-		return nil
-	}
 
+	// Path-content gate: every path the marker names is constrained to the
+	// canonical set (live triplet, staged in the DB dir, backup beneath the
+	// resolved DB). Anything outside fails closed without being touched.
 	cr, err := resolveCanonicalRestore(dbPath, sidecar, mk)
 	if err != nil {
 		return err
 	}
 	return finishPendingRestore(cr)
-}
-
-// serveLockOwnerFor returns (ownerPID, alive, err) for the serve lock derived
-// from a resolved DB path. A missing lock is (0, false, nil). Used by resume to
-// gate on whether a LIVE process (other than us) is actively holding the DB.
-func serveLockOwnerFor(resolvedDB string) (int, bool, error) {
-	path, err := serveLockPath(resolvedDB)
-	if err != nil {
-		return 0, false, err
-	}
-	return readServeLockOwner(path)
 }
 
 // finishPendingRestore completes or rolls back a torn restore described by the

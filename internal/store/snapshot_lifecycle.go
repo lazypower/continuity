@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -47,6 +48,30 @@ func RecordSuccessfulBoot(dbPath string, currentSchemaVersion int) error {
 	// Only tick a restore point whose upgrade has actually completed; if the
 	// DB is still below target, this boot does not prove the upgrade good.
 	if m.TargetSchemaVersion > currentSchemaVersion {
+		return nil
+	}
+
+	// LINEAGE GATE (Finding 8): recompute the lineage fingerprint from the LIVE
+	// DB and only tick/expire a sidecar whose lineage MATCHES this DB. A sidecar
+	// transplanted next to an unrelated DB (a foreign restore point) carries a
+	// different instance_id, so its fingerprint cannot match — and boot expiry
+	// must NEVER auto-delete unproven/foreign restore material. On mismatch we
+	// leave the sidecar completely untouched (no tick, no expiry).
+	//
+	// A live DB we cannot open or fingerprint (missing/legacy/corrupt) is also a
+	// fail-closed "do not touch" — we report the error but never delete the
+	// sidecar off an unverifiable lineage.
+	cur, oerr := OpenNoMigrate(dbPath)
+	if oerr != nil {
+		return fmt.Errorf("snapshot: boot lineage open: %w", oerr)
+	}
+	curFingerprint, ferr := lineageFingerprint(cur, m.PreSchemaVersion)
+	cur.Close()
+	if ferr != nil {
+		return fmt.Errorf("snapshot: boot lineage recompute: %w", ferr)
+	}
+	if curFingerprint != m.LineageFingerprint {
+		// Foreign/transplanted sidecar — never tick or auto-delete it.
 		return nil
 	}
 
@@ -158,44 +183,102 @@ func Prune(dbPath string) error {
 // Serve lockfile — lets restore refuse while a serve holds the DB.
 // =========================================================================
 
-// serveLockPath is the lockfile a running `serve` holds next to the DB.
+// serveLockPath is the lockfile a running `serve` holds next to the DB. It is
+// keyed to the SAME canonical real DB path as the sidecar (Finding 3): both
+// route through canonicalDBPath, so a symlinked or mid-restore (dangling) DB
+// can never end up with the lock keyed to the link while the sidecar/marker is
+// keyed to the real file — which previously let a serve/restore contend on
+// DIFFERENT locks for the same database.
 func serveLockPath(dbPath string) (string, error) {
-	abs, err := filepath.Abs(dbPath)
+	resolved, err := canonicalDBPath(dbPath)
 	if err != nil {
 		return "", err
-	}
-	resolved := abs
-	if _, statErr := os.Stat(abs); statErr == nil {
-		if r, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
-			resolved = r
-		}
 	}
 	return resolved + ".serve.lock", nil
 }
 
-// ErrServeLockHeld is returned by AcquireServeLock when a LIVE serve already
-// holds the lock for this DB. serve must refuse to start in that case so a
-// second server cannot run against (and have the DB swapped under) the first.
+// ErrServeLockHeld is returned by AcquireServeLock when a serve lock for this DB
+// is already held — by a LIVE serve in ANOTHER process, or by THIS process (a
+// second same-PID acquire while the first is still outstanding). serve/restore
+// must refuse in that case so a second holder cannot run against (or have the DB
+// swapped under) the first.
 var ErrServeLockHeld = errors.New("serve: another continuity serve is already running against this DB")
 
-// AcquireServeLock takes an EXCLUSIVE advisory lock recording the serve PID.
+// =========================================================================
+// In-process serve-lock ownership (Finding 9).
 //
-// Semantics (O_CREATE|O_EXCL with stale reclaim):
-//   - If no lock exists, create it atomically (O_EXCL) and own it.
-//   - If a lock exists and its recorded PID is ALIVE, refuse with
-//     ErrServeLockHeld — a live serve owns the DB.
-//   - If a lock exists but its PID is dead (or the lock is unparseable in a way
-//     that proves it stale), reclaim it: remove and recreate with our PID.
+// The on-disk O_EXCL lockfile records a PID. It CANNOT distinguish two acquires
+// from the SAME process: both see "owner == myPID" and the prior code returned
+// success to both, handing back two releasers over ONE lock file — so whichever
+// released first removed the single file while the other holder still believed
+// it owned the DB (and a foreign serve could then acquire underneath it).
 //
-// The returned release func removes the lock ONLY if we still own it (our PID
-// is recorded). This prevents a second serve that clobbered the first's lock
-// from later deleting it on exit and leaving the first server unprotected.
+// We close that hole with a process-local registry keyed by lock path. The lock
+// is single-owner WITHIN this process: the first acquire records ownership; a
+// second same-PID acquire (while the first is outstanding) is treated as
+// CONTENTION (ErrServeLockHeld), exactly like a foreign live holder. The file is
+// removed only when the in-process owner releases AND the file still records our
+// PID. Releases are idempotent (a second call is a no-op) so a deferred release
+// after a contention failure cannot strand the real owner.
+// =========================================================================
+
+var serveLockOwners serveLockRegistry
+
+type serveLockRegistry struct {
+	mu    sync.Mutex
+	owned map[string]bool // lock path → held by THIS process right now
+}
+
+// claim marks path as in-process-owned. Returns false if it is already owned by
+// this process (a same-PID re-acquire → contention).
+func (r *serveLockRegistry) claim(path string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.owned == nil {
+		r.owned = make(map[string]bool)
+	}
+	if r.owned[path] {
+		return false
+	}
+	r.owned[path] = true
+	return true
+}
+
+func (r *serveLockRegistry) release(path string) {
+	r.mu.Lock()
+	delete(r.owned, path)
+	r.mu.Unlock()
+}
+
+// AcquireServeLock takes an EXCLUSIVE advisory lock recording the serve PID,
+// serializing BOTH separate processes (via a PID-stamped O_EXCL lockfile) AND
+// same-process callers (via the in-process registry — Finding 9).
+//
+// Semantics:
+//   - A same-process second acquire while the first is outstanding → contention
+//     (ErrServeLockHeld). We never hand back two releasers over one file.
+//   - If no lock file exists, create it atomically (O_EXCL) and own it.
+//   - If a lock exists and its recorded PID is ALIVE (a different live process),
+//     refuse with ErrServeLockHeld.
+//   - If a lock exists but its PID is dead (or unparseable so it cannot be a
+//     live us), reclaim it: remove and recreate with our PID.
+//
+// The returned release func removes the lock ONLY if THIS process still owns it
+// in the registry AND the file still records our PID, and is idempotent.
 func AcquireServeLock(dbPath string) (func(), error) {
 	path, err := serveLockPath(dbPath)
 	if err != nil {
 		return func() {}, err
 	}
 	myPID := os.Getpid()
+
+	// In-process gate FIRST: a second same-PID acquire is contention, not a
+	// silent share of the single lock file.
+	if !serveLockOwners.claim(path) {
+		return func() {}, ErrServeLockHeld
+	}
+	// From here, any non-success path must release the in-process claim so a
+	// failed acquire never leaves the path permanently "owned".
 
 	for attempt := 0; attempt < 2; attempt++ {
 		// Atomic create-if-absent: only one process wins the O_EXCL race.
@@ -205,54 +288,62 @@ func AcquireServeLock(dbPath string) (func(), error) {
 			cerr := f.Close()
 			if werr != nil {
 				_ = os.Remove(path)
+				serveLockOwners.release(path)
 				return func() {}, werr
 			}
 			if cerr != nil {
 				_ = os.Remove(path)
+				serveLockOwners.release(path)
 				return func() {}, cerr
 			}
 			return makeServeLockReleaser(path, myPID), nil
 		}
 		if !os.IsExist(err) {
+			serveLockOwners.release(path)
 			return func() {}, err
 		}
 
-		// A lock already exists. Decide: live (refuse) or stale (reclaim).
+		// A lock file already exists. We hold the in-process claim, so a file that
+		// records our OWN PID here is a stale leftover from a crashed prior run of
+		// this process (no live sibling can hold it — the registry guarantees it),
+		// and we reclaim it. Anything else: live (refuse) or dead (reclaim).
 		owner, alive, perr := readServeLockOwner(path)
 		if perr != nil {
+			serveLockOwners.release(path)
 			return func() {}, perr
 		}
-		if owner == myPID {
-			// We already hold it (re-acquire in the same process).
-			return makeServeLockReleaser(path, myPID), nil
-		}
-		if alive {
+		if owner != myPID && alive {
+			serveLockOwners.release(path)
 			return func() {}, ErrServeLockHeld
 		}
-		// Stale lock (dead PID): reclaim by removing, then retry the O_EXCL
-		// create. If another process reclaims first, the retry's create fails
-		// and we re-evaluate liveness (and may refuse).
+		// Stale lock (dead PID, or our own crashed PID): reclaim by removing, then
+		// retry the O_EXCL create. If another process reclaims first, the retry's
+		// create fails and we re-evaluate liveness (and may refuse).
 		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			serveLockOwners.release(path)
 			return func() {}, rmErr
 		}
 	}
 	// Lost the reclaim race twice — treat as held to fail closed.
+	serveLockOwners.release(path)
 	return func() {}, ErrServeLockHeld
 }
 
-// makeServeLockReleaser returns a release func that removes the lockfile ONLY
-// while it still records ownerPID. If another process has since reclaimed the
-// lock (recorded a different PID), we leave it alone — never delete a lock we
-// no longer own.
+// makeServeLockReleaser returns an idempotent release func. The FIRST call drops
+// this process's in-process ownership and removes the lockfile ONLY while it
+// still records ownerPID (a foreign process that reclaimed it keeps it). A
+// second call is a no-op — so a deferred release after the owner already
+// released cannot remove a lock a different acquirer now holds.
 func makeServeLockReleaser(path string, ownerPID int) func() {
+	var once sync.Once
 	return func() {
-		owner, _, err := readServeLockOwner(path)
-		if err != nil {
-			return
-		}
-		if owner == ownerPID {
-			_ = os.Remove(path)
-		}
+		once.Do(func() {
+			owner, _, err := readServeLockOwner(path)
+			if err == nil && owner == ownerPID {
+				_ = os.Remove(path)
+			}
+			serveLockOwners.release(path)
+		})
 	}
 }
 
@@ -315,12 +406,14 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	}
 	defer releaseLock()
 
-	// Drive any torn restore from a previous crash to a clean state first; a
-	// fresh restore must never start on top of an in-progress one. We already
-	// hold the serve lock, so resume runs under it (no re-acquire) and no other
-	// process can race the recovery.
-	if rerr := resumeRestoreIfPending(dbPath); rerr != nil {
-		return "", fmt.Errorf("restore: resume prior restore: %w", rerr)
+	// Drive any torn restore from a previous crash to a clean terminal state
+	// FIRST, under FULL validation: a fresh restore must never start on top of an
+	// in-progress one. This is the ONE place recovery runs (explicit operator
+	// intent + serve lock held), per the fail-closed pivot — Open never resumes.
+	// recoverPendingRestore validates the marker schema and constrains every path
+	// to the canonical set; a corrupt/partial marker fails closed here.
+	if rerr := recoverPendingRestore(dbPath); rerr != nil {
+		return "", fmt.Errorf("restore: recover prior restore: %w", rerr)
 	}
 
 	m, err := loadValidManifest(sidecar)
@@ -455,6 +548,12 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 			return "", fmt.Errorf("restore: move %s aside: %w", src, err)
 		}
 	}
+	// fsync the DB dir so the moved-aside originals are DURABLE before we publish
+	// over their old names (Finding 5): a power loss mid-restore must leave the
+	// originals findable for rollback, not silently reverted to the live names.
+	if err := fsyncDir(dbDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: restore: fsync db dir after move-aside: %v\n", err)
+	}
 
 	// Rename the staged snapshot into the live DB path (atomic on same dir).
 	if err := os.Rename(staged, resolvedDB); err != nil {
@@ -464,6 +563,10 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		return "", fmt.Errorf("restore: publish restored db: %w", err)
 	}
 	_ = os.Chmod(resolvedDB, 0o600)
+	// fsync the DB dir so the restored DB's directory entry is durable (Finding 5).
+	if err := fsyncDir(dbDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: restore: fsync db dir after publish: %v\n", err)
+	}
 
 	// Mark the DB as published so a crash from here COMPLETES (never rolls back
 	// over the freshly-restored DB).
@@ -501,21 +604,12 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	return movedAsidePrefix, nil
 }
 
-// resolveDBPath returns the canonical (Abs + EvalSymlinks) path for an existing
-// DB, matching the derivation sidecarPath uses. A missing file resolves to its
-// absolute form (EvalSymlinks would error). This is the single resolved path
-// every destructive restore operation works against.
+// resolveDBPath returns the canonical real path for a DB, matching the single
+// derivation sidecarPath/serveLockPath use (canonicalDBPath). It is the resolved
+// path every destructive restore operation works against. Retained as a named
+// wrapper because tests and Restore read clearer with the intent in the name.
 func resolveDBPath(dbPath string) (string, error) {
-	abs, err := filepath.Abs(dbPath)
-	if err != nil {
-		return "", err
-	}
-	if _, statErr := os.Stat(abs); statErr == nil {
-		if r, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
-			return r, nil
-		}
-	}
-	return abs, nil
+	return canonicalDBPath(dbPath)
 }
 
 // uniquePreRestorePrefix returns a "<resolvedDB>.pre-restore.<ts>.<pid>[.<n>]"

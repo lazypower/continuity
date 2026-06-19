@@ -37,13 +37,16 @@ func Open(path string) (*DB, error) {
 	// permissions on creation, so pre-existing dirs/files need explicit chmod.
 	hardenPermissions(dir, path)
 
-	// Self-heal a restore interrupted by a crash BEFORE opening the DB: a torn
-	// restore can leave a missing DB beside a stale WAL, which sql.Open would
-	// otherwise fabricate over. resumeRestoreIfPending drives the marker to a
-	// clean terminal state (complete or roll back) first. Best-effort path
-	// resolution failures fail closed.
-	if err := resumeRestoreIfPending(path); err != nil {
-		return nil, fmt.Errorf("resume interrupted restore: %w", err)
+	// FAIL CLOSED on an interrupted restore (Findings 1, 2, 4). A torn restore
+	// leaves a marker in the sidecar; the DB on disk may be missing, torn, or
+	// mid-swap. We must NEVER auto-resume here: a marker that a crash, corruption,
+	// OR an attacker can write would otherwise drive destructive file moves on a
+	// routine open (e.g. `continuity profile`). Instead we refuse to open and
+	// return ErrRestoreInterrupted; recovery happens only under explicit operator
+	// intent via `continuity snapshot restore --confirm`. A corrupt/partial marker
+	// is ALSO ErrRestoreInterrupted (not erased, not fabricated over).
+	if err := detectRestoreInterrupted(path); err != nil {
+		return nil, err
 	}
 
 	sqlDB, err := sql.Open("sqlite", path)
@@ -80,6 +83,15 @@ var ErrDBMissing = errors.New("store: database file does not exist")
 // file first and return ErrDBMissing when it is absent. This is what stops
 // restore from silently materializing an empty DB over a missing live one.
 func OpenNoMigrate(path string) (*DB, error) {
+	// FAIL CLOSED on an interrupted restore, exactly like Open (Findings 1, 2,
+	// 4). The inspection-only path is reached by non-server commands too; it must
+	// never read through a half-restored DB beside a pending marker. Recovery is
+	// the operator's explicit job. (Snapshot-image inspection inside the sidecar
+	// has no marker of its own, so integrity/lineage checks are unaffected.)
+	if err := detectRestoreInterrupted(path); err != nil {
+		return nil, err
+	}
+
 	// Existence gate: a missing live DB must fail closed, never be fabricated.
 	// (file:... DSNs and :memory: are not used with OpenNoMigrate.)
 	if _, err := os.Stat(path); err != nil {

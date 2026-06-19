@@ -149,29 +149,64 @@ func snapshotEligiblePath(path string) bool {
 	return true
 }
 
+// canonicalDBPath resolves a DB path to its single real on-disk target, the
+// ONE derivation every sidecar/lock/backup name is keyed to. It must return the
+// same answer for every spelling of the same real DB AND survive the two states
+// a mid-restore DB can be in:
+//
+//	abs           = Abs(path)
+//	(a) DB present:        EvalSymlinks(abs)               — follows symlinks
+//	(b) DB missing, abs is
+//	    a dangling symlink: Readlink(abs) then resolve via parent dir
+//	(c) DB missing, plain:  resolve via parent dir (e.g. /var → /private/var)
+//
+// (b) and (c) are why lock and sidecar resolution can no longer diverge
+// (Finding 3): when a restore through a symlinked CONTINUITY_DB has moved the
+// real DB aside, EvalSymlinks(abs) fails, and a naive fallback to abs would key
+// the lock to the LINK while the sidecar was written under the REAL DB. Both
+// serveLockPath and sidecarPath now route through this one helper, so the lock
+// and the sidecar are always keyed to the same real DB.
+func canonicalDBPath(dbPath string) (string, error) {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return "", fmt.Errorf("snapshot: abs db path: %w", err)
+	}
+	// (a) Existing, resolvable path: follow symlinks to the real file.
+	if _, statErr := os.Stat(abs); statErr == nil {
+		if r, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
+			return r, nil
+		}
+	}
+	// (b) abs is itself a (possibly dangling) symlink: follow it via Readlink so
+	// a crashed restore through a symlink still resolves to the REAL DB.
+	if li, lerr := os.Lstat(abs); lerr == nil && li.Mode()&os.ModeSymlink != 0 {
+		if target, rlErr := os.Readlink(abs); rlErr == nil {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(abs), target)
+			}
+			return resolveViaParentDir(target), nil
+		}
+	}
+	// (c) The DB itself is gone (or never existed) and abs is not a symlink.
+	// Resolving the PARENT dir still canonicalizes platform symlinks so the
+	// recomputed sidecar/lock/backup names match what production wrote.
+	return resolveViaParentDir(abs), nil
+}
+
 // sidecarPath derives the canonical sidecar directory for a DB path:
 //
-//	abs = Abs(path)
-//	resolved = EvalSymlinks(abs)  (only if the DB file exists)
-//	sidecar = resolved + ".snapshot"
+//	sidecar = canonicalDBPath(path) + ".snapshot"
 //
-// Relative and absolute spellings of the same real DB resolve identically.
+// Relative and absolute spellings of the same real DB resolve identically, and
+// the derivation survives a dangling/missing target (see canonicalDBPath).
 // Returns ErrSnapshotUnsupportedPath for ineligible paths.
 func sidecarPath(dbPath string) (string, error) {
 	if !snapshotEligiblePath(dbPath) {
 		return "", ErrSnapshotUnsupportedPath
 	}
-	abs, err := filepath.Abs(dbPath)
+	resolved, err := canonicalDBPath(dbPath)
 	if err != nil {
-		return "", fmt.Errorf("snapshot: abs db path: %w", err)
-	}
-	resolved := abs
-	if _, statErr := os.Stat(abs); statErr == nil {
-		// Only resolve symlinks when the DB exists; a not-yet-created DB has
-		// no link to resolve and EvalSymlinks would error.
-		if r, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
-			resolved = r
-		}
+		return "", err
 	}
 	return resolved + snapshotSidecarSuffix, nil
 }
@@ -342,6 +377,26 @@ func verifySnapshotHash(snapPath string, m *Manifest) error {
 		return fmt.Errorf("%w: snapshot hash mismatch", ErrSnapshotSidecarCorrupt)
 	}
 	return nil
+}
+
+// fsyncDir fsyncs a directory so a rename INTO it (or a file creation) is
+// durable across a power loss (Finding 5). An atomic rename updates a directory
+// entry; without fsyncing the directory, a crash can lose that entry even though
+// the file's own data was synced — leaving, e.g., a published snapshot.db with
+// no manifest, or a moved-aside original that silently reverts. Best-effort by
+// contract: a platform/filesystem that cannot fsync a directory handle (some
+// network FS) returns an error the caller logs but does not treat as fatal, so
+// durability hardening never breaks an otherwise-successful operation.
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if serr := d.Sync(); serr != nil {
+		d.Close()
+		return serr
+	}
+	return d.Close()
 }
 
 // hashFile returns ("sha256:<hex>", size, nil) for a file.
@@ -663,16 +718,46 @@ func (db *DB) createRestorePointLocked(preVersion, target, firstRisky int) error
 }
 
 // writeRestorePoint performs the actual VACUUM INTO + validate + atomic
-// publish. Only called when no valid sidecar exists.
+// publish. Only called when no valid sidecar exists, and (for the risky-upgrade
+// path) under the held op-lock — so the sidecar it creates and the temps within
+// are this call's to clean up on failure.
 func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky int) error {
 	// Sidecar path must not be a symlink even if we are about to create it.
 	if err := assertNotSymlink(sidecar); err != nil {
 		return err
 	}
+	// Track whether the sidecar dir already existed: if WE create it here and the
+	// snapshot-creation then fails, we remove our partial sidecar so no
+	// half-built restore point lingers (Finding 6). We never remove a sidecar dir
+	// that pre-existed our call, and removeOwnedPartialSidecar only ever rmdir's
+	// when the dir holds nothing but our own aborted artifacts.
+	sidecarPreexisted := true
+	if _, statErr := os.Lstat(sidecar); statErr != nil {
+		if os.IsNotExist(statErr) {
+			sidecarPreexisted = false
+		} else {
+			return statErr
+		}
+	}
 	if err := os.MkdirAll(sidecar, 0o700); err != nil {
 		return fmt.Errorf("snapshot: mkdir sidecar: %w", err)
 	}
 	_ = os.Chmod(sidecar, 0o700)
+
+	// failClosed removes this call's partial artifacts (the named temp, if any)
+	// and — only when WE created the sidecar dir this call — the now-empty sidecar
+	// dir, so a failed snapshot creation leaves NO partial restore point behind
+	// (Finding 6). It never touches a pre-existing sidecar or any file it cannot
+	// prove this call created.
+	failClosed := func(tmp string, e error) error {
+		if tmp != "" {
+			_ = os.Remove(tmp)
+		}
+		if !sidecarPreexisted {
+			removeOwnedEmptySidecar(sidecar)
+		}
+		return e
+	}
 
 	// Establish the per-DB instance identity HERE — only after the sidecar is
 	// proven usable (not a symlink, dir creatable), and BEFORE the VACUUM INTO so
@@ -682,14 +767,25 @@ func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky i
 	// NO continuity_meta write, because we never reach this point. Idempotent: a
 	// DB that already carries an instance_id keeps it (so a copy and its source
 	// agree), which is exactly what the lineage fingerprint below relies on.
+	//
+	// IDENTITY vs TRACKING METADATA (Finding 6): instance_id is per-DB IDENTITY —
+	// it is INTENTIONALLY written into the DB and INTENTIONALLY copy-preserved
+	// (cp/VACUUM INTO carry it), which is categorically different from the
+	// snapshot-TRACKING metadata the design keeps OUT of the DB (no absolute
+	// paths, no manifest rows). A stray identity row left by a snapshot that
+	// failed AFTER this write is BENIGN: it causes no data/schema loss, the DB
+	// stays at its pre-version, and a later successful snapshot reuses the same
+	// id. So we keep the identity write before VACUUM (the snapshot MUST capture
+	// it for lineage) and accept that a post-write failure may leave the id — the
+	// partial SIDECAR is what we scrub, not the benign identity row.
 	if err := db.ensureInstanceID(); err != nil {
-		return fmt.Errorf("snapshot: ensure instance identity: %w", err)
+		return failClosed("", fmt.Errorf("snapshot: ensure instance identity: %w", err))
 	}
 
 	// Compute lineage fingerprint from the live (pre-migration) DB.
 	fingerprint, err := lineageFingerprint(db, preVersion)
 	if err != nil {
-		return err
+		return failClosed("", err)
 	}
 
 	// VACUUM INTO a temp file inside the sidecar. The name is reserved via an
@@ -699,44 +795,44 @@ func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky i
 	// rather than overwrite foreign data (Finding 7).
 	tmpSnap, terr := reserveOwnedTempName(sidecar, "snapshot.tmp.", "")
 	if terr != nil {
-		return terr
+		return failClosed("", terr)
 	}
 	if _, err := db.Exec(`VACUUM INTO ?`, tmpSnap); err != nil {
-		_ = os.Remove(tmpSnap)
-		return fmt.Errorf("snapshot: VACUUM INTO: %w", err)
+		return failClosed(tmpSnap, fmt.Errorf("snapshot: VACUUM INTO: %w", err))
 	}
-	// From here on, remove tmpSnap on any failure.
+	// From here on, remove tmpSnap (and our partial sidecar) on any failure.
 	cleanupTmp := func() { _ = os.Remove(tmpSnap) }
 
 	// Integrity-check the snapshot.
 	if err := integrityCheck(tmpSnap); err != nil {
-		cleanupTmp()
-		return err
+		return failClosed(tmpSnap, err)
 	}
 	// The snapshot must reflect the pre-upgrade schema exactly.
 	if sv, err := snapshotSchemaVersion(tmpSnap); err != nil {
-		cleanupTmp()
-		return err
+		return failClosed(tmpSnap, err)
 	} else if sv != preVersion {
-		cleanupTmp()
-		return fmt.Errorf("snapshot: image schema v%d != pre-upgrade v%d", sv, preVersion)
+		return failClosed(tmpSnap, fmt.Errorf("snapshot: image schema v%d != pre-upgrade v%d", sv, preVersion))
 	}
 
 	_ = os.Chmod(tmpSnap, 0o600)
 
 	sum, size, err := hashFile(tmpSnap)
 	if err != nil {
-		cleanupTmp()
-		return err
+		return failClosed(tmpSnap, err)
 	}
 
 	// Atomic publish of the snapshot image.
 	finalSnap := snapshotDBPathIn(sidecar)
 	if err := os.Rename(tmpSnap, finalSnap); err != nil {
-		cleanupTmp()
-		return fmt.Errorf("snapshot: publish snapshot.db: %w", err)
+		return failClosed(tmpSnap, fmt.Errorf("snapshot: publish snapshot.db: %w", err))
 	}
+	cleanupTmp() // tmpSnap consumed by the rename; nothing left to remove
 	_ = os.Chmod(finalSnap, 0o600)
+	// fsync the sidecar dir so the published snapshot.db entry survives power
+	// loss BEFORE the manifest names it (Finding 5).
+	if err := fsyncDir(sidecar); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: snapshot: fsync sidecar dir after publish: %v\n", err)
+	}
 
 	// Build + write the manifest (temp → fsync → rename).
 	m := &Manifest{
@@ -758,17 +854,39 @@ func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky i
 		LastRestoredAt:              nil,
 	}
 	if err := writeManifestAtomic(sidecar, m); err != nil {
-		// Snapshot.db published but manifest write failed: sidecar is now
-		// partial. We deliberately do NOT remove snapshot.db (we cannot
-		// prove a concurrent process didn't just publish it). Subsequent
-		// runs fail closed on the partial sidecar, which is the safe state.
-		return err
+		// Snapshot.db published but the manifest write failed: the sidecar is now
+		// partial. We hold the op-lock and renamed OUR OWN proven-owned temp into
+		// snapshot.db this call, so it is provably ours to scrub (no concurrent
+		// process could have published it under the lock). Remove the partial
+		// snapshot.db and our sidecar dir so no half-built restore point lingers
+		// (Finding 6) — leaving a snapshot.db with no manifest would just fail
+		// closed on every later run.
+		if rmErr := os.Remove(finalSnap); rmErr != nil && !os.IsNotExist(rmErr) {
+			fmt.Fprintf(os.Stderr, "warning: snapshot: remove partial snapshot.db after manifest failure: %v\n", rmErr)
+		}
+		return failClosed("", err)
 	}
 
 	fmt.Fprintf(os.Stderr,
 		"  restore point: captured pre-v%d snapshot before risky migration → %s\n",
 		preVersion, sidecar)
 	return nil
+}
+
+// removeOwnedEmptySidecar removes the sidecar directory ONLY when it is empty —
+// i.e. this call's aborted snapshot creation left nothing behind in it. If any
+// entry remains (a foreign file, or material we could not prove is ours) the dir
+// is left intact: we never rmdir a directory holding files we cannot prove are
+// ours (Finding 6, consistent with the global bar). Best-effort.
+func removeOwnedEmptySidecar(sidecar string) {
+	entries, err := os.ReadDir(sidecar)
+	if err != nil {
+		return
+	}
+	if len(entries) != 0 {
+		return // not empty — leave anything we did not prove ours
+	}
+	_ = os.Remove(sidecar)
 }
 
 // writeManifestAtomic writes the manifest via temp + fsync + rename, chmod 0600.
@@ -802,6 +920,12 @@ func writeManifestAtomic(sidecar string, m *Manifest) error {
 		return fmt.Errorf("snapshot: publish manifest: %w", err)
 	}
 	_ = os.Chmod(manifestPathIn(sidecar), 0o600)
+	// fsync the sidecar dir so the manifest rename is durable across power loss
+	// (Finding 5): a synced manifest file with an unsynced directory entry could
+	// otherwise vanish on crash, leaving a snapshot.db with no manifest.
+	if err := fsyncDir(sidecar); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: snapshot: fsync sidecar dir after manifest: %v\n", err)
+	}
 	return nil
 }
 

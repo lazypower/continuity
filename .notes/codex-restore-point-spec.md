@@ -170,7 +170,7 @@ Restore is destructive to the selected DB path but should not delete the previou
 | crash after manifest before migration | Future migration reuses valid restore point. |
 | crash mid-migration | SQLite rolls back current transaction. Future run reuses existing pre-upgrade snapshot and continues. |
 | crash after v6 before v9 | Existing pre-upgrade snapshot remains; v9 does not replace it. |
-| crash mid-restore | Restore journal drives resume or rollback. Never leave stale original `-wal/-shm` beside restored DB. |
+| crash mid-restore | FAIL CLOSED (Round 3 pivot). A pending marker makes `Open()`/`OpenNoMigrate()` return `ErrRestoreInterrupted` — routine opens never self-heal off a forgeable marker. Recovery (complete or roll back) runs ONLY under `snapshot restore --confirm`, holding the serve lock, after marker-schema + canonical-path validation. Never leaves stale original `-wal/-shm` beside the restored DB. See `.notes/restore-recovery-model.md`. |
 | copied DB without sidecar | New path has no restore point. No stale metadata exists. |
 | copied DB with sidecar | Valid local restore point; lineage matches because DB was copied with it. |
 | sidecar copied to unrelated DB | Restore refuses on lineage fingerprint mismatch. Prune only affects local sidecar if manifest is valid. |

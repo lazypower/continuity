@@ -1071,7 +1071,7 @@ func TestRestore_SymlinkedDBHitsRealFile(t *testing.T) {
 
 // TestRestoreMarker_RollbackAfterCrashBeforePublish simulates a crash AFTER the
 // originals were moved aside but BEFORE the staged snapshot was published
-// (DBPublished=false): the live DB is missing. resumeRestoreIfPending must ROLL
+// (DBPublished=false): the live DB is missing. recoverPendingRestore must ROLL
 // BACK — move the originals back and leave NO stale -wal/-shm at the live name.
 func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 	dir := t.TempDir()
@@ -1118,9 +1118,9 @@ func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Resume: must roll back.
-	if err := resumeRestoreIfPending(dbPath); err != nil {
-		t.Fatalf("resume rollback: %v", err)
+	// Explicit recovery (the only path that acts on a marker) must roll back.
+	if err := recoverPendingRestore(dbPath); err != nil {
+		t.Fatalf("recover rollback: %v", err)
 	}
 	// The original DB is back and openable.
 	rdb, err := OpenNoMigrate(dbPath)
@@ -1139,7 +1139,7 @@ func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 
 // TestRestoreMarker_CompleteAfterCrashAfterPublish simulates a crash AFTER the
 // staged snapshot was published (DBPublished=true) but BEFORE wal/shm scrub and
-// marker removal. resumeRestoreIfPending must COMPLETE: keep the restored DB,
+// marker removal. recoverPendingRestore must COMPLETE: keep the restored DB,
 // scrub any stale live -wal/-shm, and clear the marker.
 func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
 	dir := t.TempDir()
@@ -1171,8 +1171,8 @@ func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := resumeRestoreIfPending(dbPath); err != nil {
-		t.Fatalf("resume complete: %v", err)
+	if err := recoverPendingRestore(dbPath); err != nil {
+		t.Fatalf("recover complete: %v", err)
 	}
 	// Stale wal/shm scrubbed.
 	for _, suffix := range []string{"-wal", "-shm"} {
@@ -1232,9 +1232,9 @@ func TestRestoreMarker_HostileBackupPrefixRefusedAndUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = resumeRestoreIfPending(dbPath)
+	err = recoverPendingRestore(dbPath)
 	if err == nil {
-		t.Fatal("expected resume to fail closed on a marker backup prefix outside the canonical set")
+		t.Fatal("expected recovery to fail closed on a marker backup prefix outside the canonical set")
 	}
 	if !errors.Is(err, ErrSnapshotSidecarCorrupt) {
 		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", err)
@@ -1282,9 +1282,9 @@ func TestRestoreMarker_HostileStagedPathRefusedAndUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = resumeRestoreIfPending(dbPath)
+	err = recoverPendingRestore(dbPath)
 	if err == nil {
-		t.Fatal("expected resume to fail closed on a staged path outside the db dir")
+		t.Fatal("expected recovery to fail closed on a staged path outside the db dir")
 	}
 	if !errors.Is(err, ErrSnapshotSidecarCorrupt) {
 		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", err)
@@ -1315,9 +1315,9 @@ func TestRestoreMarker_SymlinkedSidecarRefusedOnResume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := resumeRestoreIfPending(dbPath)
+	err := recoverPendingRestore(dbPath)
 	if err == nil {
-		t.Fatal("expected resume to refuse a symlinked sidecar")
+		t.Fatal("expected recovery to refuse a symlinked sidecar")
 	}
 	if !errors.Is(err, ErrSnapshotSidecarCorrupt) {
 		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", err)
@@ -1329,18 +1329,18 @@ func TestRestoreMarker_SymlinkedSidecarRefusedOnResume(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// ROUND 2 Finding 2: restore/resume mutual exclusion via the serve lock.
-// A pending marker must NOT be resumed by a routine Open while ANOTHER live
-// process holds the serve lock (a restore/serve is in progress). Resume must
-// SKIP and leave the marker (and the moved-aside originals) untouched.
+// PIVOT (Findings 1, 2, 4): a routine Open NEVER resumes a restore. A pending
+// marker makes Open()/OpenNoMigrate() FAIL CLOSED with ErrRestoreInterrupted,
+// regardless of who (if anyone) holds the serve lock. Recovery happens ONLY
+// under explicit operator intent (the restore path → recoverPendingRestore).
 // ---------------------------------------------------------------------------
 
-// TestResume_SkipsWhileForeignLiveServeLockHeld plants a not-yet-published
-// marker (originals moved aside) AND a serve lock owned by a DIFFERENT live
-// process. An Open-side resume must skip recovery (the live holder owns it) —
-// it must NOT roll back the originals, so the in-progress restore is not
-// corrupted from underneath the active restorer.
-func TestResume_SkipsWhileForeignLiveServeLockHeld(t *testing.T) {
+// TestOpen_FailsClosedOnTornPrePublishState manufactures the torn pre-publish
+// window (triplet moved aside, marker present, live DB MISSING) and asserts a
+// routine Open does NOT fabricate a DB and does NOT touch the marker/originals —
+// it returns ErrRestoreInterrupted. This holds whether or not a foreign live
+// serve lock is present (Findings 1 + 2). Then explicit recovery completes it.
+func TestOpen_FailsClosedOnTornPrePublishState(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
 	buildDBAtVersionStandalone(t, dbPath, 5)
@@ -1353,8 +1353,7 @@ func TestResume_SkipsWhileForeignLiveServeLockHeld(t *testing.T) {
 	resolved, _ := resolveDBPath(dbPath)
 
 	// Manufacture the torn (pre-publish) state: move the triplet aside, stage a
-	// copy, write a not-yet-published marker. Leave the live DB MISSING — exactly
-	// the window an active restorer occupies.
+	// copy, write a not-yet-published marker. Leave the live DB MISSING.
 	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.excl.db")
 	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
 		t.Fatal(err)
@@ -1379,41 +1378,50 @@ func TestResume_SkipsWhileForeignLiveServeLockHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A DIFFERENT live process holds the serve lock (the active restorer).
+	// Routine Open must FAIL CLOSED — never fabricate a DB at the path, never
+	// resume. No serve lock is held here (nobody is actively restoring); under
+	// the pivot the open still refuses rather than self-healing.
+	if _, oerr := Open(dbPath); !errors.Is(oerr, ErrRestoreInterrupted) {
+		t.Fatalf("Open over a pending marker: err=%v, want ErrRestoreInterrupted", oerr)
+	}
+	// OpenNoMigrate must fail closed identically.
+	if _, oerr := OpenNoMigrate(dbPath); !errors.Is(oerr, ErrRestoreInterrupted) {
+		t.Fatalf("OpenNoMigrate over a pending marker: err=%v, want ErrRestoreInterrupted", oerr)
+	}
+	// The Open must NOT have fabricated a DB at the live path.
+	if _, err := os.Stat(resolved); !os.IsNotExist(err) {
+		t.Errorf("Open fabricated a DB at the live path despite a pending marker (err=%v)", err)
+	}
+	// Marker + moved-aside originals untouched.
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); err != nil {
+		t.Errorf("Open disturbed the marker: %v", err)
+	}
+	if _, err := os.Stat(backupPrefix); err != nil {
+		t.Errorf("Open disturbed the moved-aside original: %v", err)
+	}
+
+	// A foreign LIVE serve lock must not change the answer: Open still fails
+	// closed (it never even consults the lock).
 	lp, _ := serveLockPath(resolved)
 	if err := os.WriteFile(lp, []byte("1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if _, oerr := Open(dbPath); !errors.Is(oerr, ErrRestoreInterrupted) {
+		t.Fatalf("Open under a foreign live lock: err=%v, want ErrRestoreInterrupted", oerr)
+	}
+	_ = os.Remove(lp)
 
-	// Routine Open-side resume must SKIP: it must not roll the originals back.
-	if err := resumeRestoreIfPending(dbPath); err != nil {
-		t.Fatalf("resume should skip (not error) under a foreign live lock: %v", err)
-	}
-	// Marker still present (untouched), originals still moved aside, live DB
-	// still missing — the active restorer's state is undisturbed.
-	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); err != nil {
-		t.Errorf("resume removed the marker despite a live foreign lock: %v", err)
-	}
-	if _, err := os.Stat(backupPrefix); err != nil {
-		t.Errorf("resume disturbed the moved-aside original despite a live lock: %v", err)
-	}
-	if _, err := os.Stat(resolved); !os.IsNotExist(err) {
-		t.Errorf("resume re-materialized the live DB despite a live lock (err=%v)", err)
-	}
-
-	// Once the foreign holder is GONE (stale lock), resume recovers.
-	if err := os.WriteFile(lp, []byte("999999999\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := resumeRestoreIfPending(dbPath); err != nil {
-		t.Fatalf("resume after holder gone: %v", err)
+	// Explicit recovery (the restore path's primitive) rolls back and clears the
+	// marker; afterward a routine Open succeeds again.
+	if err := recoverPendingRestore(dbPath); err != nil {
+		t.Fatalf("explicit recovery: %v", err)
 	}
 	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(err) {
-		t.Errorf("marker survived resume after holder gone")
+		t.Errorf("marker survived explicit recovery")
 	}
 	rdb, err := OpenNoMigrate(dbPath)
 	if err != nil {
-		t.Fatalf("DB not recovered after holder gone: %v", err)
+		t.Fatalf("DB not recovered after explicit recovery: %v", err)
 	}
 	rdb.Close()
 }
@@ -1478,8 +1486,8 @@ func TestRestoreMarker_ResumeThroughDanglingSymlinkRecovers(t *testing.T) {
 		t.Fatal("link unexpectedly resolves; real DB should be moved aside (dangling)")
 	}
 
-	if err := resumeRestoreIfPending(link); err != nil {
-		t.Fatalf("resume through dangling symlink: %v", err)
+	if err := recoverPendingRestore(link); err != nil {
+		t.Fatalf("recover through dangling symlink: %v", err)
 	}
 	// The real DB is back (rollback moved the originals back).
 	rdb, err := OpenNoMigrate(realDB)
@@ -1922,6 +1930,531 @@ func TestCreateOwnedTemp_ExclusiveOwnership(t *testing.T) {
 	if _, err := os.Stat(reserved); !os.IsNotExist(err) {
 		t.Errorf("reserved temp name is not free: %v", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// PIVOT Finding 1: a planted marker + a hostile <db>.pre-restore.* file must NOT
+// drive a destructive rollback on a routine Open. Open fails closed
+// (ErrRestoreInterrupted); the live DB and the hostile file are both untouched.
+// ---------------------------------------------------------------------------
+
+// TestOpen_PlantedMarkerWithHostilePreRestoreFile_FailsClosed plants a marker
+// that names a canonical-looking "<db>.pre-restore.*" backup whose CONTENT is
+// attacker-controlled, alongside the intact live DB. Before the pivot, a routine
+// Open auto-rolled-back: it would rename the attacker's pre-restore file over the
+// live DB. Now Open must FAIL CLOSED and touch nothing.
+func TestOpen_PlantedMarkerWithHostilePreRestoreFile_FailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // real sidecar at dbPath.snapshot
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Record the live DB bytes so we can prove they are untouched.
+	liveBefore, err := os.ReadFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A hostile pre-restore file with a canonical prefix but attacker content. A
+	// naive rollback would os.Rename(hostile, liveDB).
+	hostilePrefix := resolved + ".pre-restore.20200101T000000Z.1"
+	const hostile = "ATTACKER-CONTROLLED ROLLBACK SOURCE"
+	if err := os.WriteFile(hostilePrefix, []byte(hostile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Plant a not-yet-published marker pointing rollback at the hostile file.
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: "",
+		BackupPrefix: hostilePrefix, MovedSuffixes: []string{""}, DBPublished: false,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// Routine Open must fail closed — never roll back off the planted marker.
+	if _, oerr := Open(dbPath); !errors.Is(oerr, ErrRestoreInterrupted) {
+		t.Fatalf("Open over planted marker: err=%v, want ErrRestoreInterrupted", oerr)
+	}
+
+	// The live DB is byte-intact (the hostile file was NOT pulled over it).
+	liveAfter, err := os.ReadFile(resolved)
+	if err != nil {
+		t.Fatalf("live DB disturbed by routine open: %v", err)
+	}
+	if string(liveAfter) != string(liveBefore) {
+		t.Error("routine Open overwrote the live DB from a planted marker's hostile pre-restore file")
+	}
+	// The hostile file is byte-intact (never consumed by a rename).
+	got, err := os.ReadFile(hostilePrefix)
+	if err != nil || string(got) != hostile {
+		t.Errorf("hostile pre-restore file disturbed: data=%q err=%v", got, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PIVOT Finding 4: a corrupt `{}` marker after a crash must make Open fail
+// closed, the marker preserved (not erased), and NO DB fabricated.
+// ---------------------------------------------------------------------------
+
+// TestOpen_CorruptEmptyMarker_FailsClosedPreservesMarker writes a `{}` marker
+// (decodes, but fails the schema gate: version 0, no fields) into the sidecar
+// with the live DB MISSING. Open must return ErrRestoreInterrupted, leave the
+// marker in place, and not fabricate a DB. Explicit recovery then refuses on the
+// schema gate too (the operator must inspect), proving the corrupt marker is
+// never silently treated as recovered.
+func TestOpen_CorruptEmptyMarker_FailsClosedPreservesMarker(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Remove the live DB triplet to simulate the torn mid-restore window.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Remove(resolved + suffix)
+	}
+
+	// Write a corrupt `{}` marker directly at the marker path.
+	markerPath := restoreMarkerPathIn(sidecar)
+	if err := os.WriteFile(markerPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open must fail closed and NOT fabricate a DB.
+	if _, oerr := Open(dbPath); !errors.Is(oerr, ErrRestoreInterrupted) {
+		t.Fatalf("Open over `{}` marker: err=%v, want ErrRestoreInterrupted", oerr)
+	}
+	if _, err := os.Stat(resolved); !os.IsNotExist(err) {
+		t.Errorf("Open fabricated a DB despite a corrupt marker (err=%v)", err)
+	}
+	// The marker must be PRESERVED byte-for-byte (never erased).
+	got, err := os.ReadFile(markerPath)
+	if err != nil || string(got) != "{}" {
+		t.Errorf("corrupt marker was disturbed: data=%q err=%v", got, err)
+	}
+
+	// Explicit recovery refuses on the schema gate (version != 1) — the corrupt
+	// marker is never acted on, and is still preserved.
+	if rerr := recoverPendingRestore(dbPath); !errors.Is(rerr, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("recovery over `{}` marker: err=%v, want ErrSnapshotSidecarCorrupt", rerr)
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Errorf("recovery erased the corrupt marker instead of failing closed: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 3: lock & sidecar keyed to the SAME real DB through a symlink whose
+// target appears later. serve and a second serve/restore must contend on ONE
+// lock (the real DB's), never on divergent link-vs-real lock paths.
+// ---------------------------------------------------------------------------
+
+// TestServeLock_SymlinkLockUnifiedWithRealTarget builds the real DB, points a
+// symlink at it, and asserts the serve lock path resolved via the LINK equals
+// the one resolved via the REAL DB — and that acquiring through the link blocks a
+// second acquire through the real path (same single on-disk lock). Before
+// Finding 3 the lock used Abs (link path) while the sidecar used the resolved
+// real path, so a serve-via-link and a restore-via-real-path contended on
+// DIFFERENT locks and could both touch the DB.
+func TestServeLock_SymlinkLockUnifiedWithRealTarget(t *testing.T) {
+	realDir := t.TempDir()
+	realDB := filepath.Join(realDir, "real.db")
+	buildDBAtVersionStandalone(t, realDB, 5)
+
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "link.db")
+	if err := os.Symlink(realDB, link); err != nil {
+		t.Fatal(err)
+	}
+
+	viaLink, err := serveLockPath(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	viaReal, err := serveLockPath(realDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if viaLink != viaReal {
+		t.Fatalf("serve lock keyed differently via link vs real:\n link=%s\n real=%s", viaLink, viaReal)
+	}
+
+	// Acquire through the LINK; a second acquire through the REAL path must see
+	// the SAME lock held (in-process single-owner → contention).
+	rel, err := AcquireServeLock(link)
+	if err != nil {
+		t.Fatalf("acquire via link: %v", err)
+	}
+	defer rel()
+	if _, aerr := AcquireServeLock(realDB); !errors.Is(aerr, ErrServeLockHeld) {
+		t.Errorf("acquire via real path while link holds the lock: err=%v, want ErrServeLockHeld", aerr)
+	}
+}
+
+// TestCanonicalDBPath_SurvivesLaterCreatedSymlinkTarget pins that the lock and
+// sidecar derivations agree even when the symlink target does not exist YET
+// (it is created later): both route through canonicalDBPath, so they cannot
+// diverge between the missing-target and present-target states.
+func TestCanonicalDBPath_SurvivesLaterCreatedSymlinkTarget(t *testing.T) {
+	realDir := t.TempDir()
+	realDB := filepath.Join(realDir, "real.db")
+
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "link.db")
+	if err := os.Symlink(realDB, link); err != nil {
+		t.Fatal(err)
+	}
+
+	// Target does not exist yet: resolution must follow the link via Readlink and
+	// agree for both lock and sidecar.
+	lockBefore, _ := serveLockPath(link)
+	sidecarBefore, _ := sidecarPath(link)
+	if filepath.Dir(lockBefore) != filepath.Dir(sidecarBefore) {
+		t.Errorf("lock/sidecar dirs diverge with missing target:\n lock=%s\n sidecar=%s", lockBefore, sidecarBefore)
+	}
+
+	// Now create the target; resolution must still agree, and the lock/sidecar
+	// must be keyed to the SAME real file as resolving the real path directly.
+	buildDBAtVersionStandalone(t, realDB, 5)
+	lockAfter, _ := serveLockPath(link)
+	realLock, _ := serveLockPath(realDB)
+	if lockAfter != realLock {
+		t.Errorf("post-create lock via link != via real:\n link=%s\n real=%s", lockAfter, realLock)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 5: directory fsync after the durability-critical renames. A full
+// power-loss can't be simulated in a unit test; we verify the helper works and
+// that the publish paths invoke it (ordering: fsync AFTER the rename).
+// ---------------------------------------------------------------------------
+
+// TestFsyncDir_SyncsAndErrorsOnNonDir verifies the helper: it fsyncs a real
+// directory without error, and returns an error for a non-existent path (so a
+// caller can log it).
+func TestFsyncDir_SyncsAndErrorsOnNonDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := fsyncDir(dir); err != nil {
+		t.Errorf("fsyncDir on a real dir: %v", err)
+	}
+	if err := fsyncDir(filepath.Join(dir, "does-not-exist")); err == nil {
+		t.Error("fsyncDir on a missing path: want error, got nil")
+	}
+}
+
+// TestWriteRestorePoint_PublishesDurably exercises the create path that fsyncs
+// the sidecar dir after the snapshot.db and manifest renames. We can't observe
+// the fsync syscall directly, but we assert the post-condition the fsync exists
+// to protect: after createRestorePoint returns, snapshot.db AND manifest.json
+// are both present and the manifest validates — i.e. the renames the fsync
+// makes durable both landed and are internally consistent.
+func TestWriteRestorePoint_PublishesDurably(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	db := openWritableNoMigrate(t, dbPath)
+	defer db.Close()
+	if err := db.createRestorePoint(5, headVersion(), 6); err != nil {
+		t.Fatalf("createRestorePoint: %v", err)
+	}
+	if _, err := os.Stat(snapshotDBPathIn(sidecar)); err != nil {
+		t.Errorf("snapshot.db not durably published: %v", err)
+	}
+	if _, err := loadValidManifest(sidecar); err != nil {
+		t.Errorf("manifest not durably published/valid: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 6: a snapshot creation that fails AFTER the sidecar dir is created
+// must remove the partial sidecar (no half-built restore point lingers), while
+// never removing a sidecar dir that pre-existed or holds foreign files.
+// ---------------------------------------------------------------------------
+
+// TestCreateRestorePoint_FailureRemovesPartialSidecar forces the snapshot image
+// to fail its post-VACUUM schema check by pointing createRestorePoint at a
+// pre-version that the live DB cannot match, and asserts the partial sidecar dir
+// it created is removed (Finding 6). The DB stays unmutated except for the
+// benign per-DB identity row (documented as identity, not tracking metadata).
+func TestCreateRestorePoint_FailureRemovesPartialSidecar(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	db := openWritableNoMigrate(t, dbPath)
+	defer db.Close()
+
+	// preVersion=4 but the live DB is at v5: the snapshot image's schema (v5) will
+	// not equal the claimed pre-upgrade v4, so writeRestorePoint fails AFTER it
+	// created the sidecar dir and VACUUM'd the image.
+	err := db.createRestorePoint(4, headVersion(), 6)
+	if err == nil {
+		t.Fatal("expected createRestorePoint to fail on a schema mismatch")
+	}
+	// The partial sidecar dir we created must be GONE — no half-built restore
+	// point lingers.
+	if _, statErr := os.Stat(sidecar); !os.IsNotExist(statErr) {
+		entries, _ := os.ReadDir(sidecar)
+		t.Errorf("partial sidecar survived a failed snapshot creation (entries=%v, err=%v)", entries, statErr)
+	}
+}
+
+// TestCreateRestorePoint_FailureKeepsPreexistingSidecar proves the cleanup is
+// scoped: if the sidecar dir PRE-EXISTED (e.g. holds an operator file), a failed
+// creation must NOT remove it — we only clean up a dir we created this call.
+func TestCreateRestorePoint_FailureKeepsPreexistingSidecar(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	// Pre-create the sidecar dir with a stray operator file.
+	if err := os.MkdirAll(sidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stray := filepath.Join(sidecar, "operator-note.txt")
+	if err := os.WriteFile(stray, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	db := openWritableNoMigrate(t, dbPath)
+	defer db.Close()
+	if err := db.createRestorePoint(4, headVersion(), 6); err == nil {
+		t.Fatal("expected createRestorePoint to fail on a schema mismatch")
+	}
+	// The pre-existing sidecar and its stray file must remain.
+	if _, err := os.Stat(stray); err != nil {
+		t.Errorf("failed creation removed a pre-existing sidecar's file: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 7: fork ambiguity is a KNOWN, DOCUMENTED limitation. cp A.db→B.db
+// makes B inherit A's instance_id; diverging B then dropping A's sidecar next to
+// B passes lineage and restores A's snapshot onto B. This test PINS that
+// behavior so it cannot change silently. The restore point protects a DB and
+// FAITHFUL COPIES of it; operators must not cross-pollinate sidecars between
+// forked copies. (See .notes/restore-recovery-model.md.)
+// ---------------------------------------------------------------------------
+
+// TestRestore_ForkAmbiguityIsPinned documents-by-test the finding-7 limitation:
+// a copy shares identity by design, so a sidecar from the source restores onto
+// the diverged copy. We assert it SUCCEEDS (lineage matches), pinning the known
+// behavior — NOT claiming protection we do not have.
+func TestRestore_ForkAmbiguityIsPinned(t *testing.T) {
+	dir := t.TempDir()
+	aPath := filepath.Join(dir, "a.db")
+	buildDBAtVersionStandalone(t, aPath, 5)
+
+	// Seed a row in A that identifies its snapshot.
+	{
+		raw, err := sql.Open("sqlite", aPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`
+			INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
+			VALUES ('mem://user/events/from-A', 'leaf', 'events', 'A-snapshot', 1, 1)`); err != nil {
+			t.Fatal(err)
+		}
+		raw.Close()
+	}
+
+	// Take A's restore point (sidecar at a.db.snapshot, lineage bound to A's id).
+	{
+		db := openWritableNoMigrate(t, aPath)
+		if err := db.createRestorePoint(5, headVersion(), 6); err != nil {
+			db.Close()
+			t.Fatalf("create A restore point: %v", err)
+		}
+		db.Close()
+	}
+
+	// cp A.db → B.db: B INHERITS A's instance_id (fork ambiguity by design).
+	bPath := filepath.Join(dir, "b.db")
+	if err := copyFile(aPath, bPath); err != nil {
+		t.Fatal(err)
+	}
+	// Diverge B: add a B-only row so we can see A's snapshot overwrite it.
+	{
+		raw, err := sql.Open("sqlite", bPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`
+			INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
+			VALUES ('mem://user/events/B-only', 'leaf', 'events', 'diverged', 2, 2)`); err != nil {
+			t.Fatal(err)
+		}
+		raw.Close()
+	}
+
+	// Transplant A's sidecar next to B (cross-pollination the docs warn against).
+	aSidecar, _ := sidecarPath(aPath)
+	bSidecar, _ := sidecarPath(bPath)
+	if err := os.MkdirAll(bSidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(snapshotDBPathIn(aSidecar), snapshotDBPathIn(bSidecar)); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(manifestPathIn(aSidecar), manifestPathIn(bSidecar)); err != nil {
+		t.Fatal(err)
+	}
+
+	// PINNED behavior: lineage matches (shared id), so restore SUCCEEDS and B now
+	// holds A's snapshot — the B-only row is gone. This is the documented fork
+	// limitation, asserted so it can't silently change.
+	if _, err := Restore(bPath); err != nil {
+		t.Fatalf("fork-ambiguity restore (pinned to SUCCEED): %v", err)
+	}
+	rdb, err := OpenNoMigrate(bPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rdb.Close()
+	var fromA, bOnly int
+	rdb.QueryRow(`SELECT COUNT(*) FROM mem_nodes WHERE uri='mem://user/events/from-A'`).Scan(&fromA)
+	rdb.QueryRow(`SELECT COUNT(*) FROM mem_nodes WHERE uri='mem://user/events/B-only'`).Scan(&bOnly)
+	if fromA != 1 {
+		t.Errorf("A's snapshot row missing after fork restore (count=%d)", fromA)
+	}
+	if bOnly != 0 {
+		t.Errorf("B-only row survived A's snapshot restore (count=%d); fork limitation changed", bOnly)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 8: boot expiry must recompute lineage and leave a transplanted/foreign
+// sidecar UNTOUCHED — never auto-delete unproven restore material.
+// ---------------------------------------------------------------------------
+
+// TestRecordSuccessfulBoot_LeavesForeignSidecarUntouched transplants A's sidecar
+// next to an unrelated DB B (different instance_id), then boots B 3× (enough to
+// hit the expiry threshold for a MATCHING sidecar). Because B's recomputed
+// lineage does not match the transplanted manifest, the boot tick must do
+// NOTHING — the foreign sidecar's snapshot.db + manifest survive all 3 boots.
+func TestRecordSuccessfulBoot_LeavesForeignSidecarUntouched(t *testing.T) {
+	dir := t.TempDir()
+	aPath := filepath.Join(dir, "a.db")
+	buildDBAtVersionStandalone(t, aPath, 5)
+	{
+		db := openWritableNoMigrate(t, aPath)
+		if err := db.createRestorePoint(5, headVersion(), 6); err != nil {
+			db.Close()
+			t.Fatalf("create A restore point: %v", err)
+		}
+		db.Close()
+	}
+	aSidecar, _ := sidecarPath(aPath)
+
+	// An unrelated DB B at head with its OWN random instance_id.
+	bPath := filepath.Join(dir, "b.db")
+	buildDBAtVersionStandalone(t, bPath, headVersion())
+	bSidecar, _ := sidecarPath(bPath)
+
+	// Transplant A's sidecar (snapshot.db + manifest) next to B verbatim.
+	if err := os.MkdirAll(bSidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(snapshotDBPathIn(aSidecar), snapshotDBPathIn(bSidecar)); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(manifestPathIn(aSidecar), manifestPathIn(bSidecar)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Boot B three times. A MATCHING sidecar would expire on the third tick; the
+	// foreign one must be left entirely alone (lineage gate).
+	for i := 0; i < 3; i++ {
+		if err := RecordSuccessfulBoot(bPath, headVersion()); err != nil {
+			t.Fatalf("boot %d against foreign sidecar: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(snapshotDBPathIn(bSidecar)); err != nil {
+		t.Errorf("foreign snapshot.db was deleted by boot expiry: %v", err)
+	}
+	if _, err := os.Stat(manifestPathIn(bSidecar)); err != nil {
+		t.Errorf("foreign manifest was deleted by boot expiry: %v", err)
+	}
+	// And the boot count must NOT have been ticked into the foreign manifest.
+	m, err := loadValidManifest(bSidecar)
+	if err != nil {
+		t.Fatalf("foreign manifest no longer valid: %v", err)
+	}
+	if m.SuccessfulBoots != 0 {
+		t.Errorf("boot tick mutated a foreign manifest: successful_boots=%d, want 0", m.SuccessfulBoots)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 9: same-process serve-lock reentry is contention, and releasing one
+// holder never strands another (single in-process owner + own-PID file removal).
+// ---------------------------------------------------------------------------
+
+// TestServeLock_SameProcessReentryIsContention acquires the serve lock, then a
+// SECOND same-process acquire must see contention (ErrServeLockHeld) rather than
+// share the single lock file. Releasing the second (failed) acquire's no-op
+// releaser must not remove the lock the first holder still owns; only the first
+// holder's release removes the file.
+func TestServeLock_SameProcessReentryIsContention(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	lp, _ := serveLockPath(dbPath)
+
+	rel1, err := AcquireServeLock(dbPath)
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+
+	// Second same-process acquire → contention, NOT a shared releaser.
+	rel2, err := AcquireServeLock(dbPath)
+	if !errors.Is(err, ErrServeLockHeld) {
+		t.Fatalf("second same-process acquire: err=%v, want ErrServeLockHeld", err)
+	}
+	// The lock file must still exist (the first holder owns it).
+	if _, serr := os.Stat(lp); serr != nil {
+		t.Errorf("lock vanished after a contended second acquire: %v", serr)
+	}
+
+	// Calling the failed acquire's (no-op) releaser must NOT strand the first
+	// holder — the lock stays.
+	rel2()
+	if _, serr := os.Stat(lp); serr != nil {
+		t.Errorf("failed-acquire releaser removed the first holder's lock: %v", serr)
+	}
+	owner, alive, _ := readServeLockOwner(lp)
+	if owner != os.Getpid() || !alive {
+		t.Errorf("first holder no longer owns the lock: owner=%d alive=%v", owner, alive)
+	}
+
+	// Now the first holder releases → the file is removed (it owns it), and a
+	// fresh acquire succeeds (the in-process ownership was cleared).
+	rel1()
+	if _, serr := os.Stat(lp); !os.IsNotExist(serr) {
+		t.Errorf("owner release did not remove the lock (err=%v)", serr)
+	}
+	rel3, err := AcquireServeLock(dbPath)
+	if err != nil {
+		t.Fatalf("re-acquire after full release: %v", err)
+	}
+	rel3()
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
