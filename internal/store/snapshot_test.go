@@ -54,9 +54,9 @@ func applyMigrationsUpTo(t *testing.T, sqlDB *sql.DB, target int) {
 	}
 }
 
-// buildDBAtVersion creates a DB file at path with schema at the given
+// buildSnapshotDBAtVersion creates a DB file at path with schema at the given
 // version. Returns nothing because the path is the input.
-func buildDBAtVersion(t *testing.T, path string, target int) {
+func buildSnapshotDBAtVersion(t *testing.T, path string, target int) {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -79,7 +79,7 @@ func TestSnapshot_CreatedBeforeRiskyMigration(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 5) // pre-v6, so v6 (risky) will run
+	buildSnapshotDBAtVersion(t, dbPath, 5) // pre-v6, so v6 (risky) will run
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -118,7 +118,7 @@ func TestSnapshot_OptOutEnvVarSkips(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 5)
+	buildSnapshotDBAtVersion(t, dbPath, 5)
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -152,7 +152,7 @@ func TestSnapshot_NotCreatedForAdditiveMigration(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 9) // current head
+	buildSnapshotDBAtVersion(t, dbPath, 9) // current head
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -223,7 +223,7 @@ func TestSnapshot_FailureBlocksMigration(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 5)
+	buildSnapshotDBAtVersion(t, dbPath, 5)
 
 	// Plant a regular FILE where the snapshots/ directory would land,
 	// so MkdirAll fails with "not a directory".
@@ -286,7 +286,7 @@ func TestSnapshot_CapturesWALActiveData(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 8) // pre-v9 so v9 (risky) triggers the snapshot
+	buildSnapshotDBAtVersion(t, dbPath, 8) // pre-v9 so v9 (risky) triggers the snapshot
 
 	// Open a keeper connection in WAL mode and write a row. Keep the
 	// connection OPEN so its close-time checkpoint does not quietly
@@ -383,7 +383,7 @@ func TestSnapshot_ContentMatchesPreMigrationState(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 5)
+	buildSnapshotDBAtVersion(t, dbPath, 5)
 
 	// Seed a v5-era row directly.
 	raw, err := sql.Open("sqlite", dbPath)
@@ -461,7 +461,7 @@ func TestSnapshot_OnlyMostRecentRetained(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 5)
+	buildSnapshotDBAtVersion(t, dbPath, 5)
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -495,7 +495,7 @@ func TestSnapshot_RetentionDeletesAfterNBoots(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 8) // v9 is risky, so this triggers exactly one snapshot
+	buildSnapshotDBAtVersion(t, dbPath, 8) // v9 is risky, so this triggers exactly one snapshot
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -539,7 +539,7 @@ func TestSnapshot_RetentionLeavesSnapshotBeforeThreshold(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 8)
+	buildSnapshotDBAtVersion(t, dbPath, 8)
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -575,7 +575,7 @@ func TestSnapshot_FilePermissions(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 8)
+	buildSnapshotDBAtVersion(t, dbPath, 8)
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -617,7 +617,7 @@ func TestSnapshot_ListReturnsRecordedFields(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 8)
+	buildSnapshotDBAtVersion(t, dbPath, 8)
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -657,7 +657,7 @@ func TestSnapshot_PruneRemovesEverything(t *testing.T) {
 
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	buildDBAtVersion(t, dbPath, 8)
+	buildSnapshotDBAtVersion(t, dbPath, 8)
 
 	db, err := Open(dbPath)
 	if err != nil {
