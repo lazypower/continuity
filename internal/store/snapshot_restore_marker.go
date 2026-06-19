@@ -88,6 +88,15 @@ type restoreMarker struct {
 	BackupPrefix   string   `json:"backup_prefix"`
 	MovedSuffixes  []string `json:"moved_suffixes"`
 	DBPublished    bool     `json:"db_published"`
+
+	// OriginalDBSHA256 is "sha256:<hex>" over the ORIGINAL live DB's bytes,
+	// recorded AT RESTORE START before the DB file is moved aside (Finding 1). On
+	// rollback, recovery verifies the moved-aside backup file's hash equals this
+	// recorded value before renaming it back over the live DB path — so a planted,
+	// stale, or corrupt `<db>.pre-restore.*` file can never be pulled over the DB.
+	// Empty only when the original DB was absent at restore start (no "" suffix in
+	// MovedSuffixes), in which case there is no DB backup to provenance-check.
+	OriginalDBSHA256 string `json:"original_db_sha256"`
 }
 
 func restoreMarkerPathIn(sidecar string) string {
@@ -204,7 +213,13 @@ type canonicalRestore struct {
 	staged     string   // canonical staged snapshot path inside the DB dir
 	backup     string   // canonical pre-restore backup prefix
 	moved      []string // subset of {"","-wal","-shm"} the marker claims it moved
-	published  bool     // the ONLY field trusted verbatim from the marker
+	published  bool     // a phase HINT from the marker — reconciled against disk
+	// originalDBSHA256 is the recorded hash of the pre-restore live DB, used to
+	// provenance-check the moved-aside backup before a rollback rename (Finding 1).
+	originalDBSHA256 string
+	// snapshotSHA256 is the validated restore point's snapshot.db hash, used to
+	// decide from DISK whether the live DB IS the restored image (Finding 1).
+	snapshotSHA256 string
 }
 
 // resolveDBPathSurvivingDangling returns the canonical DB path surviving a
@@ -289,12 +304,13 @@ func resolveCanonicalRestore(dbPath string, sidecar string, mk *restoreMarker) (
 	}
 
 	return &canonicalRestore{
-		resolvedDB: resolvedDB,
-		sidecar:    sidecar,
-		staged:     staged,
-		backup:     backup,
-		moved:      moved,
-		published:  mk.DBPublished,
+		resolvedDB:       resolvedDB,
+		sidecar:          sidecar,
+		staged:           staged,
+		backup:           backup,
+		moved:            moved,
+		published:        mk.DBPublished,
+		originalDBSHA256: mk.OriginalDBSHA256,
 	}, nil
 }
 
@@ -441,7 +457,154 @@ func recoverPendingRestore(dbPath string) error {
 	if err != nil {
 		return err
 	}
-	return finishPendingRestore(cr)
+
+	// REALITY GATE (Finding 1): never act on the marker's claimed phase until the
+	// restore point itself is PROVEN. Load + validate the restore point (manifest
+	// shape + snapshot.db sha256 + schema). If there is NO valid restore point we
+	// FAIL CLOSED and touch nothing — a planted/stale marker beside an absent or
+	// corrupt sidecar can no longer drive a destructive rename/remove.
+	vm, verr := loadValidManifest(sidecar)
+	if verr != nil {
+		// ErrNoRestorePoint or corrupt → cannot prove anything → fail closed. The
+		// marker is preserved; the operator must inspect.
+		if errors.Is(verr, ErrNoRestorePoint) {
+			return fmt.Errorf("%w: restore marker present but no valid restore point to reconcile against", ErrSnapshotSidecarCorrupt)
+		}
+		return verr
+	}
+	cr.snapshotSHA256 = vm.SnapshotSHA256
+
+	return reconcilePendingRestore(cr)
+}
+
+// reconcilePendingRestore drives a torn restore to a clean terminal state by
+// RECONCILING the marker's claimed phase against on-disk REALITY (Finding 1),
+// never by trusting the marker's db_published bit. The restore point has already
+// been proven valid (cr.snapshotSHA256 is its snapshot.db hash). This is the
+// recovery path for an UNTRUSTED, possibly planted/stale marker — distinct from
+// the in-process finishPendingRestore used by a live Restore that just moved its
+// own files.
+//
+// Decision table (all paths under the serve + op lock, marker already
+// schema/path-gated):
+//
+//   - live DB present AND hash == snapshot hash → treat as PUBLISHED: complete
+//     (scrub stale -wal/-shm, drop staged), remove the marker. NEVER roll back —
+//     a stale pre-publish marker cannot clobber the already-restored DB.
+//   - live DB absent AND DB backup present AND staged present → genuine
+//     pre-publish torn state → roll back, but ONLY after the DB backup's hash
+//     matches cr.originalDBSHA256 (provenance). A mismatch (planted/stale/corrupt
+//     backup) → FAIL CLOSED, do not rename it over the DB.
+//   - anything else (inconsistent: live DB present but != snapshot and no torn
+//     evidence, or absent DB with no usable backups/staged) → FAIL CLOSED, touch
+//     nothing. The operator inspects; we never guess.
+func reconcilePendingRestore(cr *canonicalRestore) error {
+	db := cr.resolvedDB
+
+	liveSum, livePresent, herr := hashIfPresent(db)
+	if herr != nil {
+		return fmt.Errorf("restore recover: hash live db: %w", herr)
+	}
+
+	// CASE A — the live DB already IS the restored snapshot image. Complete.
+	if livePresent && liveSum == cr.snapshotSHA256 {
+		return completeReconciled(cr)
+	}
+
+	// CASE B — genuine pre-publish torn state: the live DB is gone, the original
+	// was moved aside (DB backup present), and a staged image is waiting. Roll
+	// back to the moved-aside original after proving its provenance.
+	dbBackupPresent := cr.backup != "" && lstatExists(cr.backup) // "" suffix backup
+	stagedPresent := cr.staged != "" && lstatExists(cr.staged)
+	if !livePresent && dbBackupPresent && stagedPresent {
+		// Provenance: the DB backup must hash to the recorded original. A planted
+		// or corrupt <db>.pre-restore.* can never be renamed over the DB.
+		if cr.originalDBSHA256 == "" {
+			return fmt.Errorf("%w: rollback requested but marker recorded no original db hash to verify against", ErrSnapshotSidecarCorrupt)
+		}
+		backupSum, _, berr := hashIfPresent(cr.backup)
+		if berr != nil {
+			return fmt.Errorf("restore recover: hash db backup: %w", berr)
+		}
+		if backupSum != cr.originalDBSHA256 {
+			return fmt.Errorf("%w: pre-restore db backup hash does not match the recorded original; refusing to roll it back over the live db", ErrSnapshotSidecarCorrupt)
+		}
+		return rollbackReconciled(cr)
+	}
+
+	// Anything else is inconsistent — fail closed, touch nothing.
+	return fmt.Errorf("%w: restore marker does not match on-disk state (live present=%v, db backup present=%v, staged present=%v); refusing to guess",
+		ErrSnapshotSidecarCorrupt, livePresent, dbBackupPresent, stagedPresent)
+}
+
+// completeReconciled finishes a proven-published restore: scrub stale live
+// -wal/-shm (they belong to the OLD DB), drop any orphaned staged temp, remove
+// the marker. The live DB is the restored image and is never touched.
+func completeReconciled(cr *canonicalRestore) error {
+	db := cr.resolvedDB
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if lstatExists(db + suffix) {
+			if rmErr := os.Remove(db + suffix); rmErr != nil && !os.IsNotExist(rmErr) {
+				return fmt.Errorf("restore recover: scrub %s%s: %w", db, suffix, rmErr)
+			}
+		}
+	}
+	if cr.staged != "" {
+		_ = os.Remove(cr.staged)
+	}
+	fmt.Fprintf(os.Stderr, "  restore reconciled: live db is the restored snapshot; completed %s\n", db)
+	return removeRestoreMarker(cr.sidecar)
+}
+
+// rollbackReconciled moves the (provenance-verified) moved-aside originals back
+// into the live names and drops the staged copy. Called only after the DB
+// backup's hash was proven to match the recorded original.
+func rollbackReconciled(cr *canonicalRestore) error {
+	db := cr.resolvedDB
+	for _, suffix := range cr.moved {
+		live := db + suffix
+		backup := cr.backup + suffix
+		if !lstatExists(backup) {
+			continue // nothing to roll back for this suffix
+		}
+		if lstatExists(live) {
+			if rmErr := os.Remove(live); rmErr != nil && !os.IsNotExist(rmErr) {
+				return fmt.Errorf("restore rollback: clear %s: %w", live, rmErr)
+			}
+		}
+		if err := os.Rename(backup, live); err != nil {
+			return fmt.Errorf("restore rollback: restore %s: %w", live, err)
+		}
+	}
+	if cr.staged != "" {
+		_ = os.Remove(cr.staged)
+	}
+	fmt.Fprintf(os.Stderr, "  restore rolled back: interrupted restore of %s reverted to pre-restore state\n", db)
+	return removeRestoreMarker(cr.sidecar)
+}
+
+// lstatExists reports whether path exists (does not follow the final symlink).
+func lstatExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+// hashIfPresent returns ("sha256:<hex>", true, nil) for a present regular file,
+// ("", false, nil) when it does not exist, and a non-nil error for any other
+// stat/read failure. Used by reconciliation to learn the ACTUAL on-disk state of
+// the live DB and the moved-aside backup rather than trusting the marker.
+func hashIfPresent(path string) (string, bool, error) {
+	if _, err := os.Lstat(path); err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	sum, _, err := hashFile(path)
+	if err != nil {
+		return "", false, err
+	}
+	return sum, true, nil
 }
 
 // finishPendingRestore completes or rolls back a torn restore described by the

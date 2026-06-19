@@ -281,24 +281,14 @@ func AcquireServeLock(dbPath string) (func(), error) {
 	// failed acquire never leaves the path permanently "owned".
 
 	for attempt := 0; attempt < 2; attempt++ {
-		// Atomic create-if-absent: only one process wins the O_EXCL race.
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		// Atomic create-if-absent: the lockfile is published with the PID already
+		// written (Finding 5), so it is never observably PID-less. Only one writer
+		// wins the existence race; a pre-existing lock yields errLockfileExists.
+		err := writeLockfileAtomic(path, myPID)
 		if err == nil {
-			_, werr := f.WriteString(fmt.Sprintf("%d\n", myPID))
-			cerr := f.Close()
-			if werr != nil {
-				_ = os.Remove(path)
-				serveLockOwners.release(path)
-				return func() {}, werr
-			}
-			if cerr != nil {
-				_ = os.Remove(path)
-				serveLockOwners.release(path)
-				return func() {}, cerr
-			}
 			return makeServeLockReleaser(path, myPID), nil
 		}
-		if !os.IsExist(err) {
+		if !errors.Is(err, errLockfileExists) {
 			serveLockOwners.release(path)
 			return func() {}, err
 		}
@@ -347,10 +337,86 @@ func makeServeLockReleaser(path string, ownerPID int) func() {
 	}
 }
 
+// errLockfileExists signals that writeLockfileAtomic could not publish because a
+// lockfile already occupies path. Callers treat it exactly like an O_EXCL
+// collision on the lock path itself (re-evaluate the existing holder's liveness).
+var errLockfileExists = errors.New("store: lockfile already exists")
+
+// writeLockfileAtomic publishes a lockfile at path whose content is ALREADY the
+// owner PID, atomically (Finding 5). It O_EXCL-creates a temp in the same
+// directory with the PID written and fsync'd, then renames it into place. The
+// lockfile therefore NEVER exists in a PID-less / zero-length state observable by
+// a reader: either the file is absent, or it is the fully-written PID line.
+//
+// Atomicity for the create-if-absent contract: an os.Rename overwrites on unix,
+// so before renaming we O_EXCL-create the FINAL path as an empty sentinel to win
+// the existence race (then remove it just before the rename). If that sentinel
+// create fails with EEXIST, another holder owns the path → errLockfileExists.
+// The window between removing the sentinel and the rename is closed by the
+// in-process mutex/registry the callers already hold, so no concurrent same-DB
+// writer can slip in; a cross-process writer would itself have to win the same
+// O_EXCL sentinel, which only one process can.
+func writeLockfileAtomic(path string, pid int) error {
+	dir := filepath.Dir(path)
+	// Win the existence race with an O_EXCL sentinel at the FINAL path. A
+	// pre-existing lockfile makes this fail with EEXIST → caller re-evaluates.
+	sentinel, serr := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if serr != nil {
+		if os.IsExist(serr) {
+			return errLockfileExists
+		}
+		return serr
+	}
+	_ = sentinel.Close()
+
+	// Build the real content in an owned temp, fsync it, then atomically rename
+	// over the (empty) sentinel so the published lockfile is never PID-less.
+	f, tmp, terr := createOwnedTemp(dir, "lock.tmp.", "")
+	if terr != nil {
+		_ = os.Remove(path)
+		return terr
+	}
+	if _, werr := f.WriteString(fmt.Sprintf("%d\n", pid)); werr != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		_ = os.Remove(path)
+		return werr
+	}
+	if syncErr := f.Sync(); syncErr != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		_ = os.Remove(path)
+		return syncErr
+	}
+	if cerr := f.Close(); cerr != nil {
+		_ = os.Remove(tmp)
+		_ = os.Remove(path)
+		return cerr
+	}
+	if rerr := os.Rename(tmp, path); rerr != nil {
+		_ = os.Remove(tmp)
+		_ = os.Remove(path)
+		return rerr
+	}
+	// Best-effort durability of the directory entry; non-fatal.
+	if derr := fsyncDir(dir); derr != nil {
+		fmt.Fprintf(os.Stderr, "warning: store: fsync dir after lockfile publish: %v\n", derr)
+	}
+	return nil
+}
+
 // readServeLockOwner reads the lockfile and returns (pid, alive, err). A
-// missing lock returns (0, false, nil). An unparseable lock is reported as
-// (0, true, nil) — treated as a live lock so we fail closed rather than reclaim
-// something we cannot understand.
+// missing lock returns (0, false, nil).
+//
+// A zero-length or unparseable lockfile is reported as (0, false, nil) — i.e.
+// STALE/reclaimable, NOT live (Finding 5). Lockfiles are now written ATOMICALLY
+// (a PID is rename-published into place, never an empty O_EXCL-created file that
+// is later filled in), so a PID-less lockfile can only be a crash remnant from a
+// non-atomic writer, a truncated file, or hand-corruption — never a live holder
+// mid-write. Treating it as live forever would wedge serve/restore/migrations
+// until manual deletion; we reclaim it instead. (The previous "unparseable →
+// held" rule existed precisely because the old writer created the file before
+// writing the PID; with atomic publish that window no longer exists.)
 func readServeLockOwner(path string) (pid int, alive bool, err error) {
 	data, rerr := os.ReadFile(path)
 	if rerr != nil {
@@ -360,7 +426,7 @@ func readServeLockOwner(path string) (pid int, alive bool, err error) {
 		return 0, false, rerr
 	}
 	if _, serr := fmt.Sscanf(string(data), "%d", &pid); serr != nil || pid <= 0 {
-		return 0, true, nil // unparseable → treat as held (fail closed)
+		return 0, false, nil // zero-length / unparseable → STALE (reclaimable)
 	}
 	return pid, processAlive(pid), nil
 }
@@ -405,6 +471,24 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		return "", fmt.Errorf("restore: acquire serve lock: %w", lockErr)
 	}
 	defer releaseLock()
+
+	// ALSO acquire the snapshot OPERATION lock — the SAME lock a risky migration
+	// holds across its destructive DDL (Finding 3). The serve lock alone does not
+	// serialize restore against a DIRECT migrating Open: profile/tree/dedup reach
+	// store.Open via openDB() WITHOUT the serve lock, so a risky migration and a
+	// restore could otherwise run concurrently and restore could swap the DB out
+	// from under live SQLite handles a migration holds. Holding the op-lock here
+	// makes restore and any migrating Open serialize; the loser waits briefly then
+	// fails closed (ErrSnapshotOpLocked) rather than racing. We keep the serve lock
+	// too (it serializes restore vs serve).
+	releaseOp, opErr := acquireSnapshotOpLock(sidecar)
+	if opErr != nil {
+		if errors.Is(opErr, ErrSnapshotOpLocked) {
+			return "", errors.New("restore: a migration appears to be running against this DB; retry once it finishes")
+		}
+		return "", fmt.Errorf("restore: acquire snapshot op-lock: %w", opErr)
+	}
+	defer releaseOp()
 
 	// Drive any torn restore from a previous crash to a clean terminal state
 	// FIRST, under FULL validation: a fresh restore must never start on top of an
@@ -467,6 +551,15 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 			curVersion, m.PreSchemaVersion, m.TargetSchemaVersion)
 	}
 
+	// Record the ORIGINAL live DB's sha256 BEFORE moving it aside (Finding 1).
+	// Recovery uses this to provenance-check the moved-aside backup before ever
+	// renaming it back over the live DB: a planted/stale/corrupt
+	// <db>.pre-restore.* whose hash does not match this recorded value is refused.
+	originalDBSHA256, _, ohErr := hashFile(resolvedDB)
+	if ohErr != nil {
+		return "", fmt.Errorf("restore: hash original db: %w", ohErr)
+	}
+
 	dbDir := filepath.Dir(resolvedDB)
 
 	// Stage the snapshot to a temp file in the DB dir, then verify its hash
@@ -511,12 +604,13 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	// Write the restore marker BEFORE the first destructive rename. From here a
 	// crash is recoverable from the sidecar marker.
 	mk := &restoreMarker{
-		Version:        1,
-		RestoredDBPath: resolvedDB,
-		StagedPath:     staged,
-		BackupPrefix:   movedAsidePrefix,
-		MovedSuffixes:  movedSuffixes,
-		DBPublished:    false,
+		Version:          1,
+		RestoredDBPath:   resolvedDB,
+		StagedPath:       staged,
+		BackupPrefix:     movedAsidePrefix,
+		MovedSuffixes:    movedSuffixes,
+		DBPublished:      false,
+		OriginalDBSHA256: originalDBSHA256,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		_ = os.Remove(staged)
@@ -528,12 +622,13 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	// so it is already trusted; finishPendingRestore consumes the same shape that
 	// resume reconstructs from disk.
 	cr := &canonicalRestore{
-		resolvedDB: resolvedDB,
-		sidecar:    sidecar,
-		staged:     staged,
-		backup:     movedAsidePrefix,
-		moved:      movedSuffixes,
-		published:  false,
+		resolvedDB:       resolvedDB,
+		sidecar:          sidecar,
+		staged:           staged,
+		backup:           movedAsidePrefix,
+		moved:            movedSuffixes,
+		published:        false,
+		originalDBSHA256: originalDBSHA256,
 	}
 
 	// Move the current triplet aside to the unique pre-restore names. We do NOT
@@ -568,15 +663,11 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		fmt.Fprintf(os.Stderr, "warning: restore: fsync db dir after publish: %v\n", err)
 	}
 
-	// Mark the DB as published so a crash from here COMPLETES (never rolls back
-	// over the freshly-restored DB).
-	mk.DBPublished = true
-	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
-		// We could not record the published state. Scrub stale wal/shm and
-		// surface the error; the DB is restored but the marker is stale, which
-		// the next Open will resolve as a COMPLETE only if it reads published.
-		fmt.Fprintf(os.Stderr, "warning: restore published but marker update failed: %v\n", err)
-	}
+	// PUBLISHED. From here, the staged image IS the live DB. The pre-publish
+	// marker still says db_published:false, but a crash from this point is no
+	// longer a rollback hazard: recovery reconciles against REALITY (Finding 1) —
+	// it hashes the live DB, finds it equals the snapshot, and COMPLETES rather
+	// than rolling back over the freshly-restored DB.
 
 	// Ensure no stale -wal/-shm remain at the LIVE names. They were moved aside
 	// above, but a crash could have left a fresh one; remove any that match the
@@ -588,9 +679,11 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		}
 	}
 
-	// Restore complete — clear the marker.
-	if err := removeRestoreMarker(sidecar); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: restore succeeded but marker cleanup failed: %v\n", err)
+	// CRASH-SAFE POST-PUBLISH TRANSITION (Finding 2). The marker MUST be durably
+	// removed now; if it cannot be, FAIL LOUDLY rather than return success with a
+	// marker still on disk.
+	if err := clearPublishedRestoreMarker(sidecar, resolvedDB); err != nil {
+		return "", err
 	}
 
 	// Record the restore in the manifest (best-effort).
@@ -602,6 +695,29 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	}
 
 	return movedAsidePrefix, nil
+}
+
+// clearPublishedRestoreMarker durably removes the restore marker AFTER a
+// successful publish (Finding 2). The marker still records db_published:false at
+// this point, but the live DB now IS the snapshot, so a crash here is no longer a
+// rollback hazard (reconcilePendingRestore completes against reality). The marker
+// must nonetheless be cleared before Restore returns success: a stale
+// recovery-implying marker left behind a "success" return is exactly the state
+// the bar forbids. On removal failure we FAIL LOUDLY — the operator is told the
+// restore SUCCEEDED but the marker must be cleared by hand — rather than return
+// success. fsync the sidecar dir so the removal is durable across power loss.
+func clearPublishedRestoreMarker(sidecar, resolvedDB string) error {
+	if err := removeRestoreMarker(sidecar); err != nil {
+		return fmt.Errorf(
+			"restore: the database was restored successfully to %s, but the restore marker could not be cleared (%v); "+
+				"remove %s by hand before the next restore", resolvedDB, err, restoreMarkerPathIn(sidecar))
+	}
+	if err := fsyncDir(sidecar); err != nil {
+		// The marker file's unlink was issued; a dir-fsync failure cannot resurrect
+		// it on a sane FS. Non-fatal, but surface it.
+		fmt.Fprintf(os.Stderr, "warning: restore: fsync sidecar dir after marker removal: %v\n", err)
+	}
+	return nil
 }
 
 // resolveDBPath returns the canonical real path for a DB, matching the single

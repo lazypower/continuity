@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -1095,6 +1096,13 @@ func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
 		t.Fatal(err)
 	}
+	// Record the ORIGINAL live DB's hash BEFORE moving it aside, exactly as
+	// production Restore does — reconciliation provenance-checks the backup hash
+	// against this before rolling it back (Finding 1).
+	origSum, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var moved []string
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		src := resolved + suffix
@@ -1113,6 +1121,7 @@ func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 	mk := &restoreMarker{
 		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
+		OriginalDBSHA256: origSum,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -1138,9 +1147,12 @@ func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 }
 
 // TestRestoreMarker_CompleteAfterCrashAfterPublish simulates a crash AFTER the
-// staged snapshot was published (DBPublished=true) but BEFORE wal/shm scrub and
-// marker removal. recoverPendingRestore must COMPLETE: keep the restored DB,
-// scrub any stale live -wal/-shm, and clear the marker.
+// staged snapshot was published over the live DB but BEFORE wal/shm scrub and
+// marker removal — with the marker STILL recording db_published:false (the
+// stale-pre-publish-marker window Finding 2 addresses). recoverPendingRestore
+// must reconcile against reality: the live DB hashes equal to the snapshot, so
+// it COMPLETES (keeps the restored DB, scrubs stale -wal/-shm, clears the
+// marker) and never rolls back over the already-restored DB.
 func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
@@ -1152,10 +1164,17 @@ func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
 	db.Close()
 	sidecar, _ := sidecarPath(dbPath)
 
-	// The DB at dbPath is already the (head) live DB; pretend it is the freshly
-	// published restored image. Plant a stale -wal/-shm at the live names and a
-	// published marker. Marker fields use the RESOLVED DB path as production does.
+	// Publish the snapshot image AT the live DB path, exactly as a real restore
+	// does just before it crashes. Reconciliation determines "published" from
+	// REALITY now (Finding 1): it hashes the live DB and matches it to the
+	// snapshot, so the live file MUST actually be the snapshot image — not the
+	// stale head DB. Plant a stale -wal/-shm at the live names and a marker that
+	// still says db_published:false (the crash window this round 2 closes). Marker
+	// fields use the RESOLVED DB path as production does.
 	resolved, _ := resolveDBPath(dbPath)
+	if err := copyFile(snapshotDBPathIn(sidecar), resolved); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(dbPath+"-wal", []byte("stale-wal"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1165,7 +1184,7 @@ func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
 	mk := &restoreMarker{
 		Version: 1, RestoredDBPath: resolved, StagedPath: "",
 		BackupPrefix: resolved + ".pre-restore.x", MovedSuffixes: []string{"", "-wal", "-shm"},
-		DBPublished: true,
+		DBPublished: false,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -1358,6 +1377,10 @@ func TestOpen_FailsClosedOnTornPrePublishState(t *testing.T) {
 	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
 		t.Fatal(err)
 	}
+	origSum, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
 	backupPrefix := resolved + ".pre-restore.excl"
 	var moved []string
 	for _, suffix := range []string{"", "-wal", "-shm"} {
@@ -1373,6 +1396,7 @@ func TestOpen_FailsClosedOnTornPrePublishState(t *testing.T) {
 	mk := &restoreMarker{
 		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
+		OriginalDBSHA256: origSum,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -1455,6 +1479,10 @@ func TestRestoreMarker_ResumeThroughDanglingSymlinkRecovers(t *testing.T) {
 	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
 		t.Fatal(err)
 	}
+	origSum, _, err := hashFile(resolvedReal)
+	if err != nil {
+		t.Fatal(err)
+	}
 	backupPrefix := resolvedReal + ".pre-restore.dangle"
 	var moved []string
 	for _, suffix := range []string{"", "-wal", "-shm"} {
@@ -1470,6 +1498,7 @@ func TestRestoreMarker_ResumeThroughDanglingSymlinkRecovers(t *testing.T) {
 	mk := &restoreMarker{
 		Version: 1, RestoredDBPath: resolvedReal, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
+		OriginalDBSHA256: origSum,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -2455,6 +2484,546 @@ func TestServeLock_SameProcessReentryIsContention(t *testing.T) {
 		t.Fatalf("re-acquire after full release: %v", err)
 	}
 	rel3()
+}
+
+// ===========================================================================
+// ROUND 4 (Codex) regression tests.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Finding 1: explicit recovery RECONCILES against on-disk reality and never
+// destroys before proving. Two adversarial conditions:
+//   (a) planted marker + hostile <db>.pre-restore.* + NO valid restore point →
+//       `snapshot restore --confirm` (Restore) fails closed; live DB AND the
+//       hostile file are byte-intact.
+//   (b) rollback where the backup's hash != the recorded original → fails closed
+//       (the planted/stale/corrupt backup is never renamed over the live DB).
+// ---------------------------------------------------------------------------
+
+// TestRecover_PlantedMarkerNoValidManifest_FailsClosed is the Finding 1
+// reality-gate regression. A marker is planted beside the intact live DB with a
+// canonical-looking "<db>.pre-restore.*" backup whose CONTENT is hostile, but NO
+// valid restore point exists (no snapshot.db / manifest). Pre-fix, recovery acted
+// on the marker's claimed pre-publish phase and would rename the hostile file over
+// the live DB before discovering "no restore point". Now the reality gate loads +
+// validates the restore point FIRST; with none valid it FAILS CLOSED and touches
+// nothing. Driven through the real operator path (Restore).
+func TestRecover_PlantedMarkerNoValidManifest_FailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	// A live, openable DB at v5 — but NO restore point at all.
+	resolved, _ := resolveDBPath(dbPath)
+	sidecar, _ := sidecarPath(dbPath)
+	if err := os.MkdirAll(sidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	liveBefore, err := os.ReadFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A hostile pre-restore file with a CANONICAL prefix (passes the path gate)
+	// but attacker content. A pre-fix rollback would os.Rename(hostile, liveDB).
+	hostilePrefix := resolved + ".pre-restore.20200101T000000Z.1"
+	const hostile = "ATTACKER-CONTROLLED ROLLBACK SOURCE"
+	if err := os.WriteFile(hostilePrefix, []byte(hostile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Plant a not-yet-published marker pointing rollback at the hostile file. Note
+	// there is NO snapshot.db / manifest in the sidecar → no valid restore point.
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: "",
+		BackupPrefix: hostilePrefix, MovedSuffixes: []string{""}, DBPublished: false,
+		OriginalDBSHA256: "sha256:deadbeef",
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// The operator path must fail closed (no valid restore point to reconcile
+	// against). Restore surfaces it wrapped as "recover prior restore".
+	_, rerr := Restore(dbPath)
+	if rerr == nil {
+		t.Fatal("expected Restore to fail closed when a marker is present but no valid restore point exists")
+	}
+
+	// Live DB byte-intact — the hostile file was NOT pulled over it.
+	liveAfter, err := os.ReadFile(resolved)
+	if err != nil {
+		t.Fatalf("live DB disturbed by failed recovery: %v", err)
+	}
+	if string(liveAfter) != string(liveBefore) {
+		t.Error("failed-closed recovery overwrote the live DB from the planted marker")
+	}
+	// Hostile file byte-intact (never consumed by a rename).
+	got, err := os.ReadFile(hostilePrefix)
+	if err != nil || string(got) != hostile {
+		t.Errorf("hostile pre-restore file disturbed: data=%q err=%v", got, err)
+	}
+	// The marker is preserved (recovery never erased it).
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); err != nil {
+		t.Errorf("failed-closed recovery erased the marker: %v", err)
+	}
+}
+
+// TestRecover_RollbackBackupHashMismatch_FailsClosed is the Finding 1 provenance
+// regression. A genuine torn pre-publish state exists (live DB absent, a
+// "<db>.pre-restore." backup present, staged present, a VALID restore point), but
+// the backup file's bytes do NOT match the original DB hash recorded in the marker
+// — i.e. the backup was planted/corrupted/swapped. Recovery must FAIL CLOSED and
+// refuse to rename the unprovable backup over the live DB path.
+func TestRecover_RollbackBackupHashMismatch_FailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // creates a VALID restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Manufacture the torn pre-publish state: stage a copy, move the triplet aside,
+	// then CORRUPT the DB backup so its hash no longer matches the recorded original.
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.mismatch.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+	origSum, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupPrefix := resolved + ".pre-restore.mismatch"
+	var moved []string
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := resolved + suffix
+		if _, statErr := os.Lstat(src); statErr != nil {
+			continue
+		}
+		if err := os.Rename(src, backupPrefix+suffix); err != nil {
+			t.Fatal(err)
+		}
+		moved = append(moved, suffix)
+	}
+	// Tamper: overwrite the moved-aside DB backup with attacker bytes so its hash
+	// will NOT match origSum recorded in the marker.
+	const planted = "PLANTED BACKUP — DO NOT RESTORE ME"
+	if err := os.WriteFile(backupPrefix, []byte(planted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
+		OriginalDBSHA256: origSum, // recorded original hash — backup no longer matches
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recovery must refuse: the backup's provenance cannot be proven.
+	rerr := recoverPendingRestore(dbPath)
+	if rerr == nil {
+		t.Fatal("expected recovery to fail closed on a backup whose hash != recorded original")
+	}
+	if !errors.Is(rerr, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", rerr)
+	}
+	// The planted backup must NOT have been renamed over the live DB path.
+	if _, err := os.Stat(resolved); !os.IsNotExist(err) {
+		// If it exists, it must NOT be the planted bytes.
+		if data, _ := os.ReadFile(resolved); string(data) == planted {
+			t.Error("recovery renamed an unprovable backup over the live DB path")
+		}
+	}
+	// The planted backup is still where it was (untouched).
+	if data, _ := os.ReadFile(backupPrefix); string(data) != planted {
+		t.Errorf("recovery disturbed the unprovable backup: %q", data)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 2: a stale pre-publish marker after a successful publish must
+// reconcile to COMPLETE (never roll back over the restored DB); and the publish
+// path treats a failed marker-clear as a LOUD error (not a silent success).
+// ---------------------------------------------------------------------------
+
+// TestRecover_StalePrePublishMarkerCompletes is the Finding 2 reconcile
+// regression. The live DB already IS the snapshot image (publish succeeded), but
+// the marker still records db_published:false (the marker-clear crashed). The
+// next recovery must COMPLETE — recognize the live DB equals the snapshot — and
+// NOT roll back over the already-restored DB.
+func TestRecover_StalePrePublishMarkerCompletes(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Publish the snapshot image at the live path (publish succeeded) and record a
+	// DB backup so a naive rollback WOULD have something to revert to — proving the
+	// reconcile chooses COMPLETE over rollback purely from "live == snapshot".
+	snapSum, _, err := hashFile(snapshotDBPathIn(sidecar))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupPrefix := resolved + ".pre-restore.stale"
+	// Move the current (head) DB aside as the "original" backup, then publish the
+	// snapshot over the live path.
+	origSum, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(resolved, backupPrefix); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFile(snapshotDBPathIn(sidecar), resolved); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: the live DB now hashes to the snapshot.
+	liveSum, _, _ := hashFile(resolved)
+	if liveSum != snapSum {
+		t.Fatalf("test setup: live DB hash %s != snapshot %s", liveSum, snapSum)
+	}
+
+	// Plant a stale pre-publish marker (db_published:false) — the exact window
+	// Finding 2 addresses.
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: "",
+		BackupPrefix: backupPrefix, MovedSuffixes: []string{""}, DBPublished: false,
+		OriginalDBSHA256: origSum,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := recoverPendingRestore(dbPath); err != nil {
+		t.Fatalf("recover stale pre-publish marker: %v", err)
+	}
+	// COMPLETED: the live DB is STILL the snapshot image (never rolled back to the
+	// backup), and the marker is cleared.
+	afterSum, _, _ := hashFile(resolved)
+	if afterSum != snapSum {
+		t.Error("reconcile rolled back over the already-restored DB instead of completing")
+	}
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("marker survived complete-reconcile")
+	}
+}
+
+// TestClearPublishedMarker_FailedClearIsLoudError is the Finding 2 publish-path
+// regression: when the post-publish marker removal fails, the restore must NOT
+// return silent success — it returns a loud error telling the operator the
+// restore succeeded but the marker must be cleared. We exercise the exact seam
+// (clearPublishedRestoreMarker) with a marker the OS cannot unlink: it lives in a
+// read-only sidecar directory, so os.Remove fails with EACCES.
+func TestClearPublishedMarker_FailedClearIsLoudError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory write permissions; cannot simulate an un-removable marker")
+	}
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	resolved := dbPath
+	sidecar := dbPath + ".snapshot"
+	if err := os.MkdirAll(sidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := restoreMarkerPathIn(sidecar)
+	if err := os.WriteFile(markerPath, []byte(`{"version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Make the sidecar dir read-only so the marker cannot be unlinked.
+	if err := os.Chmod(sidecar, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sidecar, 0o700) }) // so TempDir cleanup can remove it
+
+	err := clearPublishedRestoreMarker(sidecar, resolved)
+	if err == nil {
+		t.Fatal("expected a loud error when the post-publish marker cannot be cleared")
+	}
+	// The error must name the success+manual-clear contract and the marker path.
+	if !contains(err.Error(), "restored successfully") || !contains(err.Error(), markerPath) {
+		t.Errorf("loud error missing operator guidance / marker path: %v", err)
+	}
+	// The marker is still present (we did not silently succeed).
+	if _, serr := os.Stat(markerPath); serr != nil {
+		t.Errorf("marker unexpectedly gone after a failed clear: %v", serr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 3: Restore serializes against a migrating direct Open via the snapshot
+// op-lock. A risky migration holding the op-lock and a concurrent restore must
+// NOT overlap; the restore waits then fails closed rather than swapping the DB
+// under a live migration.
+// ---------------------------------------------------------------------------
+
+// TestRestore_SerializesAgainstHeldOpLock holds the snapshot op-lock (as a risky
+// migrating Open does across its DDL) in another goroutine, then runs Restore.
+// Restore must ALSO take the op-lock; with it held it waits the bounded window
+// and FAILS CLOSED rather than swapping the DB. Pre-fix, Restore took only the
+// serve lock and would proceed concurrently with the migration.
+func TestRestore_SerializesAgainstHeldOpLock(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // creates a valid restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Record the live DB bytes so we can prove Restore did NOT swap it while the
+	// op-lock was held by the "migration".
+	liveBefore, err := os.ReadFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the op-lock for the entire duration of the Restore attempt, simulating a
+	// risky migration that holds it across its DDL.
+	releaseOp, err := acquireSnapshotOpLock(sidecar)
+	if err != nil {
+		t.Fatalf("seed op-lock: %v", err)
+	}
+
+	// Restore must NOT swap the DB while the op-lock is held: it waits the bounded
+	// window and fails closed. (The op-lock's PID-stamped lockfile records THIS
+	// process's PID; acquireSnapshotOpLock's in-process mutex serializes the
+	// goroutine, so Restore's own acquire blocks on the mutex then, once we release,
+	// could proceed — so we release only AFTER Restore returns to assert exclusion.)
+	type result struct {
+		out string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, rerr := Restore(dbPath)
+		done <- result{out, rerr}
+	}()
+
+	// Give Restore time to reach (and block on) the op-lock acquire.
+	// It must not have completed while we still hold the lock.
+	select {
+	case r := <-done:
+		releaseOp()
+		t.Fatalf("Restore completed while the op-lock was held (out=%q err=%v); it must serialize", r.out, r.err)
+	case <-time.After(300 * time.Millisecond):
+		// Good: Restore is blocked on the op-lock (or will fail closed). Now release.
+	}
+	releaseOp()
+
+	// After release, Restore either succeeded (it waited, then proceeded once the
+	// lock cleared) or failed closed on the op-lock — both are acceptable
+	// SERIALIZED outcomes. What must NOT happen is a swap WHILE the lock was held,
+	// which the select above already proved did not occur.
+	r := <-done
+	if r.err == nil {
+		// It proceeded only after the lock was free — fine. The DB is now the
+		// restored snapshot; nothing overlapped.
+		return
+	}
+	// Failed closed: the live DB must be byte-intact (never swapped under the
+	// held migration lock).
+	if !errors.Is(r.err, ErrSnapshotOpLocked) && !contains(r.err.Error(), "migration") {
+		t.Errorf("Restore failed for an unexpected reason (want op-lock serialization): %v", r.err)
+	}
+	liveAfter, rerr := os.ReadFile(resolved)
+	if rerr != nil {
+		t.Fatalf("live DB missing after serialized Restore: %v", rerr)
+	}
+	if string(liveAfter) != string(liveBefore) {
+		t.Error("Restore swapped the DB despite failing closed on the held op-lock")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 4: the snapshot opt-out disables ONLY the snapshot, never the
+// migration op-lock SERIALIZATION. Two opt-out migrations against one v5 DB must
+// serialize: one upgrades, the other waits/fails closed; no torn schema and no
+// restore point is created.
+// ---------------------------------------------------------------------------
+
+// TestMigrate_OptOutStillSerializes races migrate() across N pre-opened handles
+// on one v5 DB with CONTINUITY_DISABLE_MIGRATION_SNAPSHOT=1. Pre-fix the opt-out
+// skipped the riskyUpgrade branch entirely, so two opt-out processes could both
+// enter the destructive mem_nodes rebuild concurrently. The lock is now decoupled
+// from the opt-out: the rebuild serializes (the loser waits/fails closed /
+// SQLITE_BUSY), the seeded row survives exactly once, the DB ends at head, and NO
+// restore point is created (opt-out still suppresses the snapshot).
+func TestMigrate_OptOutStillSerializes(t *testing.T) {
+	t.Setenv(envDisableSnapshot, "1")
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	// Seed a v5 row so a torn/double rebuild would lose or duplicate it.
+	{
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`
+			INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
+			VALUES ('mem://user/events/optout-marker', 'leaf', 'events', 'survive', 1, 1)`); err != nil {
+			t.Fatal(err)
+		}
+		raw.Close()
+	}
+
+	const n = 6
+	handles := make([]*DB, n)
+	for i := range handles {
+		handles[i] = openWritableNoMigrate(t, dbPath)
+		defer handles[i].Close()
+	}
+
+	var wg sync.WaitGroup
+	var start sync.WaitGroup
+	start.Add(1)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			start.Wait()
+			errs[idx] = handles[idx].migrate()
+		}(i)
+	}
+	start.Done()
+	wg.Wait()
+
+	for i, e := range errs {
+		if e == nil || errors.Is(e, ErrSnapshotOpLocked) {
+			continue
+		}
+		if contains(e.Error(), "database is locked") || contains(e.Error(), "SQLITE_BUSY") {
+			continue
+		}
+		t.Errorf("goroutine %d: unexpected error (want success / op-lock fail-closed / SQLITE_BUSY): %v", i, e)
+	}
+
+	// Final DB at head, seeded row survives EXACTLY once (no torn/double rebuild).
+	fin, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fin.Close()
+	if v, _ := fin.SchemaVersion(); v != headVersion() {
+		t.Errorf("final schema = v%d, want head v%d", v, headVersion())
+	}
+	var cnt int
+	if err := fin.QueryRow(
+		`SELECT COUNT(*) FROM mem_nodes WHERE uri='mem://user/events/optout-marker'`).Scan(&cnt); err != nil {
+		t.Fatalf("read marker after concurrent opt-out upgrade: %v", err)
+	}
+	if cnt != 1 {
+		t.Errorf("seeded row count = %d after concurrent opt-out upgrade, want exactly 1 (torn/double rebuild)", cnt)
+	}
+	// Opt-out still means NO restore point was created.
+	sidecar, _ := sidecarPath(dbPath)
+	if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+		t.Errorf("opt-out created a sidecar despite the snapshot being disabled (err=%v)", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 5: lockfiles are published atomically (never observably PID-less), and
+// a zero-length / unparseable lockfile is treated as STALE (reclaimable), not
+// live-forever. A well-formed live-PID lock still blocks.
+// ---------------------------------------------------------------------------
+
+// TestServeLock_ZeroLengthLockReclaimed plants a ZERO-LENGTH serve lockfile (the
+// crash-window artifact the old "create then write PID" path could leave) and
+// asserts a new acquire RECLAIMS it rather than treating it as a permanent live
+// lock. Then a well-formed live-PID lock (PID 1) must still block.
+func TestServeLock_ZeroLengthLockReclaimed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	lp, _ := serveLockPath(dbPath)
+
+	// A zero-length lockfile: no PID, exactly what a crash between create and
+	// PID-write would leave under the old non-atomic writer.
+	if err := os.WriteFile(lp, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// readServeLockOwner must report it STALE (reclaimable), not live.
+	if owner, alive, err := readServeLockOwner(lp); err != nil || owner != 0 || alive {
+		t.Errorf("zero-length lock: (owner=%d alive=%v err=%v), want (0,false,nil) stale", owner, alive, err)
+	}
+	// A fresh acquire must reclaim it (succeed) and stamp OUR pid.
+	rel, err := AcquireServeLock(dbPath)
+	if err != nil {
+		t.Fatalf("acquire over zero-length lock should reclaim: %v", err)
+	}
+	owner, alive, _ := readServeLockOwner(lp)
+	if owner != os.Getpid() || !alive {
+		t.Errorf("reclaimed lock owner=%d alive=%v, want our live pid", owner, alive)
+	}
+	rel()
+
+	// An unparseable (garbage) lockfile is likewise reclaimable.
+	if err := os.WriteFile(lp, []byte("not-a-pid\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rel2, err := AcquireServeLock(dbPath)
+	if err != nil {
+		t.Fatalf("acquire over unparseable lock should reclaim: %v", err)
+	}
+	rel2()
+
+	// A WELL-FORMED live-PID lock (PID 1 is always alive) must STILL block.
+	if err := os.WriteFile(lp, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, aerr := AcquireServeLock(dbPath); !errors.Is(aerr, ErrServeLockHeld) {
+		t.Errorf("acquire over a live-PID lock: err=%v, want ErrServeLockHeld (must still block)", aerr)
+	}
+}
+
+// TestWriteLockfileAtomic_NeverPidless verifies the atomic writer: a published
+// lockfile always carries the PID (never a zero-length intermediate visible to a
+// reader), and a second write over an existing lockfile reports errLockfileExists
+// without disturbing the incumbent.
+func TestWriteLockfileAtomic_NeverPidless(t *testing.T) {
+	dir := t.TempDir()
+	lp := filepath.Join(dir, "x.serve.lock")
+
+	if err := writeLockfileAtomic(lp, 4242); err != nil {
+		t.Fatalf("writeLockfileAtomic: %v", err)
+	}
+	// The published file carries the PID — never an empty file.
+	data, err := os.ReadFile(lp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) == 0 {
+		t.Fatal("published lockfile is zero-length (PID-less)")
+	}
+	owner, _, _ := readServeLockOwner(lp)
+	if owner != 4242 {
+		t.Errorf("published lock owner = %d, want 4242", owner)
+	}
+	// A second write over the existing lock must report existence, not clobber it.
+	if err := writeLockfileAtomic(lp, 9999); !errors.Is(err, errLockfileExists) {
+		t.Errorf("second write over existing lock: err=%v, want errLockfileExists", err)
+	}
+	owner2, _, _ := readServeLockOwner(lp)
+	if owner2 != 4242 {
+		t.Errorf("incumbent lock disturbed by a colliding write: owner=%d, want 4242", owner2)
+	}
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }

@@ -2,7 +2,6 @@ package store
 
 import (
 	"fmt"
-	"os"
 )
 
 type migration struct {
@@ -308,9 +307,18 @@ func (db *DB) migrate() error {
 	// (Finding 6). Fails closed — if the snapshot is required but cannot be
 	// created/validated, abort with no schema change. Skipped for fresh installs
 	// (maxApplied == 0), :memory:, and SQLite URI/DSN paths.
+	//
+	// SERIALIZATION IS DECOUPLED FROM THE SNAPSHOT OPT-OUT (Finding 4): a risky
+	// on-disk upgrade against an eligible path acquires the op-lock REGARDLESS of
+	// CONTINUITY_DISABLE_MIGRATION_SNAPSHOT. The env var only suppresses creating
+	// the restore point (handled inside ensureUpgradeRestorePoint*), NOT the
+	// lock/serialization boundary. Otherwise two opt-out processes could both enter
+	// the destructive mem_nodes rebuild concurrently and tear the schema. The lock
+	// still requires an eligible path (the op-lock lives beside the sidecar, which
+	// is path-derived); :memory:/URI/DSN upgrades cannot take it and the
+	// restore-point helper fails closed on them unless opted out.
 	_, hasRisky := firstPendingRiskyVersion(maxApplied)
-	riskyUpgrade := maxApplied > 0 && hasRisky &&
-		snapshotEligiblePath(db.Path) && os.Getenv(envDisableSnapshot) != "1"
+	riskyUpgrade := maxApplied > 0 && hasRisky && snapshotEligiblePath(db.Path)
 
 	if riskyUpgrade {
 		sidecar, serr := sidecarPath(db.Path)
@@ -324,16 +332,18 @@ func (db *DB) migrate() error {
 		defer releaseOp()
 
 		// Restore point first (lock already held — no re-acquire), then the DDL,
-		// all under the same op-lock so no concurrent opener can interleave.
+		// all under the same op-lock so no concurrent opener can interleave. When
+		// the snapshot is opted out, ensureUpgradeRestorePointLocked just warns and
+		// returns nil — but the op-lock above STILL serializes the rebuild.
 		if err := db.ensureUpgradeRestorePointLocked(maxApplied); err != nil {
 			return err
 		}
 		return db.runPendingMigrations()
 	}
 
-	// No risky migration pending (or opt-out / ineligible path): the restore-point
-	// helper still handles the opt-out/ineligible warnings, but no op-lock is held
-	// — non-risky ALTER-only migrations do not rewrite tables and are safe to run
+	// No risky migration pending (or ineligible path): the restore-point helper
+	// still handles the opt-out/ineligible warnings, but no op-lock is held —
+	// non-risky ALTER-only migrations do not rewrite tables and are safe to run
 	// without cross-process serialization.
 	if err := db.ensureUpgradeRestorePoint(maxApplied); err != nil {
 		return err

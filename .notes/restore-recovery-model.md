@@ -54,6 +54,91 @@ root flaw: **a forgeable marker drove destructive action on an innocent open.**
    open. The operator re-runs `snapshot restore --confirm`, which recovers under
    the lock with full proof. Recovery never moves an unproven file over the live DB.
 
+## Recovery RECONCILES against reality (Round 4, Findings 1 & 2)
+
+The third-round model still drove recovery off the marker's *claimed* phase
+(`db_published`) and its path fields, validating lineage only *after* it had
+already begun. A planted or stale marker beside an absent/corrupt restore point
+could therefore remove the live DB and rename a `<db>.pre-restore.*` file over it
+before failing with "no restore point". The recovery contract is now:
+
+1. **Schema + path gates first** (unchanged): `validateMarkerSchema`, then
+   `resolveCanonicalRestore` constrains every marker path to this DB's canonical
+   set. Anything outside fails closed untouched.
+
+2. **REALITY GATE — prove the restore point BEFORE touching anything.** Recovery
+   calls `loadValidManifest` (manifest shape + `snapshot.db` sha256 + schema).
+   **If there is NO valid restore point, FAIL CLOSED — touch nothing.** A
+   forged/stale marker can no longer trigger a destructive rename/remove.
+
+3. **Determine the ACTUAL state from disk, never the `db_published` bit**
+   (`reconcilePendingRestore`):
+   - **live DB present AND its sha256 == the snapshot's sha256** → treat as
+     PUBLISHED: complete (scrub stale `-wal`/`-shm`, drop staged), remove the
+     marker. **Never roll back** — a stale pre-publish marker cannot clobber the
+     already-restored DB.
+   - **live DB absent AND the DB backup present AND staged present** → genuine
+     pre-publish torn state → roll back, **but only after provenance**: the
+     moved-aside backup's sha256 must equal `original_db_sha256`, which Restore
+     records in the marker **at restore start, before moving the DB aside**. A
+     mismatch (planted/stale/corrupt backup) → FAIL CLOSED; the unprovable file is
+     never renamed over the DB.
+   - **anything else (inconsistent)** → FAIL CLOSED, touch nothing.
+
+4. **Crash-safe post-publish transition (Finding 2).** After a real publish the
+   marker is durably removed (`clearPublishedRestoreMarker`: remove + `fsyncDir`).
+   If it cannot be cleared, Restore **fails LOUDLY** — it returns an error telling
+   the operator the restore SUCCEEDED but the marker must be cleared by hand —
+   rather than returning success with a recovery-implying marker. Combined with
+   the reality gate (live == snapshot ⇒ complete), a marker still saying
+   `db_published:false` after a successful publish can no longer cause a future
+   rollback: the next recovery hashes the live DB, sees it equals the snapshot,
+   and COMPLETES.
+
+   The intermediate `db_published:true` marker write was REMOVED — it was the
+   stale-marker hazard, and the disk-truth reconcile makes the phase bit advisory.
+
+### Threat model for the provenance check
+
+The `original_db_sha256` provenance check defends the realistic **crash /
+corruption / stale-marker** cases: a `<db>.pre-restore.*` left by a crash, a
+truncated/partially-written backup, or a marker an attacker planted to point
+rollback at a hostile file. It is **NOT** claimed to stop a local attacker who
+already owns the DB directory — such an attacker can corrupt the live DB directly,
+and could also recompute a matching hash into the marker. The guarantee is: a
+mismatched/unprovable backup is **never** renamed over the live DB, and recovery
+**never destroys before proving** a valid restore point exists.
+
+## Restore serializes against migrating opens (Finding 3)
+
+`Restore` now acquires the snapshot **operation lock** (`acquireSnapshotOpLock`)
+in addition to the serve lock. Direct CLI commands (profile/tree/dedup) migrate
+via `openDB()` → `store.Open` **without** the serve lock; a risky migration holds
+the op-lock across its destructive DDL. Holding the op-lock in Restore makes
+restore and any migrating Open serialize — the loser waits the bounded window then
+fails closed (`ErrSnapshotOpLocked`), so a restore can never swap the DB out from
+under SQLite handles a live migration holds. The serve lock is still held too
+(serializes restore vs serve).
+
+## Migration serialization is decoupled from the snapshot opt-out (Finding 4)
+
+A risky on-disk upgrade against an eligible path acquires the op-lock **regardless
+of** `CONTINUITY_DISABLE_MIGRATION_SNAPSHOT`. The env var suppresses only
+*creating the restore point* (inside `ensureUpgradeRestorePoint*`), never the
+lock/serialization boundary. Two opt-out processes can therefore no longer both
+enter the destructive `mem_nodes` rebuild concurrently and tear the schema; one
+upgrades, the other waits/fails closed.
+
+## Lockfiles are atomic and PID-less files are reclaimable (Finding 5)
+
+Serve/op lockfiles are now published **atomically** (`writeLockfileAtomic`):
+an O_EXCL temp containing the PID is fsync'd and renamed into place, so the
+lockfile is **never observably PID-less**. Correspondingly, an existing
+**zero-length / unparseable** lockfile is treated as **STALE/reclaimable**, not as
+a permanent live lock — closing the wedge where a crash between "create file" and
+"write PID" left a PID-less lock that blocked serve/restore/migrations forever. A
+well-formed live-PID lock still blocks.
+
 ## One path resolution rule (Finding 3)
 
 `canonicalDBPath` is the single derivation for the real DB path. Both

@@ -608,11 +608,21 @@ func (db *DB) ensureUpgradeRestorePointLocked(preVersion int) error {
 	if !hasRisky {
 		return nil
 	}
-	// Eligibility + opt-out were already checked by migrate() before taking the
-	// lock (this path is only entered for an eligible, non-opt-out risky upgrade),
-	// but re-assert eligibility defensively rather than assume.
+	// Eligibility was already checked by migrate() before taking the lock (this
+	// path is only entered for an eligible risky upgrade), but re-assert
+	// defensively rather than assume.
 	if !snapshotEligiblePath(db.Path) {
 		return fmt.Errorf("%w: %q", ErrSnapshotUnsupportedPath, db.Path)
+	}
+	// Opt-out skips ONLY the snapshot, never the serialization (Finding 4): migrate()
+	// holds the op-lock around this call AND the subsequent DDL regardless, so two
+	// opt-out upgrades still serialize. Here we simply decline to create the restore
+	// point and let the (locked) migration proceed.
+	if os.Getenv(envDisableSnapshot) == "1" {
+		fmt.Fprintf(os.Stderr,
+			"warning: %s=1; skipping migration restore point before risky upgrade (pre v%d)\n",
+			envDisableSnapshot, preVersion)
+		return nil
 	}
 	target := headVersion()
 	if err := db.createRestorePointLocked(preVersion, target, firstRisky); err != nil {
@@ -1008,18 +1018,8 @@ func acquireSnapshotOpLock(sidecar string) (func(), error) {
 	unlock := func() { mu.Unlock() }
 
 	for attempt := 0; attempt < snapshotOpLockWaitAttempts; attempt++ {
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		err := writeLockfileAtomic(path, myPID)
 		if err == nil {
-			_, werr := f.WriteString(fmt.Sprintf("%d\n", myPID))
-			cerr := f.Close()
-			if werr != nil || cerr != nil {
-				_ = os.Remove(path)
-				unlock()
-				if werr != nil {
-					return func() {}, werr
-				}
-				return func() {}, cerr
-			}
 			return func() {
 				if owner, _, oerr := readServeLockOwner(path); oerr == nil && owner == myPID {
 					_ = os.Remove(path)
@@ -1027,7 +1027,7 @@ func acquireSnapshotOpLock(sidecar string) (func(), error) {
 				unlock()
 			}, nil
 		}
-		if !os.IsExist(err) {
+		if !errors.Is(err, errLockfileExists) {
 			unlock()
 			return func() {}, err
 		}
