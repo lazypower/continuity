@@ -12,7 +12,7 @@ LDFLAGS := -X $(CLI_PKG).Version=$(VERSION) \
 
 PLATFORMS := darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64
 
-.PHONY: build test clean run ui dist
+.PHONY: build test vet clean run ui dist
 
 ui:
 	devbox run -- bash -c 'cd ui && npm install && npm run build'
@@ -22,8 +22,15 @@ ui:
 build: ui
 	devbox run -- go build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/continuity
 
+# Tests use -tags noembed so the UI dist is not a prerequisite — keeps
+# `make test` runnable on a fresh clone without first running `make ui`.
+# The subprocess e2e test (internal/cli/retract_e2e_test.go) likewise builds
+# the binary it spawns with -tags noembed.
 test:
-	devbox run -- go test ./... -v
+	devbox run -- go test -tags noembed ./... -v
+
+vet:
+	devbox run -- go vet -tags noembed ./...
 
 dist: ui
 	@mkdir -p dist

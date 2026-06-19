@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +18,24 @@ import (
 	"github.com/lazypower/continuity/internal/store"
 	"github.com/spf13/cobra"
 )
+
+// Server-side environment variables, read at serve start. These exist to make
+// hermetic subprocess tests possible (and pave the way for TFIDF CI coverage),
+// not as the production configuration surface — Phase 1 config.toml loading
+// remains the path for normal use.
+const (
+	envServeDB       = "CONTINUITY_DB"       // overrides Database.Path
+	envServePort     = "CONTINUITY_PORT"     // overrides Server.Port (int)
+	envServeBind     = "CONTINUITY_BIND"     // overrides Server.Bind
+	envServeEmbedder = "CONTINUITY_EMBEDDER" // "tfidf" | "ollama" | "none" | "" (auto)
+)
+
+// tfidfBestEffortNotice is surfaced once at startup whenever TFIDF is the active
+// embedder (forced or fallback). TFIDF is best-effort by construction — the
+// corpus IS the model — so operators should know the tradeoff they're running
+// with, plus a one-line pointer to the upgrade path. The README's "Embedding
+// backends" section spells out the two shipped paths (Ollama / TFIDF). Issue #22.
+const tfidfBestEffortNotice = "  ! tfidf: retraction-dedup recall is best-effort; install Ollama (nomic-embed-text) for stronger guarantees — see README \"Embedding backends\""
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -30,6 +50,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
 		cfg.LLM.Provider = "anthropic"
 		cfg.LLM.AnthropicKey = key
+	}
+
+	if err := applyServeEnvOverrides(&cfg); err != nil {
+		return err
 	}
 
 	// Resolve database path
@@ -71,13 +95,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 			embeddingModel = "nomic-embed-text"
 		}
 
-		if engine.ProbeOllama(ollamaURL, embeddingModel) {
+		choice := resolveEmbedderChoice(ollamaURL, embeddingModel)
+		switch choice {
+		case "ollama":
 			emb := engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768)
 			if eng != nil {
 				eng.SetEmbedder(emb)
 			}
 			fmt.Fprintf(os.Stderr, "  embedder: ollama (%s)\n", embeddingModel)
-		} else {
+		case "tfidf":
 			emb, tfidfErr := engine.NewTFIDFEmbedder(db, 512)
 			if tfidfErr != nil {
 				fmt.Fprintf(os.Stderr, "warning: tfidf embedder init failed: %v\n", tfidfErr)
@@ -85,14 +111,30 @@ func runServe(cmd *cobra.Command, args []string) error {
 				if eng != nil {
 					eng.SetEmbedder(emb)
 				}
-				fmt.Fprintf(os.Stderr, "  embedder: tfidf (fallback)\n")
-				// TFIDF is best-effort by construction (the corpus IS the
-				// model). Surface the consequence once at startup so operators
-				// know what tradeoff they're running with, with a one-line
-				// pointer to the upgrade path. The README's "Embedding
-				// backends" section spells out the two shipped paths
-				// (Ollama / TFIDF). Issue #22.
-				fmt.Fprintln(os.Stderr, "  ! tfidf: retraction-dedup recall is best-effort; install Ollama (nomic-embed-text) for stronger guarantees — see README \"Embedding backends\"")
+				fmt.Fprintf(os.Stderr, "  embedder: tfidf (forced)\n")
+				fmt.Fprintln(os.Stderr, tfidfBestEffortNotice)
+			}
+		case "none":
+			fmt.Fprintln(os.Stderr, "  embedder: none (forced; dedup-against-retracted gate inactive)")
+		default:
+			// auto: probe Ollama, fall back to TFIDF
+			if engine.ProbeOllama(ollamaURL, embeddingModel) {
+				emb := engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768)
+				if eng != nil {
+					eng.SetEmbedder(emb)
+				}
+				fmt.Fprintf(os.Stderr, "  embedder: ollama (%s)\n", embeddingModel)
+			} else {
+				emb, tfidfErr := engine.NewTFIDFEmbedder(db, 512)
+				if tfidfErr != nil {
+					fmt.Fprintf(os.Stderr, "warning: tfidf embedder init failed: %v\n", tfidfErr)
+				} else {
+					if eng != nil {
+						eng.SetEmbedder(emb)
+					}
+					fmt.Fprintf(os.Stderr, "  embedder: tfidf (fallback)\n")
+					fmt.Fprintln(os.Stderr, tfidfBestEffortNotice)
+				}
 			}
 		}
 
@@ -142,4 +184,43 @@ func runServe(cmd *cobra.Command, args []string) error {
 	defer cancel()
 
 	return httpServer.Shutdown(ctx)
+}
+
+// applyServeEnvOverrides mutates cfg with values from CONTINUITY_* env vars.
+// Invalid values (e.g. a non-integer port) are returned as errors so the
+// server fails fast rather than silently ignoring them.
+func applyServeEnvOverrides(cfg *config.Config) error {
+	if v := strings.TrimSpace(os.Getenv(envServeDB)); v != "" {
+		cfg.Database.Path = v
+	}
+	if v := strings.TrimSpace(os.Getenv(envServeBind)); v != "" {
+		cfg.Server.Bind = v
+	}
+	if v := strings.TrimSpace(os.Getenv(envServePort)); v != "" {
+		port, err := strconv.Atoi(v)
+		if err != nil || port < 0 || port > 65535 {
+			return fmt.Errorf("%s=%q: must be an integer in [0, 65535]", envServePort, v)
+		}
+		cfg.Server.Port = port
+	}
+	return nil
+}
+
+// resolveEmbedderChoice translates the CONTINUITY_EMBEDDER env var into one of
+// {"ollama", "tfidf", "none", "auto"}. Unknown values fall back to "auto" with
+// a warning so a typo never silently bypasses the embedder. The ollamaURL and
+// embeddingModel arguments are unused today; they exist so future validation
+// (e.g. require Ollama reachable when forced) can land without a signature
+// change.
+func resolveEmbedderChoice(ollamaURL, embeddingModel string) string {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(envServeEmbedder)))
+	switch v {
+	case "", "auto":
+		return "auto"
+	case "ollama", "tfidf", "none":
+		return v
+	default:
+		fmt.Fprintf(os.Stderr, "warning: unrecognized %s=%q; falling back to auto\n", envServeEmbedder, v)
+		return "auto"
+	}
 }
