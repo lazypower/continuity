@@ -227,7 +227,26 @@ Continuity uses an LLM for memory extraction and semantic search. Three options:
 
 Haiku handles bulk extraction. The Claude CLI provider (`claude -p`) is free with a Max subscription — no API key needed.
 
-For embeddings: Ollama with `nomic-embed-text` if available, otherwise falls back to TF-IDF (zero external dependencies).
+## Embedding backends
+
+Continuity needs an embedder for semantic search and for the dedup-against-retracted gate (the safety net that catches a PII-shaped memory being re-written after retraction). Two paths ship today, in probe order:
+
+**1. Ollama with `nomic-embed-text` — recommended.**
+
+```bash
+ollama serve            # daemon
+ollama pull nomic-embed-text
+```
+
+Free, runs locally, embeddings come from a fixed pre-trained model so the vector space is consistent across writes and across process restarts. This is the path Continuity is developed and tested against. Use this if dedup-against-retracted recall matters — and it matters for any user who has used `retract` to remove PII.
+
+**2. Built-in TFIDF — fallback, best-effort.**
+
+Zero external dependencies. Used automatically when Ollama is unreachable, so a fresh install always has *something*. The cost: TFIDF rebuilds its vocabulary from the local corpus on each startup, so the vector space drifts as the corpus grows or changes. The retraction-induced component of that drift is contained (issue #22 — the IDF table includes retracted nodes so cosine similarity stays coherent across a retraction). The corpus-growth component is not. The hard gate at `sim ≥ 0.65` still fires for direct rewrites; near-duplicates that would have been caught under Ollama may slip through.
+
+This path is shipped and tested — but it is not the path Continuity is developed against day-to-day. Use it if you can't run a daemon and are okay with degraded retraction-gate recall.
+
+**Picking a path.** If you care about the retraction gate, install Ollama. If you're running Continuity casually and the worst case of a soft duplicate slipping through is "I have to dedup manually later," the built-in TFIDF fallback is fine.
 
 ## CLI
 

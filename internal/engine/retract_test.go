@@ -283,3 +283,87 @@ func TestRetractedMatchError_NoCategoryOrTagInline(t *testing.T) {
 		}
 	}
 }
+
+// TestFindRetractedMatches_TFIDFCorpusCoherent is the asserted regression
+// test for issue #22. Reproduces the production scenario:
+//
+//  1. Process A seeds + embeds N leaves under TFIDF Embedder A.
+//  2. Process A retracts one leaf.
+//  3. Process B starts and builds TFIDF Embedder B from the current corpus
+//     (the realistic restart path; the in-process embedder doesn't rebuild).
+//  4. A fresh write semantically identical to the retracted memory comes in.
+//     The gate must still fire — the candidate's fresh embedding (from
+//     Embedder B) must still match the stored vector (computed under A).
+//
+// Pre-fix, Embedder B's IDF table differed from Embedder A's because the
+// retracted leaf's vocabulary contributed to A but not to B — vectors lived
+// in different spaces, cosine similarity degraded, and the smoke test in
+// smoke_test.go could only `logf` rather than assert. With the fix
+// (corpus = ListLeavesIncludingRetracted), both IDFs are identical and the
+// gate fires deterministically.
+func TestFindRetractedMatches_TFIDFCorpusCoherent(t *testing.T) {
+	db := testDB(t)
+	mock := &llm.MockClient{Response: &llm.Response{Content: "[]"}}
+	eng := New(db, mock)
+	ctx := context.Background()
+
+	// Step 1: seed under Embedder A, embed, save vectors.
+	live := seedAndEmbed(t, eng, "events", "live-event",
+		"Live event with overlapping wording about a captured detail",
+		"Body content with enough length to pass validation thresholds easily.")
+	retracted := seedAndEmbed(t, eng, "events", "retracted-event",
+		"User captured their personal home street address by accident in chat",
+		"Body content with enough length to pass validation thresholds easily.")
+
+	embedderA, err := NewTFIDFEmbedder(db, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.SetEmbedder(embedderA)
+	for _, uri := range []string{live, retracted} {
+		n, err := db.GetNodeByURI(uri)
+		if err != nil {
+			t.Fatalf("GetNodeByURI(%s): %v", uri, err)
+		}
+		if n == nil {
+			t.Fatalf("GetNodeByURI(%s): node not found after seed", uri)
+		}
+		if err := eng.EmbedNode(ctx, n); err != nil {
+			t.Fatalf("EmbedNode(%s): %v", uri, err)
+		}
+	}
+
+	// Step 2: retract the victim.
+	if _, err := db.RetractNode(retracted, "PII captured in error", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 3: simulate a process restart by building Embedder B fresh from
+	// the post-retraction corpus. Pre-fix, this used ListLeaves() and the
+	// retracted node's vocabulary dropped out, shifting IDF weights.
+	embedderB, err := NewTFIDFEmbedder(db, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.SetEmbedder(embedderB)
+
+	// Step 4: a fresh write semantically identical to the retracted memory.
+	// The default-threshold gate must fire — recall must be preserved across
+	// the embedder rebuild that straddled the retraction.
+	matches, err := eng.findRetractedMatches(ctx,
+		"User captured their personal home street address by mistake in conversation",
+		"events", defaultSimilarityThreshold)
+	if err != nil {
+		t.Fatalf("findRetractedMatches: %v", err)
+	}
+
+	found := false
+	for _, m := range matches {
+		if m.URI == retracted {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("regression: gate failed to find retracted node %s after embedder rebuild — corpus coherence broken (issue #22). matches=%d", retracted, len(matches))
+	}
+}
