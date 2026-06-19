@@ -228,7 +228,13 @@ func (db *DB) TickSnapshotRetention() error {
 
 	for _, p := range expired {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "warning: could not delete expired snapshot %s: %v\n", p, err)
+			// Removal genuinely failed (permission denied, a snapshot DB held
+			// open on Windows, etc.). Keep the tracking row so the file stays
+			// visible to `snapshot list/prune` and a future retention tick can
+			// retry the delete. Dropping the row here would strand the file on
+			// disk, untracked and unreclaimable.
+			fmt.Fprintf(os.Stderr, "warning: could not delete expired snapshot %s: %v (will retry next boot)\n", p, err)
+			continue
 		}
 		if _, err := db.Exec(`DELETE FROM migration_snapshots WHERE snapshot_path = ?`, p); err != nil {
 			return fmt.Errorf("remove expired row: %w", err)

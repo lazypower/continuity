@@ -47,16 +47,8 @@ func init() {
 	snapshotCmd.AddCommand(snapshotPruneCmd)
 }
 
-func openDBForSnapshot() (*store.DB, error) {
-	dbPath, err := store.DefaultDBPath()
-	if err != nil {
-		return nil, fmt.Errorf("resolve db path: %w", err)
-	}
-	return store.Open(dbPath)
-}
-
 func runSnapshotList(cmd *cobra.Command, args []string) error {
-	db, err := openDBForSnapshot()
+	db, err := openDB()
 	if err != nil {
 		return err
 	}
@@ -86,7 +78,7 @@ func runSnapshotList(cmd *cobra.Command, args []string) error {
 }
 
 func runSnapshotPrune(cmd *cobra.Command, args []string) error {
-	db, err := openDBForSnapshot()
+	db, err := openDB()
 	if err != nil {
 		return err
 	}

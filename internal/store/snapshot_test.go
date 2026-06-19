@@ -563,6 +563,61 @@ func TestSnapshot_RetentionLeavesSnapshotBeforeThreshold(t *testing.T) {
 	}
 }
 
+// TestSnapshot_RetentionKeepsRowWhenRemoveFails pins the failure-path contract:
+// when os.Remove can't delete an expired snapshot file (permission denied, a DB
+// held open on Windows, etc.), TickSnapshotRetention must KEEP the tracking row
+// so the file stays visible to `snapshot list/prune` and a later tick can retry.
+// Dropping the row on a failed remove would strand the file on disk, untracked
+// and unreclaimable — a silent leak of exactly the data we promised to manage.
+func TestSnapshot_RetentionKeepsRowWhenRemoveFails(t *testing.T) {
+	t.Setenv(EnvNoMigrationSnapshot, "")
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	buildSnapshotDBAtVersion(t, dbPath, 8) // v9 is risky → one snapshot recorded
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	snaps, _ := db.ListMigrationSnapshots()
+	if len(snaps) != 1 {
+		t.Fatalf("setup: expected 1 snapshot row, got %d", len(snaps))
+	}
+	snapPath := snaps[0].Path
+
+	// Make the snapshot path undeletable in a portable way: replace the file
+	// with a NON-EMPTY directory. os.Remove on a non-empty dir fails with a
+	// non-IsNotExist error (ENOTEMPTY) on every OS — no permission games.
+	if err := os.Remove(snapPath); err != nil {
+		t.Fatalf("setup: remove real snapshot file: %v", err)
+	}
+	if err := os.MkdirAll(snapPath, 0o700); err != nil {
+		t.Fatalf("setup: mkdir at snapshot path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(snapPath, "blocker"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("setup: write blocker file: %v", err)
+	}
+
+	// Tick past the threshold. Each tick will try (and fail) to remove the
+	// "file"; the row must survive every time.
+	for i := 0; i < SnapshotRetentionBoots+1; i++ {
+		if err := db.TickSnapshotRetention(); err != nil {
+			t.Fatalf("tick %d returned error; a failed os.Remove must not fail the tick: %v", i+1, err)
+		}
+	}
+
+	after, _ := db.ListMigrationSnapshots()
+	if len(after) != 1 {
+		t.Fatalf("row must survive while its file can't be deleted; got %d rows", len(after))
+	}
+	if after[0].Path != snapPath {
+		t.Errorf("surviving row path = %q, want %q", after[0].Path, snapPath)
+	}
+}
+
 // =========================================================================
 // Permissions
 // =========================================================================
