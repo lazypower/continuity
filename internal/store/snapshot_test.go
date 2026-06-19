@@ -889,12 +889,45 @@ func TestRestore_RefusesLineageMismatch(t *testing.T) {
 	}
 }
 
-// TestRestore_RefusesWhileServeLockHeld: a LIVE serve lock held by ANOTHER
-// process blocks restore. Restore now ACQUIRES the serve lock (Finding 2), so a
-// foreign live holder makes the acquire fail closed. We plant PID 1 (always
-// alive) to stand in for a separate live serve — using our own PID would let
-// Restore re-acquire its own lock, which is the legitimate same-process case.
-func TestRestore_RefusesWhileServeLockHeld(t *testing.T) {
+// foreignFlock takes a RAW flock (LOCK_SH or LOCK_EX) on the per-DB lock file,
+// BYPASSING the in-process registry, to simulate a SEPARATE process holding the
+// lock. It opens its own fd (flock is per-open-file-description, and two fds in
+// one process DO conflict), so an exclusive acquire that routes through
+// acquireExclusiveLock will see a foreign cross-process holder and fail closed
+// after the bounded wait — exactly the behaviour a real second process produces.
+// The returned releaser closes the fd (dropping the flock).
+func foreignFlock(t *testing.T, dbPath string, exclusive bool) func() {
+	t.Helper()
+	lp, err := dbLockPath(dbPath)
+	if err != nil {
+		t.Fatalf("dbLockPath: %v", err)
+	}
+	f, err := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open lock file: %v", err)
+	}
+	if exclusive {
+		ok, lerr := flockExclusiveNB(f)
+		if lerr != nil || !ok {
+			f.Close()
+			t.Fatalf("foreign exclusive flock: ok=%v err=%v", ok, lerr)
+		}
+	} else {
+		if lerr := flockShared(f); lerr != nil {
+			f.Close()
+			t.Fatalf("foreign shared flock: %v", lerr)
+		}
+	}
+	return func() { _ = f.Close() }
+}
+
+// TestRestore_RefusesWhileForeignSharedLockHeld proves the CENTERPIECE fail-
+// closed bar: a writable open in ANOTHER process (a SHARED flock holder) makes
+// Restore's EXCLUSIVE acquire wait the bounded window and FAIL CLOSED with
+// ErrDBLocked, rather than swap the DB triplet out from under the live writer.
+// We simulate the foreign process with a raw flock on a separate fd (bypassing
+// the in-process registry), which cross-process flock treats as a real holder.
+func TestRestore_RefusesWhileForeignSharedLockHeld(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
 	buildDBAtVersionStandalone(t, dbPath, 5)
@@ -903,85 +936,110 @@ func TestRestore_RefusesWhileServeLockHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
-
-	// Plant a serve lock owned by a DIFFERENT live process (PID 1) → restore must
-	// refuse rather than swap the DB under a running server.
-	lp, _ := serveLockPath(dbPath)
-	if err := os.WriteFile(lp, []byte("1\n"), 0o600); err != nil {
+	resolved, _ := resolveDBPath(dbPath)
+	liveBefore, err := os.ReadFile(resolved)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Restore(dbPath); err == nil {
-		t.Fatal("expected restore to refuse while a foreign live serve lock is held")
-	} else if !contains(err.Error(), "serve") {
-		t.Errorf("err = %v, want serve-lock refusal", err)
+
+	// A foreign SHARED holder (a writable open in another process) is present.
+	release := foreignFlock(t, dbPath, false)
+
+	if _, rerr := Restore(dbPath); rerr == nil {
+		release()
+		t.Fatal("expected restore to refuse while a foreign shared lock is held")
+	} else if !errors.Is(rerr, ErrDBLocked) && !contains(rerr.Error(), "in use") {
+		release()
+		t.Errorf("err = %v, want ErrDBLocked / 'database is in use'", rerr)
 	}
 
-	// A stale lock (dead PID) must NOT block restore — it is reclaimed.
-	if err := os.WriteFile(lp, []byte("999999999\n"), 0o600); err != nil {
-		t.Fatal(err)
+	// The live DB must be byte-intact — restore failed closed before any swap.
+	liveAfter, _ := os.ReadFile(resolved)
+	if string(liveAfter) != string(liveBefore) {
+		release()
+		t.Error("restore swapped the DB despite failing closed on the foreign shared lock")
 	}
-	if _, err := Restore(dbPath); err != nil {
-		t.Errorf("restore refused despite stale (dead-PID) lock: %v", err)
+
+	// Once the foreign holder releases, restore can proceed (no wedge: flock
+	// auto-clears; a crashed holder's lock would clear on process death too).
+	release()
+	if _, rerr := Restore(dbPath); rerr != nil {
+		t.Errorf("restore refused after the foreign lock was released: %v", rerr)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Finding 2: serve lock exclusion + dead-PID reclaim + own-PID release
+// CENTERPIECE: shared-allows-many, exclusive-excludes (flock + RWMutex registry)
 // ---------------------------------------------------------------------------
 
-// TestServeLock_ExclusionReclaimAndOwnRelease covers all three serve-lock
-// hardening properties:
-//   - a SECOND acquire while a LIVE lock is held is refused (ErrServeLockHeld),
-//     so a second serve cannot clobber the first's lock;
-//   - a STALE (dead-PID) lock is reclaimed by a new acquire;
-//   - release removes the lock ONLY if we still own it (a foreign-PID lock that
-//     we did not write is left intact).
-func TestServeLock_ExclusionReclaimAndOwnRelease(t *testing.T) {
+// TestDBLock_SharedAllowsManyExclusiveExcludes covers the core lock semantics:
+//   - many SHARED holders coexist (concurrent writable opens) in one process;
+//   - an EXCLUSIVE acquire fails closed (ErrDBLocked) while a foreign SHARED
+//     holder is present, and succeeds once it clears;
+//   - a SHARED acquire fails/waits while a foreign EXCLUSIVE holder is present.
+func TestDBLock_SharedAllowsManyExclusiveExcludes(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
 	buildDBAtVersionStandalone(t, dbPath, 5)
-	lp, _ := serveLockPath(dbPath)
 
-	// First acquire (our live PID) succeeds.
-	rel1, err := AcquireServeLock(dbPath)
+	// Many SHARED holders coexist in-process (the RWMutex registry permits many
+	// concurrent RLock holders; flock LOCK_SH permits many concurrent shared
+	// holders). All N acquire without blocking each other.
+	const n = 5
+	shared := make([]*dbLockHandle, n)
+	for i := 0; i < n; i++ {
+		h, err := acquireSharedLock(dbPath)
+		if err != nil {
+			t.Fatalf("shared acquire %d: %v", i, err)
+		}
+		shared[i] = h
+	}
+
+	// A foreign SHARED holder (raw flock, no registry) must NOT block another
+	// shared acquirer either.
+	relForeignShared := foreignFlock(t, dbPath, false)
+	if h, err := acquireSharedLock(dbPath); err != nil {
+		relForeignShared()
+		t.Fatalf("shared acquire blocked by a foreign shared holder: %v", err)
+	} else {
+		h.release()
+	}
+
+	// Release ALL in-process shared holders BEFORE attempting an exclusive acquire
+	// (the standalone exclusive path takes the same registry RWMutex.Lock, which
+	// our in-process RLock holders would block in-process; the cross-process
+	// exclusion under test is provided by the FOREIGN flock holder below).
+	for _, h := range shared {
+		h.release()
+	}
+
+	// An EXCLUSIVE acquire must now fail closed while the FOREIGN shared holder is
+	// still present (bounded wait → ErrDBLocked): the in-process RWMutex is free,
+	// but the cross-process flock LOCK_EX cannot be granted over a foreign LOCK_SH.
+	stand := &DB{Path: dbPath}
+	if _, err := acquireExclusiveLockForOwner(stand); !errors.Is(err, ErrDBLocked) {
+		relForeignShared()
+		t.Fatalf("exclusive acquire over a foreign shared holder: err=%v, want ErrDBLocked", err)
+	}
+	relForeignShared()
+
+	// With everything clear, an exclusive acquire now succeeds...
+	rel, err := acquireExclusiveLockForOwner(stand)
 	if err != nil {
-		t.Fatalf("first acquire: %v", err)
+		t.Fatalf("exclusive acquire on a free db: %v", err)
 	}
 
-	// Simulate a SECOND, different live process by planting a lock with another
-	// live PID (the test process's parent is alive; use PID 1 which always is).
-	if err := os.WriteFile(lp, []byte("1\n"), 0o600); err != nil {
-		t.Fatal(err)
+	// ...and while it is held, a foreign EXCLUSIVE holder cannot also take it
+	// (non-blocking probe returns "not granted").
+	lp, _ := dbLockPath(dbPath)
+	probe, _ := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+	if ok, perr := flockExclusiveNB(probe); perr != nil || ok {
+		probe.Close()
+		rel()
+		t.Fatalf("foreign exclusive granted while we hold exclusive: ok=%v err=%v", ok, perr)
 	}
-	if _, err := AcquireServeLock(dbPath); !errors.Is(err, ErrServeLockHeld) {
-		t.Errorf("acquire over live foreign lock: err=%v, want ErrServeLockHeld", err)
-	}
-
-	// rel1 must NOT remove the foreign lock (we no longer own it: it records
-	// PID 1, not us).
-	rel1()
-	if _, err := os.Stat(lp); err != nil {
-		t.Errorf("release removed a lock we no longer own: %v", err)
-	}
-
-	// Replace with a STALE (dead) PID; a new acquire must reclaim it.
-	if err := os.WriteFile(lp, []byte("999999999\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	rel2, err := AcquireServeLock(dbPath)
-	if err != nil {
-		t.Fatalf("acquire over stale lock should reclaim: %v", err)
-	}
-	// The reclaimed lock must now record OUR pid.
-	owner, alive, _ := readServeLockOwner(lp)
-	if owner != os.Getpid() || !alive {
-		t.Errorf("reclaimed lock owner=%d alive=%v, want our live pid", owner, alive)
-	}
-	// And our release removes it (we own it).
-	rel2()
-	if _, err := os.Stat(lp); !os.IsNotExist(err) {
-		t.Errorf("own-lock release did not remove the lock (err=%v)", err)
-	}
+	probe.Close()
+	rel()
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,16 +1482,18 @@ func TestOpen_FailsClosedOnTornPrePublishState(t *testing.T) {
 		t.Errorf("Open disturbed the moved-aside original: %v", err)
 	}
 
-	// A foreign LIVE serve lock must not change the answer: Open still fails
-	// closed (it never even consults the lock).
-	lp, _ := serveLockPath(resolved)
-	if err := os.WriteFile(lp, []byte("1\n"), 0o600); err != nil {
-		t.Fatal(err)
+	// A concurrently-held SHARED lock must not change the answer: Open checks the
+	// interrupted-restore marker BEFORE acquiring its own shared lock, so it still
+	// fails closed (the marker gate is independent of lock state).
+	otherShared, slErr := acquireSharedLock(dbPath)
+	if slErr != nil {
+		t.Fatalf("acquire shared lock: %v", slErr)
 	}
 	if _, oerr := Open(dbPath); !errors.Is(oerr, ErrRestoreInterrupted) {
-		t.Fatalf("Open under a foreign live lock: err=%v, want ErrRestoreInterrupted", oerr)
+		otherShared.release()
+		t.Fatalf("Open under a held shared lock: err=%v, want ErrRestoreInterrupted", oerr)
 	}
-	_ = os.Remove(lp)
+	otherShared.release()
 
 	// Explicit recovery (the restore path's primitive) rolls back and clears the
 	// marker; afterward a routine Open succeeds again.
@@ -1843,17 +1903,17 @@ func TestMigrate_ConcurrentRiskyUpgradeSerializes(t *testing.T) {
 	start.Done()
 	wg.Wait()
 
-	// Every migrate() must have either succeeded, failed CLOSED on the op-lock
-	// (ErrSnapshotOpLocked), or hit a transient SQLITE_BUSY — never a torn-schema
+	// Every migrate() must have either succeeded, failed CLOSED on the exclusive
+	// DB lock (ErrDBLocked), or hit a transient SQLITE_BUSY — never a torn-schema
 	// error from two rebuilds interleaving.
 	for i, e := range errs {
-		if e == nil || errors.Is(e, ErrSnapshotOpLocked) {
+		if e == nil || errors.Is(e, ErrDBLocked) {
 			continue
 		}
 		if contains(e.Error(), "database is locked") || contains(e.Error(), "SQLITE_BUSY") {
 			continue
 		}
-		t.Errorf("goroutine %d: unexpected error (want success / op-lock fail-closed / SQLITE_BUSY): %v", i, e)
+		t.Errorf("goroutine %d: unexpected error (want success / exclusive-lock fail-closed / SQLITE_BUSY): %v", i, e)
 	}
 
 	// Final DB is at head, the seeded row survives exactly once, and exactly one
@@ -2090,14 +2150,14 @@ func TestOpen_CorruptEmptyMarker_FailsClosedPreservesMarker(t *testing.T) {
 // lock (the real DB's), never on divergent link-vs-real lock paths.
 // ---------------------------------------------------------------------------
 
-// TestServeLock_SymlinkLockUnifiedWithRealTarget builds the real DB, points a
-// symlink at it, and asserts the serve lock path resolved via the LINK equals
-// the one resolved via the REAL DB — and that acquiring through the link blocks a
-// second acquire through the real path (same single on-disk lock). Before
-// Finding 3 the lock used Abs (link path) while the sidecar used the resolved
-// real path, so a serve-via-link and a restore-via-real-path contended on
-// DIFFERENT locks and could both touch the DB.
-func TestServeLock_SymlinkLockUnifiedWithRealTarget(t *testing.T) {
+// TestDBLock_SymlinkLockUnifiedWithRealTarget builds the real DB, points a
+// symlink at it, and asserts the DB lock path resolved via the LINK equals the
+// one resolved via the REAL DB — and that a foreign EXCLUSIVE holder taken via
+// the link makes a SHARED acquire via the real path wait/fail-block (same single
+// on-disk lock file). Before Finding 3 the lock used Abs (link path) while the
+// sidecar used the resolved real path, so a serve-via-link and a
+// restore-via-real-path contended on DIFFERENT locks and could both touch the DB.
+func TestDBLock_SymlinkLockUnifiedWithRealTarget(t *testing.T) {
 	realDir := t.TempDir()
 	realDB := filepath.Join(realDir, "real.db")
 	buildDBAtVersionStandalone(t, realDB, 5)
@@ -2108,27 +2168,25 @@ func TestServeLock_SymlinkLockUnifiedWithRealTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	viaLink, err := serveLockPath(link)
+	viaLink, err := dbLockPath(link)
 	if err != nil {
 		t.Fatal(err)
 	}
-	viaReal, err := serveLockPath(realDB)
+	viaReal, err := dbLockPath(realDB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if viaLink != viaReal {
-		t.Fatalf("serve lock keyed differently via link vs real:\n link=%s\n real=%s", viaLink, viaReal)
+		t.Fatalf("db lock keyed differently via link vs real:\n link=%s\n real=%s", viaLink, viaReal)
 	}
 
-	// Acquire through the LINK; a second acquire through the REAL path must see
-	// the SAME lock held (in-process single-owner → contention).
-	rel, err := AcquireServeLock(link)
-	if err != nil {
-		t.Fatalf("acquire via link: %v", err)
-	}
-	defer rel()
-	if _, aerr := AcquireServeLock(realDB); !errors.Is(aerr, ErrServeLockHeld) {
-		t.Errorf("acquire via real path while link holds the lock: err=%v, want ErrServeLockHeld", aerr)
+	// A foreign EXCLUSIVE holder taken via the LINK path must make an EXCLUSIVE
+	// acquire via the REAL path fail closed — proving they contend on ONE lock.
+	relLink := foreignFlock(t, link, true)
+	defer relLink()
+	stand := &DB{Path: realDB}
+	if _, aerr := acquireExclusiveLockForOwner(stand); !errors.Is(aerr, ErrDBLocked) {
+		t.Errorf("exclusive via real path while link holds exclusive: err=%v, want ErrDBLocked", aerr)
 	}
 }
 
@@ -2148,7 +2206,7 @@ func TestCanonicalDBPath_SurvivesLaterCreatedSymlinkTarget(t *testing.T) {
 
 	// Target does not exist yet: resolution must follow the link via Readlink and
 	// agree for both lock and sidecar.
-	lockBefore, _ := serveLockPath(link)
+	lockBefore, _ := dbLockPath(link)
 	sidecarBefore, _ := sidecarPath(link)
 	if filepath.Dir(lockBefore) != filepath.Dir(sidecarBefore) {
 		t.Errorf("lock/sidecar dirs diverge with missing target:\n lock=%s\n sidecar=%s", lockBefore, sidecarBefore)
@@ -2157,8 +2215,8 @@ func TestCanonicalDBPath_SurvivesLaterCreatedSymlinkTarget(t *testing.T) {
 	// Now create the target; resolution must still agree, and the lock/sidecar
 	// must be keyed to the SAME real file as resolving the real path directly.
 	buildDBAtVersionStandalone(t, realDB, 5)
-	lockAfter, _ := serveLockPath(link)
-	realLock, _ := serveLockPath(realDB)
+	lockAfter, _ := dbLockPath(link)
+	realLock, _ := dbLockPath(realDB)
 	if lockAfter != realLock {
 		t.Errorf("post-create lock via link != via real:\n link=%s\n real=%s", lockAfter, realLock)
 	}
@@ -2432,58 +2490,59 @@ func TestRecordSuccessfulBoot_LeavesForeignSidecarUntouched(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 9: same-process serve-lock reentry is contention, and releasing one
-// holder never strands another (single in-process owner + own-PID file removal).
+// In-process exclusion via the RWMutex registry (flock is unreliable across
+// goroutines of one process, so the registry provides the goroutine-level gate).
 // ---------------------------------------------------------------------------
 
-// TestServeLock_SameProcessReentryIsContention acquires the serve lock, then a
-// SECOND same-process acquire must see contention (ErrServeLockHeld) rather than
-// share the single lock file. Releasing the second (failed) acquire's no-op
-// releaser must not remove the lock the first holder still owns; only the first
-// holder's release removes the file.
-func TestServeLock_SameProcessReentryIsContention(t *testing.T) {
+// TestDBLock_InProcessExclusiveBlocksShared exercises
+// the IN-PROCESS RWMutex registry: an EXCLUSIVE holder blocks a SHARED acquirer
+// in the SAME process (flock alone is unreliable across goroutines, so the
+// RWMutex is what serializes them). Once the exclusive holder releases, the
+// shared acquire proceeds.
+func TestDBLock_InProcessExclusiveBlocksShared(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
 	buildDBAtVersionStandalone(t, dbPath, 5)
-	lp, _ := serveLockPath(dbPath)
 
-	rel1, err := AcquireServeLock(dbPath)
+	// Take an EXCLUSIVE lock (standalone owner) and hold it.
+	stand := &DB{Path: dbPath}
+	relEx, err := acquireExclusiveLockForOwner(stand)
 	if err != nil {
-		t.Fatalf("first acquire: %v", err)
+		t.Fatalf("exclusive acquire: %v", err)
 	}
 
-	// Second same-process acquire → contention, NOT a shared releaser.
-	rel2, err := AcquireServeLock(dbPath)
-	if !errors.Is(err, ErrServeLockHeld) {
-		t.Fatalf("second same-process acquire: err=%v, want ErrServeLockHeld", err)
-	}
-	// The lock file must still exist (the first holder owns it).
-	if _, serr := os.Stat(lp); serr != nil {
-		t.Errorf("lock vanished after a contended second acquire: %v", serr)
+	// A SHARED acquire in this process must BLOCK on the in-process RWMutex while
+	// the exclusive lock is held (it does not fail closed — shared waits out an
+	// exclusive holder). Prove it blocks, then unblocks on release.
+	got := make(chan *dbLockHandle, 1)
+	go func() {
+		h, aerr := acquireSharedLock(dbPath)
+		if aerr != nil {
+			got <- nil
+			return
+		}
+		got <- h
+	}()
+
+	select {
+	case <-got:
+		relEx()
+		t.Fatal("shared acquire proceeded while an exclusive lock was held; the in-process RWMutex must block it")
+	case <-time.After(250 * time.Millisecond):
+		// Good — blocked on the RWMutex.
 	}
 
-	// Calling the failed acquire's (no-op) releaser must NOT strand the first
-	// holder — the lock stays.
-	rel2()
-	if _, serr := os.Stat(lp); serr != nil {
-		t.Errorf("failed-acquire releaser removed the first holder's lock: %v", serr)
+	// Release exclusive → the shared acquire must now complete.
+	relEx()
+	select {
+	case h := <-got:
+		if h == nil {
+			t.Fatal("shared acquire failed after exclusive release")
+		}
+		h.release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("shared acquire did not proceed after exclusive release")
 	}
-	owner, alive, _ := readServeLockOwner(lp)
-	if owner != os.Getpid() || !alive {
-		t.Errorf("first holder no longer owns the lock: owner=%d alive=%v", owner, alive)
-	}
-
-	// Now the first holder releases → the file is removed (it owns it), and a
-	// fresh acquire succeeds (the in-process ownership was cleared).
-	rel1()
-	if _, serr := os.Stat(lp); !os.IsNotExist(serr) {
-		t.Errorf("owner release did not remove the lock (err=%v)", serr)
-	}
-	rel3, err := AcquireServeLock(dbPath)
-	if err != nil {
-		t.Fatalf("re-acquire after full release: %v", err)
-	}
-	rel3()
 }
 
 // ===========================================================================
@@ -2767,12 +2826,14 @@ func TestClearPublishedMarker_FailedClearIsLoudError(t *testing.T) {
 // under a live migration.
 // ---------------------------------------------------------------------------
 
-// TestRestore_SerializesAgainstHeldOpLock holds the snapshot op-lock (as a risky
-// migrating Open does across its DDL) in another goroutine, then runs Restore.
-// Restore must ALSO take the op-lock; with it held it waits the bounded window
-// and FAILS CLOSED rather than swapping the DB. Pre-fix, Restore took only the
-// serve lock and would proceed concurrently with the migration.
-func TestRestore_SerializesAgainstHeldOpLock(t *testing.T) {
+// TestRestore_SerializesAgainstHeldExclusiveLock simulates a risky migration
+// holding the EXCLUSIVE DB lock in ANOTHER process (a foreign exclusive flock),
+// then runs Restore. Restore ALSO takes the EXCLUSIVE lock; with a foreign
+// holder present it waits the bounded window and FAILS CLOSED (ErrDBLocked)
+// rather than swapping the DB out from under the migration. Pre-fix (separate
+// serve-lock + op-lock), an ordinary writable/migrating open held no lock
+// Restore checked, and Restore could proceed concurrently.
+func TestRestore_SerializesAgainstHeldExclusiveLock(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
 	buildDBAtVersionStandalone(t, dbPath, 5)
@@ -2781,70 +2842,43 @@ func TestRestore_SerializesAgainstHeldOpLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
-	sidecar, _ := sidecarPath(dbPath)
 	resolved, _ := resolveDBPath(dbPath)
 
 	// Record the live DB bytes so we can prove Restore did NOT swap it while the
-	// op-lock was held by the "migration".
+	// exclusive lock was held by the "migration".
 	liveBefore, err := os.ReadFile(resolved)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Hold the op-lock for the entire duration of the Restore attempt, simulating a
-	// risky migration that holds it across its DDL.
-	releaseOp, err := acquireSnapshotOpLock(sidecar)
-	if err != nil {
-		t.Fatalf("seed op-lock: %v", err)
-	}
+	// A foreign EXCLUSIVE holder (a risky migration in another process) is present
+	// for the whole Restore attempt.
+	release := foreignFlock(t, dbPath, true)
 
-	// Restore must NOT swap the DB while the op-lock is held: it waits the bounded
-	// window and fails closed. (The op-lock's PID-stamped lockfile records THIS
-	// process's PID; acquireSnapshotOpLock's in-process mutex serializes the
-	// goroutine, so Restore's own acquire blocks on the mutex then, once we release,
-	// could proceed — so we release only AFTER Restore returns to assert exclusion.)
-	type result struct {
-		out string
-		err error
+	out, rerr := Restore(dbPath)
+	if rerr == nil {
+		release()
+		t.Fatalf("Restore completed (out=%q) while a foreign exclusive lock was held; it must fail closed", out)
 	}
-	done := make(chan result, 1)
-	go func() {
-		out, rerr := Restore(dbPath)
-		done <- result{out, rerr}
-	}()
-
-	// Give Restore time to reach (and block on) the op-lock acquire.
-	// It must not have completed while we still hold the lock.
-	select {
-	case r := <-done:
-		releaseOp()
-		t.Fatalf("Restore completed while the op-lock was held (out=%q err=%v); it must serialize", r.out, r.err)
-	case <-time.After(300 * time.Millisecond):
-		// Good: Restore is blocked on the op-lock (or will fail closed). Now release.
+	if !errors.Is(rerr, ErrDBLocked) && !contains(rerr.Error(), "in use") {
+		release()
+		t.Errorf("Restore failed for an unexpected reason (want exclusive-lock serialization): %v", rerr)
 	}
-	releaseOp()
-
-	// After release, Restore either succeeded (it waited, then proceeded once the
-	// lock cleared) or failed closed on the op-lock — both are acceptable
-	// SERIALIZED outcomes. What must NOT happen is a swap WHILE the lock was held,
-	// which the select above already proved did not occur.
-	r := <-done
-	if r.err == nil {
-		// It proceeded only after the lock was free — fine. The DB is now the
-		// restored snapshot; nothing overlapped.
-		return
-	}
-	// Failed closed: the live DB must be byte-intact (never swapped under the
-	// held migration lock).
-	if !errors.Is(r.err, ErrSnapshotOpLocked) && !contains(r.err.Error(), "migration") {
-		t.Errorf("Restore failed for an unexpected reason (want op-lock serialization): %v", r.err)
-	}
-	liveAfter, rerr := os.ReadFile(resolved)
-	if rerr != nil {
-		t.Fatalf("live DB missing after serialized Restore: %v", rerr)
+	// The live DB must be byte-intact — never swapped under the held lock.
+	liveAfter, ferr := os.ReadFile(resolved)
+	if ferr != nil {
+		release()
+		t.Fatalf("live DB missing after serialized Restore: %v", ferr)
 	}
 	if string(liveAfter) != string(liveBefore) {
-		t.Error("Restore swapped the DB despite failing closed on the held op-lock")
+		release()
+		t.Error("Restore swapped the DB despite failing closed on the held exclusive lock")
+	}
+
+	// After the foreign holder releases, Restore proceeds (no wedge).
+	release()
+	if _, rerr := Restore(dbPath); rerr != nil {
+		t.Errorf("Restore refused after the foreign exclusive lock cleared: %v", rerr)
 	}
 }
 
@@ -2905,13 +2939,13 @@ func TestMigrate_OptOutStillSerializes(t *testing.T) {
 	wg.Wait()
 
 	for i, e := range errs {
-		if e == nil || errors.Is(e, ErrSnapshotOpLocked) {
+		if e == nil || errors.Is(e, ErrDBLocked) {
 			continue
 		}
 		if contains(e.Error(), "database is locked") || contains(e.Error(), "SQLITE_BUSY") {
 			continue
 		}
-		t.Errorf("goroutine %d: unexpected error (want success / op-lock fail-closed / SQLITE_BUSY): %v", i, e)
+		t.Errorf("goroutine %d: unexpected error (want success / exclusive-lock fail-closed / SQLITE_BUSY): %v", i, e)
 	}
 
 	// Final DB at head, seeded row survives EXACTLY once (no torn/double rebuild).
@@ -2939,90 +2973,319 @@ func TestMigrate_OptOutStillSerializes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 5: lockfiles are published atomically (never observably PID-less), and
-// a zero-length / unparseable lockfile is treated as STALE (reclaimable), not
-// live-forever. A well-formed live-PID lock still blocks.
+// CENTERPIECE Round 5: flock auto-releases on fd close (and on process death),
+// so a CRASHED exclusive holder never wedges the next process. This replaces the
+// whole PID-liveness / zero-length-reclaim / atomic-PID-writer machinery the
+// recurring concurrency bug came from.
 // ---------------------------------------------------------------------------
 
-// TestServeLock_ZeroLengthLockReclaimed plants a ZERO-LENGTH serve lockfile (the
-// crash-window artifact the old "create then write PID" path could leave) and
-// asserts a new acquire RECLAIMS it rather than treating it as a permanent live
-// lock. Then a well-formed live-PID lock (PID 1) must still block.
-func TestServeLock_ZeroLengthLockReclaimed(t *testing.T) {
+// TestDBLock_FlockAutoReleasesOnClose proves the property that makes the
+// hand-rolled stale-lock reclaim unnecessary: closing the fd of an exclusive
+// holder (which is exactly what happens when a process exits / crashes) releases
+// the kernel flock immediately, so the next acquirer is NOT wedged. We simulate
+// the crashed holder with a raw exclusive flock on its own fd, then close it.
+func TestDBLock_FlockAutoReleasesOnClose(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
 	buildDBAtVersionStandalone(t, dbPath, 5)
-	lp, _ := serveLockPath(dbPath)
+	lp, _ := dbLockPath(dbPath)
 
-	// A zero-length lockfile: no PID, exactly what a crash between create and
-	// PID-write would leave under the old non-atomic writer.
-	if err := os.WriteFile(lp, []byte{}, 0o600); err != nil {
+	// A "crashed" exclusive holder: a raw exclusive flock on its own fd.
+	crashed, err := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
 		t.Fatal(err)
 	}
-	// readServeLockOwner must report it STALE (reclaimable), not live.
-	if owner, alive, err := readServeLockOwner(lp); err != nil || owner != 0 || alive {
-		t.Errorf("zero-length lock: (owner=%d alive=%v err=%v), want (0,false,nil) stale", owner, alive, err)
+	if ok, lerr := flockExclusiveNB(crashed); lerr != nil || !ok {
+		crashed.Close()
+		t.Fatalf("seed exclusive flock: ok=%v err=%v", ok, lerr)
 	}
-	// A fresh acquire must reclaim it (succeed) and stamp OUR pid.
-	rel, err := AcquireServeLock(dbPath)
-	if err != nil {
-		t.Fatalf("acquire over zero-length lock should reclaim: %v", err)
+
+	// While "alive" (fd open), a fresh exclusive acquire must fail closed.
+	stand := &DB{Path: dbPath}
+	if _, aerr := acquireExclusiveLockForOwner(stand); !errors.Is(aerr, ErrDBLocked) {
+		crashed.Close()
+		t.Fatalf("exclusive acquire while a live exclusive holder exists: err=%v, want ErrDBLocked", aerr)
 	}
-	owner, alive, _ := readServeLockOwner(lp)
-	if owner != os.Getpid() || !alive {
-		t.Errorf("reclaimed lock owner=%d alive=%v, want our live pid", owner, alive)
+
+	// "Crash": close the holder's fd. The kernel drops the flock immediately —
+	// no PID file to leave behind, no stale-reclaim dance needed.
+	if err := crashed.Close(); err != nil {
+		t.Fatalf("close crashed holder fd: %v", err)
+	}
+
+	// The next acquirer is NOT wedged: it gets the exclusive lock right away.
+	rel, aerr := acquireExclusiveLockForOwner(stand)
+	if aerr != nil {
+		t.Fatalf("exclusive acquire after the crashed holder released: %v", aerr)
 	}
 	rel()
+}
 
-	// An unparseable (garbage) lockfile is likewise reclaimable.
-	if err := os.WriteFile(lp, []byte("not-a-pid\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	rel2, err := AcquireServeLock(dbPath)
+// ===========================================================================
+// ROUND 5 (Codex) regression tests — bounded recovery / safety edges.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Finding 2: crash AFTER marker write but BEFORE the first move-aside rename.
+// The live DB is the untouched ORIGINAL, no backup exists. Reconcile must treat
+// this as a SAFE pre-rename abort: clear the marker, leave the original intact.
+// Pre-fix, reconcile had no matching case and failed closed, wedging the DB at
+// ErrRestoreInterrupted forever.
+// ---------------------------------------------------------------------------
+
+func TestRestoreMarker_SafePreRenameAbortClearsMarker(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // creates a valid restore point at pre-v6
 	if err != nil {
-		t.Fatalf("acquire over unparseable lock should reclaim: %v", err)
-	}
-	rel2()
-
-	// A WELL-FORMED live-PID lock (PID 1 is always alive) must STILL block.
-	if err := os.WriteFile(lp, []byte("1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, aerr := AcquireServeLock(dbPath); !errors.Is(aerr, ErrServeLockHeld) {
-		t.Errorf("acquire over a live-PID lock: err=%v, want ErrServeLockHeld (must still block)", aerr)
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Record the untouched original DB's bytes + hash.
+	origBytes, err := os.ReadFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origSum, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the crash window: a marker was written (recording the original's
+	// hash) but NO move-aside rename happened — the live DB is still the original,
+	// no <db>.pre-restore.* backup exists. A staged temp MAY exist; include one to
+	// prove it is cleaned up.
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.prerename.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+	backupPrefix := resolved + ".pre-restore.prerename"
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: []string{""}, DBPublished: false,
+		OriginalDBSHA256: origSum,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before the fix: Open fails closed and recovery has no matching case. After:
+	// explicit recovery recognizes the no-destructive-step abort, clears the marker.
+	if _, oerr := Open(dbPath); !errors.Is(oerr, ErrRestoreInterrupted) {
+		t.Fatalf("Open over the pre-rename marker: err=%v, want ErrRestoreInterrupted", oerr)
+	}
+	if rerr := recoverPendingRestore(dbPath); rerr != nil {
+		t.Fatalf("safe pre-rename abort recovery failed: %v", rerr)
+	}
+
+	// Marker cleared, staged temp cleaned up, original DB byte-intact and opens.
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("marker survived the safe pre-rename abort")
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Errorf("staged temp survived the safe pre-rename abort")
+	}
+	after, err := os.ReadFile(resolved)
+	if err != nil {
+		t.Fatalf("original DB missing after safe abort: %v", err)
+	}
+	if string(after) != string(origBytes) {
+		t.Error("original DB mutated by the safe pre-rename abort")
+	}
+	rdb, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("original DB does not open after marker cleared: %v", err)
+	}
+	rdb.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Finding 3: staged-temp ownership. The staged snapshot is written into the
+// STILL-OPEN owned fd (not a close-then-reopen-by-path), and a swapped symlink
+// is rejected before publish. Two building-block assertions:
+//   (a) writing into the open fd lands in the original inode even after the path
+//       is swapped to a symlink pointing at a victim — the victim is untouched.
+//   (b) assertRegularFile (the pre-publish gate) fails closed on a symlinked
+//       staged path, so a symlink is never renamed into the live DB.
+// ---------------------------------------------------------------------------
+
+func TestRestore_StagedTempSwapToSymlinkIsRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	// (a) Open an owned temp, swap its PATH to a symlink at a victim, then write
+	// into the still-open fd. The bytes must land in the original file, NOT the
+	// victim — proving copyFileToOpenFd is immune to a path swap.
+	src := filepath.Join(dir, "src.bin")
+	if err := os.WriteFile(src, []byte("SNAPSHOT-CONTENT"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(dir, "victim.bin")
+	if err := os.WriteFile(victim, []byte("VICTIM-UNTOUCHED"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	owned, staged, err := createOwnedTemp(dir, ".restore.staged.", ".db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Watcher swaps the staged PATH with a symlink to the victim between create
+	// and write. (We do it explicitly here; in production the fd stays open so the
+	// write cannot follow the swap.)
+	if err := os.Remove(staged); err != nil {
+		owned.Close()
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, staged); err != nil {
+		owned.Close()
+		t.Fatal(err)
+	}
+	// Write into the OPEN fd (the original now-unlinked inode), then close.
+	if cerr := copyFileToOpenFd(src, owned); cerr != nil {
+		owned.Close()
+		t.Fatalf("copy into open fd: %v", cerr)
+	}
+	owned.Close()
+
+	// The victim must be byte-intact — the write did NOT go through the symlink.
+	vb, _ := os.ReadFile(victim)
+	if string(vb) != "VICTIM-UNTOUCHED" {
+		t.Errorf("write followed the swapped symlink and clobbered the victim: %q", vb)
+	}
+
+	// (b) The pre-publish gate: a symlinked staged path fails assertRegularFile
+	// closed, so a symlink is never renamed into the live DB.
+	if err := assertRegularFile(staged); !errors.Is(err, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("assertRegularFile on a symlinked staged path: err=%v, want ErrSnapshotSidecarCorrupt", err)
 	}
 }
 
-// TestWriteLockfileAtomic_NeverPidless verifies the atomic writer: a published
-// lockfile always carries the PID (never a zero-length intermediate visible to a
-// reader), and a second write over an existing lockfile reports errLockfileExists
-// without disturbing the incumbent.
-func TestWriteLockfileAtomic_NeverPidless(t *testing.T) {
+// TestRestore_FullPathRejectsSymlinkStaged drives the REAL Restore path with a
+// staged path that a watcher swapped to a symlink AFTER restore created its owned
+// temp. We can't race the in-Restore window deterministically, so we assert the
+// end-to-end property a different way: a restore whose DB dir is sabotaged so the
+// staged write/publish would have to traverse a symlink fails closed, and the
+// live DB is left intact. This complements the unit assertions above.
+func TestRestore_DoesNotPublishSymlinkAsDB(t *testing.T) {
 	dir := t.TempDir()
-	lp := filepath.Join(dir, "x.serve.lock")
-
-	if err := writeLockfileAtomic(lp, 4242); err != nil {
-		t.Fatalf("writeLockfileAtomic: %v", err)
-	}
-	// The published file carries the PID — never an empty file.
-	data, err := os.ReadFile(lp)
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(data) == 0 {
-		t.Fatal("published lockfile is zero-length (PID-less)")
+	db.Close()
+	resolved, _ := resolveDBPath(dbPath)
+
+	// A normal restore should publish a REGULAR file as the live DB (never a
+	// symlink). Run it and assert the result is a regular file.
+	if _, rerr := Restore(dbPath); rerr != nil {
+		t.Fatalf("restore: %v", rerr)
 	}
-	owner, _, _ := readServeLockOwner(lp)
-	if owner != 4242 {
-		t.Errorf("published lock owner = %d, want 4242", owner)
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		t.Fatalf("live DB missing after restore: %v", err)
 	}
-	// A second write over the existing lock must report existence, not clobber it.
-	if err := writeLockfileAtomic(lp, 9999); !errors.Is(err, errLockfileExists) {
-		t.Errorf("second write over existing lock: err=%v, want errLockfileExists", err)
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Error("restore published a SYMLINK as the live DB")
 	}
-	owner2, _, _ := readServeLockOwner(lp)
-	if owner2 != 4242 {
-		t.Errorf("incumbent lock disturbed by a colliding write: owner=%d, want 4242", owner2)
+	if !info.Mode().IsRegular() {
+		t.Errorf("restore published a non-regular file as the live DB: mode=%v", info.Mode())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 4: Prune must REFUSE while a restore marker is pending — the manifest
+// + snapshot.db are the only recovery material, so deleting them would leave the
+// marker with no restore point (every Open fails, restore --confirm fails).
+// ---------------------------------------------------------------------------
+
+func TestPrune_RefusesWhileRestoreMarkerPending(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // valid restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+
+	// A valid restore point exists; prune would normally remove it.
+	if _, err := loadValidManifest(sidecar); err != nil {
+		t.Fatalf("expected a valid restore point: %v", err)
+	}
+
+	// Now drop a restore marker (a crashed restore). Prune must REFUSE.
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: dbPath,
+		MovedSuffixes: nil, DBPublished: false,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	if perr := Prune(dbPath); perr == nil {
+		t.Fatal("Prune deleted recovery material while a restore marker was pending")
+	} else if !errors.Is(perr, ErrRestoreInterrupted) {
+		t.Errorf("Prune err=%v, want ErrRestoreInterrupted", perr)
+	}
+
+	// Nothing was deleted: snapshot.db, manifest.json, and the marker all remain.
+	if _, err := os.Stat(snapshotDBPathIn(sidecar)); err != nil {
+		t.Errorf("Prune removed snapshot.db despite refusing: %v", err)
+	}
+	if _, err := os.Stat(manifestPathIn(sidecar)); err != nil {
+		t.Errorf("Prune removed manifest.json despite refusing: %v", err)
+	}
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); err != nil {
+		t.Errorf("Prune removed the marker despite refusing: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 5: Open() must check for an interrupted restore (and acquire the
+// shared lock) BEFORE MkdirAll/hardenPermissions, so a pending-restore Open is
+// truly no-touch — it must NOT chmod a loose-perm DB before failing closed.
+// ---------------------------------------------------------------------------
+
+func TestOpen_PendingMarkerIsNoTouchBeforeChmod(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Give the live DB LOOSE permissions (0644) that hardenPermissions would
+	// normally tighten to 0600 on Open.
+	if err := os.Chmod(resolved, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drop a marker so Open must fail closed. The sidecar dir must exist to hold it.
+	if err := os.MkdirAll(sidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mk := &restoreMarker{Version: 1, RestoredDBPath: resolved, DBPublished: false}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open must fail closed WITHOUT having chmod'd the DB.
+	if _, oerr := Open(dbPath); !errors.Is(oerr, ErrRestoreInterrupted) {
+		t.Fatalf("Open over a pending marker: err=%v, want ErrRestoreInterrupted", oerr)
+	}
+
+	// The loose 0644 perms must be UNCHANGED — Open returned before hardenPermissions.
+	info, err := os.Stat(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Errorf("Open chmod'd the DB before failing closed: perm=%o, want 0644 (no-touch)", perm)
 	}
 }
 

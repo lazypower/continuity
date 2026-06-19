@@ -2,13 +2,11 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -69,39 +67,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Ensure the DB parent directory exists BEFORE acquiring the serve lock. The
-	// lock file lives beside the DB, so a first-ever serve into a missing parent
-	// (default ~/.continuity, or a nested CONTINUITY_DB) would otherwise fail to
-	// create the lock and serve would exit before ever opening the DB. Open()
-	// also creates this dir, but the lock is acquired first now (see below), so
-	// the dir must exist first. 0700 mirrors store.Open's MkdirAll perms.
-	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("create db dir: %w", err)
-		}
-	}
-
-	// Acquire the serve lock BEFORE opening the DB. Open() runs migrations,
-	// which may create a restore point and rewrite tables — that whole window
-	// must be covered so a second serve cannot race in (or have the DB swapped
-	// under it by a concurrent restore). A LIVE lock held by another process
-	// means another serve already owns this DB: refuse to start rather than
-	// run two servers against one database. A stale (dead-PID) lock is
-	// reclaimed automatically.
-	release, lockErr := store.AcquireServeLock(dbPath)
-	if lockErr != nil {
-		if errors.Is(lockErr, store.ErrServeLockHeld) {
-			return fmt.Errorf(
-				"%w (db %s); stop the other server first", lockErr, dbPath)
-		}
-		return fmt.Errorf("acquire serve lock: %w", lockErr)
-	}
-	defer release()
-
 	// Record this binary's version in any restore-point manifest the upcoming
 	// Open() writes (it runs migrations, which may create a snapshot).
 	store.SetSnapshotCreatedByVersion("continuity " + VersionString())
 
+	// Open the DB. store.Open now takes a SHARED advisory lock (flock) held for
+	// the connection's lifetime and covering the migration window: a concurrent
+	// EXCLUSIVE holder (a restore in progress) makes the shared acquire wait then
+	// re-check the interrupted-restore marker, and a risky migration upgrades to
+	// EXCLUSIVE internally. Serve no longer needs a separate serve-lock — multiple
+	// serves coexisting is fine for SHARED reads/writes through SQLite's own
+	// locking, while a restore is what must (and does) exclude them. If a restore
+	// is in progress, Open fails closed (ErrRestoreInterrupted or a lock error)
+	// and serve refuses to start. db.Close() releases the shared lock.
 	db, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)

@@ -321,20 +321,27 @@ func (db *DB) migrate() error {
 	riskyUpgrade := maxApplied > 0 && hasRisky && snapshotEligiblePath(db.Path)
 
 	if riskyUpgrade {
-		sidecar, serr := sidecarPath(db.Path)
-		if serr != nil {
-			return serr
-		}
-		releaseOp, lerr := acquireSnapshotOpLock(sidecar)
+		// EXCLUSIVE lock for the restore-point-creation + migration-loop span. This
+		// folds the prior op-lock into the unified flock-based exclusive lock: it
+		// serializes the destructive DDL against every other writable open (which
+		// hold a SHARED lock) AND against a concurrent Restore (also EXCLUSIVE). The
+		// loser of an exclusive contention waits the bounded window then fails closed
+		// (ErrDBLocked) rather than racing into the CREATE/COPY/DROP/RENAME rebuild.
+		//
+		// NB: the caller (store.Open) already holds a SHARED lock on this DB for the
+		// open's lifetime. flock is per-open-file-description, so this fresh
+		// EXCLUSIVE acquire opens its OWN fd and is not blocked by our own shared fd;
+		// the in-process RWMutex, however, is NOT re-entrant — see migrateExclusive.
+		release, lerr := db.acquireMigrateExclusive()
 		if lerr != nil {
 			return lerr
 		}
-		defer releaseOp()
+		defer release()
 
 		// Restore point first (lock already held — no re-acquire), then the DDL,
-		// all under the same op-lock so no concurrent opener can interleave. When
-		// the snapshot is opted out, ensureUpgradeRestorePointLocked just warns and
-		// returns nil — but the op-lock above STILL serializes the rebuild.
+		// all under the same exclusive lock so no concurrent opener can interleave.
+		// When the snapshot is opted out, ensureUpgradeRestorePointLocked just warns
+		// and returns nil — but the exclusive lock above STILL serializes the rebuild.
 		if err := db.ensureUpgradeRestorePointLocked(maxApplied); err != nil {
 			return err
 		}

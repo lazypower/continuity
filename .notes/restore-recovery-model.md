@@ -1,5 +1,10 @@
 # Restore Recovery Model — fail-closed pivot (Round 3)
 
+> **Round 5 update (Codex):** the hand-rolled PID serve-lock / op-lock was
+> REPLACED by an OS-flock shared/exclusive lock. See **"OS flock lock discipline
+> (Round 5)"** below; the Round-3/4 "serve lockfile" / "op-lock" sections are
+> historical context for what the flock lock replaces.
+
 This note records the recovery contract for the migration restore point after the
 third cross-model adversarial review (Codex) found the prior crash-recovery model
 itself unsafe. The operator approved a model pivot; this is the model now in code.
@@ -205,3 +210,81 @@ faithful copy apart from the original. **Operators must not move/copy a `<db>.sn
 sidecar between forked copies of one database.** This behavior is PINNED by
 `TestRestore_ForkAmbiguityIsPinned` so it cannot change silently; if a future
 version adds fork divergence detection, that test is the one to revisit.
+
+## OS flock lock discipline (Round 5) — replaces the hand-rolled PID lock
+
+The fifth cross-model adversarial review (Codex) found the hand-rolled PID
+lockfile the recurring source of concurrency bugs:
+
+- **(Round-5 Finding 1)** the "atomic" PID lockfile created a zero-length
+  sentinel at the final path before the PID rename. A peer observing that window
+  treated it as stale, removed it, and BOTH processes ended up "holding" the lock.
+- **(Round-5 Finding 5)** restore only excluded serve + risky migrations; ordinary
+  writable opens (dedup/remember/retract/import/extract via `openDB()` / `store.Open`)
+  held NO lock, so `snapshot restore --confirm` could rename the DB triplet out from
+  under an active SQLite connection.
+
+### The lock
+
+A proper advisory lock on a per-DB lock file `<resolvedDB>.lock`, keyed through the
+single `canonicalDBPath` derivation (same real DB as the sidecar/backups):
+
+- **Cross-process:** `flock(2)` — `LOCK_SH` / `LOCK_EX` (unix, `snapshot_proc_unix.go`),
+  `LockFileEx`/`UnlockFileEx` (windows, `snapshot_proc_windows.go`). flock is
+  kernel-managed (no zero-length window) and **auto-releases on close AND on
+  process death**, so the PID-liveness / stale-reclaim / zero-length machinery the
+  bug came from is DELETED.
+- **In-process:** a process-local `RWMutex` registry keyed by the canonical lock
+  path (flock across goroutines of one process is unreliable). `SHARED = RLock +
+  LOCK_SH`; `EXCLUSIVE = Lock + LOCK_EX`. (`snapshot_lock.go`.)
+
+### Discipline
+
+- Every **WRITABLE open** (`store.Open`, used by serve AND `openDB()` CLI commands)
+  takes a **SHARED** lock held for the connection's lifetime (released by `DB.Close`).
+- **Restore** takes an **EXCLUSIVE** lock for the whole operation — non-blocking with
+  a bounded wait: if shared/other holders exist it waits ~5s then **FAILS CLOSED**
+  (`ErrDBLocked`, "database is in use; stop other continuity processes and retry").
+  This is what makes restore exclude EVERY writable open, not just serve.
+- A **risky migration** takes EXCLUSIVE across restore-point creation + the migration
+  loop. Because the writable `Open` already holds SHARED, the risky path **downgrades**:
+  release shared → take exclusive (bounded, fail-closed) → run → re-acquire shared.
+  (flock is per-open-file-description: two fds of one process DO conflict, so the
+  shared fd must be released before the exclusive acquire; the in-process RWMutex is
+  not re-entrant either. See `acquireMigrateExclusive`.)
+- A new writable open while EXCLUSIVE is held cannot reach `sql.Open` — `Open` checks
+  the interrupted-restore marker AND acquires SHARED (which `LOCK_SH` blocks until the
+  exclusive restore releases) BEFORE any `MkdirAll`/`hardenPermissions` (Round-5
+  Finding 5: a pending-restore Open is truly no-touch, failing closed before any
+  chmod/mkdir).
+- **Reads** (`OpenNoMigrate`, status, prune inspection) do NOT take the lock —
+  EXCEPT prune's deletion and restore's recovery, which run under the exclusive
+  restore (or are gated by the pending-marker refusal, below).
+- **serve** no longer takes a dedicated serve-lock: it relies on `store.Open`'s SHARED
+  lock, and refuses to start if it cannot get its shared open (an exclusive restore in
+  progress → `ErrRestoreInterrupted` / lock error). A crashed exclusive holder's flock
+  auto-releases, so a dead serve never wedges the next process.
+
+The marker-based `ErrRestoreInterrupted` fail-closed on `Open` is KEPT and is
+orthogonal: it detects a CRASHED restore, while the flock lock excludes LIVE writers.
+
+## Bounded recovery / safety edges (Round 5)
+
+- **Finding 2 — safe pre-rename abort.** A crash AFTER the marker write but BEFORE
+  the first move-aside rename leaves the live DB as the untouched ORIGINAL with no
+  backup. `reconcilePendingRestore` now has CASE A2: live DB present AND
+  `live_hash == original_db_sha256` AND no DB backup ⇒ no destructive step happened
+  ⇒ clear the marker, drop any staged temp, leave the original intact. Without it
+  the DB was wedged at `ErrRestoreInterrupted` forever.
+- **Finding 3 — staged-temp ownership.** Restore no longer close-then-reopens the
+  staged path by name. It copies the snapshot into the STILL-OPEN owned fd
+  (`copyFileToOpenFd`), so a mid-restore symlink swap of the path cannot redirect the
+  write, and it asserts the staged path is a regular file (`assertRegularFile`) before
+  the publish rename — a swapped symlink is never published as the live DB.
+- **Finding 4 — prune refuses while a marker is pending.** If a restore crashed, the
+  manifest + `snapshot.db` are the only recovery material. `Prune` now checks
+  `restoreMarkerPending` FIRST and refuses (`ErrRestoreInterrupted`) so it never
+  deletes recovery material out from under a pending restore.
+- **Finding 5 — Open no-touch ordering.** `Open` checks the interrupted-restore
+  marker and acquires the SHARED lock BEFORE `MkdirAll`/`hardenPermissions`, so a
+  pending-restore Open fails closed without chmod'ing/mkdir'ing anything.

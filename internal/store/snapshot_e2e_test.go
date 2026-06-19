@@ -197,11 +197,68 @@ func TestSnapshotE2E_RestoreCLI_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestSnapshotE2E_SecondServeRefusesWhileFirstLive is the Finding 2 behavioral
-// regression: while one serve holds the DB, a second serve against the SAME DB
-// (different port, so the refusal is the LOCK, not a bind clash) must refuse to
-// start and exit non-zero — never run two servers against one database.
-func TestSnapshotE2E_SecondServeRefusesWhileFirstLive(t *testing.T) {
+// TestSnapshotE2E_ServeRefusesWhileExclusiveRestoreLockHeld is the Round-5
+// CENTERPIECE behavioral regression: serve takes a SHARED lock via store.Open.
+// Two serves both holding SHARED is fine; what serve must REFUSE is starting
+// while an EXCLUSIVE holder (a restore in progress) owns the DB. We simulate the
+// in-progress restore by holding the EXCLUSIVE lock in THIS test process across a
+// subprocess `serve` launch: the subprocess's shared open blocks then fails.
+func TestSnapshotE2E_ServeRefusesWhileExclusiveRestoreLockHeld(t *testing.T) {
+	if testing.Short() {
+		t.Skip("snapshot e2e: skipped under -short")
+	}
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := t.TempDir()
+
+	dbPath := buildDBAtVersion(t, workDir, 5)
+	seedV5Data(t, dbPath)
+	// Migrate to head + create the restore point so the lock file exists.
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	// Hold the EXCLUSIVE flock on the per-DB lock file in THIS test process. flock
+	// is cross-process by file, so a SEPARATE `serve` subprocess is excluded by it
+	// exactly as a real in-progress restore (which holds the same exclusive lock)
+	// would exclude it. We take a raw flock on our own fd (the holder is "another
+	// process" from the subprocess's point of view).
+	lp, _ := dbLockPath(dbPath)
+	holderFD, err := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, lerr := flockExclusiveNB(holderFD); lerr != nil || !ok {
+		holderFD.Close()
+		t.Fatalf("hold exclusive flock: ok=%v err=%v", ok, lerr)
+	}
+
+	// Serve against the SAME DB but a fresh HOME + different port must FAIL: its
+	// shared open cannot be granted while the exclusive restore lock is held.
+	home2 := t.TempDir()
+	_, env2 := testharness.HermeticEnv(t, home2, dbPath, 0)
+	res := testharness.RunCLI(t, bin, env2, "serve")
+	if res.ExitCode == 0 {
+		holderFD.Close()
+		t.Errorf("serve exited 0 while an exclusive restore lock was held\nstderr:\n%s", res.Stderr)
+	}
+
+	// After the exclusive holder releases (fd close drops the flock), a fresh serve
+	// must succeed.
+	holderFD.Close()
+	home3 := t.TempDir()
+	url3, env3 := testharness.HermeticEnv(t, home3, dbPath, 0)
+	srv3 := testharness.StartServeProcess(t, bin, env3)
+	t.Cleanup(srv3.Stop)
+	testharness.WaitForReady(t, url3+"/api/health")
+}
+
+// TestSnapshotE2E_TwoServesShareCoexist pins the new SHARED-lock contract: two
+// serves against the SAME DB (different HOMEs + ports) both boot — neither
+// excludes the other, because writable opens take SHARED, not exclusive. (A
+// restore is what must exclude them; that is the test above.)
+func TestSnapshotE2E_TwoServesShareCoexist(t *testing.T) {
 	if testing.Short() {
 		t.Skip("snapshot e2e: skipped under -short")
 	}
@@ -211,39 +268,23 @@ func TestSnapshotE2E_SecondServeRefusesWhileFirstLive(t *testing.T) {
 	dbPath := buildDBAtVersion(t, workDir, 5)
 	seedV5Data(t, dbPath)
 
-	// First serve: boot and wait until ready (holds the live serve lock).
 	url1, _, srv1 := startSubprocessAgainstDB(t, bin, workDir, dbPath)
-	_ = url1
 	t.Cleanup(srv1.Stop)
 
-	// Second serve against the SAME DB but a fresh HOME + different port. It
-	// must refuse on the live serve lock.
 	home2 := t.TempDir()
-	_, env2 := testharness.HermeticEnv(t, home2, dbPath, 0)
-	res := testharness.RunCLI(t, bin, env2, "serve")
-	if res.ExitCode == 0 {
-		t.Errorf("second serve exited 0 while first holds the DB\nstderr:\n%s", res.Stderr)
-	}
-	if !contains(res.Stderr, "already running") && !contains(res.Stderr, "serve lock") {
-		t.Errorf("second serve did not refuse on the serve lock; stderr:\n%s", res.Stderr)
-	}
-
-	// After the first serve stops, a fresh serve must succeed (stale lock
-	// reclaimed), proving the refusal was scoped to the live holder.
-	srv1.Stop()
-	home3 := t.TempDir()
-	url3, env3 := testharness.HermeticEnv(t, home3, dbPath, 0)
-	srv3 := testharness.StartServeProcess(t, bin, env3)
-	t.Cleanup(srv3.Stop)
-	testharness.WaitForReady(t, url3+"/api/health")
+	url2, env2 := testharness.HermeticEnv(t, home2, dbPath, 0)
+	srv2 := testharness.StartServeProcess(t, bin, env2)
+	t.Cleanup(srv2.Stop)
+	// Both must come ready — shared locks coexist.
+	testharness.WaitForReady(t, url1+"/api/health")
+	testharness.WaitForReady(t, url2+"/api/health")
 }
 
-// TestSnapshotE2E_FirstRunServeIntoMissingDir is the Finding 3 regression: the
-// serve lock is now acquired BEFORE store.Open, and the lock file lives beside
-// the DB. A first-ever serve whose CONTINUITY_DB sits in a not-yet-created
-// (nested) directory must still create that directory before acquiring the
-// lock, so serve boots instead of dying on "open lock: no such file or
-// directory". Before the fix the lock acquire ran against a missing parent dir.
+// TestSnapshotE2E_FirstRunServeIntoMissingDir is the missing-dir regression: a
+// first-ever serve whose CONTINUITY_DB sits in a not-yet-created (nested)
+// directory must create that directory (store.Open MkdirAll's it before
+// acquiring the per-DB lock file beside it), so serve boots instead of dying on
+// "open lock: no such file or directory".
 func TestSnapshotE2E_FirstRunServeIntoMissingDir(t *testing.T) {
 	if testing.Short() {
 		t.Skip("snapshot e2e: skipped under -short")

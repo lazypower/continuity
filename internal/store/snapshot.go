@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -164,7 +163,7 @@ func snapshotEligiblePath(path string) bool {
 // (Finding 3): when a restore through a symlinked CONTINUITY_DB has moved the
 // real DB aside, EvalSymlinks(abs) fails, and a naive fallback to abs would key
 // the lock to the LINK while the sidecar was written under the REAL DB. Both
-// serveLockPath and sidecarPath now route through this one helper, so the lock
+// dbLockPath and sidecarPath now route through this one helper, so the lock
 // and the sidecar are always keyed to the same real DB.
 func canonicalDBPath(dbPath string) (string, error) {
 	abs, err := filepath.Abs(dbPath)
@@ -648,20 +647,20 @@ func firstPendingRiskyVersion(preVersion int) (int, bool) {
 // already hold the op-lock; migrate()'s risky-upgrade path takes the lock once
 // and uses createRestorePointLocked so the lock also spans the migration DDL.
 func (db *DB) createRestorePoint(preVersion, target, firstRisky int) error {
-	sidecar, err := sidecarPath(db.Path)
-	if err != nil {
-		return err
-	}
-
 	// Serialize concurrent restore-point creation: two migration opens racing
 	// against the same DB could both pass the "no restore point" check and
-	// double-publish. Take a sidecar operation lock; the loser waits briefly
-	// and then fails closed rather than clobbering a sibling's work.
-	releaseOp, lerr := acquireSnapshotOpLock(sidecar)
+	// double-publish. Take the EXCLUSIVE DB lock (the same lock a risky migration
+	// and a restore take); the loser waits the bounded window then fails closed
+	// (ErrDBLocked) rather than clobbering a sibling's work.
+	//
+	// This is the path used by tests and by any caller that does NOT already hold
+	// the exclusive lock. migrate()'s risky-upgrade path takes exclusive once and
+	// calls createRestorePointLocked so the lock also spans the migration DDL.
+	release, lerr := acquireExclusiveLockForOwner(db)
 	if lerr != nil {
 		return lerr
 	}
-	defer releaseOp()
+	defer release()
 
 	return db.createRestorePointLocked(preVersion, target, firstRisky)
 }
@@ -964,92 +963,4 @@ func snapshotSchemaVersion(path string) (int, error) {
 	}
 	defer sdb.Close()
 	return sdb.SchemaVersion()
-}
-
-// =========================================================================
-// Snapshot operation lock (serializes restore-point creation)
-// =========================================================================
-
-// snapshotOpLockWaitAttempts / snapshotOpLockWaitInterval bound how long the
-// loser of a creation race waits for the winner to finish before failing
-// closed. Kept short: a healthy create is a single VACUUM INTO + manifest
-// write, so a live holder clears quickly; a dead holder is reclaimed on the
-// first attempt via PID liveness.
-const (
-	snapshotOpLockWaitAttempts = 50
-	snapshotOpLockWaitInterval = 100 * time.Millisecond
-)
-
-// ErrSnapshotOpLocked is returned when another process holds the snapshot
-// operation lock for too long. The caller fails closed (no double-publish).
-var ErrSnapshotOpLocked = errors.New("snapshot: another process is creating a restore point")
-
-// snapshotOpLockPath is the operation lock next to the sidecar. It lives beside
-// the sidecar (not inside it) because the sidecar dir may not exist yet when
-// the first creator runs.
-func snapshotOpLockPath(sidecar string) string { return sidecar + ".oplock" }
-
-// snapshotOpLocks serializes restore-point creation WITHIN this process. The
-// on-disk PID lock alone cannot serialize same-process callers (they share a
-// PID, so the file lock can't tell two goroutines apart); the cross-process
-// guarantee comes from the file, the in-process guarantee from this mutex map.
-// Keyed by lock path so distinct DBs don't contend.
-var snapshotOpLocks sync.Map // map[string]*sync.Mutex
-
-func opLockMutex(path string) *sync.Mutex {
-	m, _ := snapshotOpLocks.LoadOrStore(path, &sync.Mutex{})
-	return m.(*sync.Mutex)
-}
-
-// acquireSnapshotOpLock takes an exclusive operation lock around restore-point
-// creation, serializing BOTH same-process goroutines (via an in-process mutex)
-// AND separate processes (via a PID-stamped O_EXCL lockfile). O_EXCL create
-// wins; a live holder makes the loser wait up to the bounded window, then fail
-// closed; a dead holder is reclaimed. Returns a release func that drops the
-// in-process mutex and removes the lockfile only while we still own it.
-func acquireSnapshotOpLock(sidecar string) (func(), error) {
-	path := snapshotOpLockPath(sidecar)
-	myPID := os.Getpid()
-
-	// In-process gate first: only one goroutine of this process contends for
-	// the file lock at a time, so the PID-based file lock is meaningful again.
-	mu := opLockMutex(path)
-	mu.Lock()
-	unlock := func() { mu.Unlock() }
-
-	for attempt := 0; attempt < snapshotOpLockWaitAttempts; attempt++ {
-		err := writeLockfileAtomic(path, myPID)
-		if err == nil {
-			return func() {
-				if owner, _, oerr := readServeLockOwner(path); oerr == nil && owner == myPID {
-					_ = os.Remove(path)
-				}
-				unlock()
-			}, nil
-		}
-		if !errors.Is(err, errLockfileExists) {
-			unlock()
-			return func() {}, err
-		}
-
-		owner, alive, perr := readServeLockOwner(path)
-		if perr != nil {
-			unlock()
-			return func() {}, perr
-		}
-		// owner == myPID here would mean a crashed prior run of THIS process
-		// left a stale file (the in-process mutex guarantees no live sibling
-		// goroutine holds it). Treat as stale and reclaim.
-		if owner == myPID || !alive {
-			if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
-				unlock()
-				return func() {}, rmErr
-			}
-			continue
-		}
-		// Live holder in ANOTHER process — wait briefly, then retry.
-		time.Sleep(snapshotOpLockWaitInterval)
-	}
-	unlock()
-	return func() {}, ErrSnapshotOpLocked
 }

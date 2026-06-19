@@ -14,6 +14,27 @@ import (
 type DB struct {
 	*sql.DB
 	Path string
+
+	// lock is the SHARED advisory lock held for this writable connection's
+	// lifetime (nil for :memory:/URI opens and for OpenNoMigrate, which is
+	// read-only inspection). Closed by Close so the flock is released when the
+	// connection goes away. See snapshot_lock.go for the lock discipline.
+	lock *dbLockHandle
+}
+
+// Close releases the SHARED advisory lock (if held) AND closes the underlying
+// sql.DB. Releasing the lock here is what bounds a writable open's SHARED hold
+// to the connection lifetime, so a Restore's EXCLUSIVE acquire can proceed once
+// every writer has closed.
+func (db *DB) Close() error {
+	if db.lock != nil {
+		db.lock.release()
+		db.lock = nil
+	}
+	if db.DB != nil {
+		return db.DB.Close()
+	}
+	return nil
 }
 
 // DefaultDBPath returns the default database path: ~/.continuity/continuity.db
@@ -27,40 +48,73 @@ func DefaultDBPath() (string, error) {
 
 // Open opens (or creates) the SQLite database at the given path,
 // configures pragmas, and runs migrations.
+//
+// LOCK DISCIPLINE (Finding 5, Round 5): a writable open takes a SHARED advisory
+// lock held for the connection's lifetime so a Restore (EXCLUSIVE) can never
+// swap the DB triplet out from under an active SQLite connection. The
+// interrupted-restore fail-closed gate runs BEFORE any chmod, and the shared
+// lock + a re-check run before hardenPermissions/sql.Open, so a pending-restore
+// (or exclusive-restore-in-progress) Open is no-touch: it never chmod's the DB
+// before failing closed.
 func Open(path string) (*DB, error) {
+	// FAIL CLOSED on an interrupted restore BEFORE touching the DB (Findings 1, 2,
+	// 4, 5). A torn restore leaves a marker in the sidecar; the DB on disk may be
+	// missing, torn, or mid-swap. We must NEVER auto-resume here, and we must not
+	// chmod first: a marker that a crash, corruption, OR an attacker can write
+	// would otherwise drive destructive file moves on a routine open (e.g.
+	// `continuity profile`). Recovery happens only under explicit operator intent
+	// via `continuity snapshot restore --confirm`. A corrupt/partial marker is ALSO
+	// ErrRestoreInterrupted. (If the DB dir does not exist there can be no marker,
+	// so this no-touch check before MkdirAll is safe.)
+	if err := detectRestoreInterrupted(path); err != nil {
+		return nil, err
+	}
+
+	// Ensure the parent dir exists so the lock file (which lives beside the DB)
+	// can be created. MkdirAll only CREATES a missing dir — it never chmod's an
+	// existing DB, so the no-touch property for a pending-restore Open is preserved
+	// (the existing-DB chmod is hardenPermissions, below, which runs only AFTER the
+	// lock + interrupted re-check). A missing dir also means no marker can exist.
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
 	}
 
-	// Tighten permissions on existing installs — MkdirAll/Open only set
-	// permissions on creation, so pre-existing dirs/files need explicit chmod.
-	hardenPermissions(dir, path)
-
-	// FAIL CLOSED on an interrupted restore (Findings 1, 2, 4). A torn restore
-	// leaves a marker in the sidecar; the DB on disk may be missing, torn, or
-	// mid-swap. We must NEVER auto-resume here: a marker that a crash, corruption,
-	// OR an attacker can write would otherwise drive destructive file moves on a
-	// routine open (e.g. `continuity profile`). Instead we refuse to open and
-	// return ErrRestoreInterrupted; recovery happens only under explicit operator
-	// intent via `continuity snapshot restore --confirm`. A corrupt/partial marker
-	// is ALSO ErrRestoreInterrupted (not erased, not fabricated over).
+	// SHARED lock for this writable connection's lifetime. If a Restore holds the
+	// EXCLUSIVE lock, LOCK_SH blocks until it releases — and we re-check for an
+	// interrupted restore afterward so we never proceed through a half-restored DB.
+	// A new writable open while EXCLUSIVE is held therefore cannot reach sql.Open
+	// (nor chmod the DB) until the restore is done.
+	lock, lerr := acquireSharedLock(path)
+	if lerr != nil {
+		return nil, fmt.Errorf("acquire db lock: %w", lerr)
+	}
+	// Re-check after acquiring shared: a restore that completed WHILE we waited may
+	// have left (or cleared) a marker. Fail closed BEFORE hardenPermissions so a
+	// pending-restore open never chmod's the DB.
 	if err := detectRestoreInterrupted(path); err != nil {
+		lock.release()
 		return nil, err
 	}
+
+	// Tighten permissions on existing installs — MkdirAll/Open only set
+	// permissions on creation, so pre-existing dirs/files need explicit chmod.
+	// Runs only after the lock + interrupted re-check (no-touch on a pending open).
+	hardenPermissions(dir, path)
 
 	sqlDB, err := sql.Open("sqlite", path)
 	if err != nil {
+		lock.release()
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 
-	db := &DB{DB: sqlDB, Path: path}
+	db := &DB{DB: sqlDB, Path: path, lock: lock}
 	if err := db.configurePragmas(); err != nil {
-		sqlDB.Close()
+		db.Close()
 		return nil, err
 	}
 	if err := db.migrate(); err != nil {
-		sqlDB.Close()
+		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return db, nil

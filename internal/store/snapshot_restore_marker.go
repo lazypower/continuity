@@ -225,7 +225,7 @@ type canonicalRestore struct {
 // resolveDBPathSurvivingDangling returns the canonical DB path surviving a
 // dangling/missing target. It delegates to canonicalDBPath so recovery resolves
 // the SAME real DB (and therefore the same sidecar, lock, and backup names) that
-// sidecarPath/serveLockPath use — there is exactly one resolution rule now
+// sidecarPath/dbLockPath use — there is exactly one resolution rule now
 // (Finding 3). The name is kept where recovery reads clearer for the intent.
 func resolveDBPathSurvivingDangling(dbPath string) (string, error) {
 	return canonicalDBPath(dbPath)
@@ -511,11 +511,29 @@ func reconcilePendingRestore(cr *canonicalRestore) error {
 		return completeReconciled(cr)
 	}
 
+	dbBackupPresent := cr.backup != "" && lstatExists(cr.backup) // "" suffix backup
+	stagedPresent := cr.staged != "" && lstatExists(cr.staged)
+
+	// CASE A2 — SAFE PRE-RENAME ABORT (Finding 2, Round 5): the crash landed AFTER
+	// the marker was written but BEFORE the first move-aside rename. In that window
+	// the live DB is still the UNTOUCHED ORIGINAL (its hash == the marker's
+	// recorded original_db_sha256), no DB backup was created yet, and a staged copy
+	// may or may not exist. NO destructive step happened, so there is nothing to
+	// roll back: clear the marker, drop any orphaned staged temp, and leave the
+	// (original) DB intact. Without this case reconcile fell through to the generic
+	// fail-closed below and the DB stayed permanently ErrRestoreInterrupted with no
+	// recovery path — exactly the wedge this fixes.
+	if livePresent && cr.originalDBSHA256 != "" && liveSum == cr.originalDBSHA256 && !dbBackupPresent {
+		if cr.staged != "" {
+			_ = os.Remove(cr.staged)
+		}
+		fmt.Fprintf(os.Stderr, "  restore reconciled: no destructive step occurred (live db is the untouched original); cleared marker for %s\n", db)
+		return removeRestoreMarker(cr.sidecar)
+	}
+
 	// CASE B — genuine pre-publish torn state: the live DB is gone, the original
 	// was moved aside (DB backup present), and a staged image is waiting. Roll
 	// back to the moved-aside original after proving its provenance.
-	dbBackupPresent := cr.backup != "" && lstatExists(cr.backup) // "" suffix backup
-	stagedPresent := cr.staged != "" && lstatExists(cr.staged)
 	if !livePresent && dbBackupPresent && stagedPresent {
 		// Provenance: the DB backup must hash to the recorded original. A planted
 		// or corrupt <db>.pre-restore.* can never be renamed over the DB.
