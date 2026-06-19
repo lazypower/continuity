@@ -87,7 +87,9 @@ func TestSnapshot_CreatedBeforeRiskyMigration(t *testing.T) {
 	}
 	defer db.Close()
 
-	snapDir := filepath.Join(dir, "snapshots")
+	// Snapshots are namespaced under snapshots/<db-filename>/ so sibling DBs
+	// never collide; this DB is test.db.
+	snapDir := filepath.Join(dir, "snapshots", "test.db")
 	entries, err := os.ReadDir(snapDir)
 	if err != nil {
 		t.Fatalf("snapshots dir not created: %v", err)
@@ -480,10 +482,10 @@ func TestSnapshot_OnlyMostRecentRetained(t *testing.T) {
 		t.Errorf("retained snapshot should be pre-v9; got target_version=%d", snaps[0].TargetVersion)
 	}
 
-	// File system should match: one file in snapshots/.
-	files, _ := os.ReadDir(filepath.Join(dir, "snapshots"))
+	// File system should match: one file in this DB's snapshots/<db>/ dir.
+	files, _ := os.ReadDir(filepath.Join(dir, "snapshots", "test.db"))
 	if len(files) != 1 {
-		t.Errorf("expected 1 file in snapshots/, got %d", len(files))
+		t.Errorf("expected 1 file in snapshots/test.db/, got %d", len(files))
 	}
 }
 
@@ -785,9 +787,9 @@ func TestSnapshot_PruneReclaimsUntrackedFiles(t *testing.T) {
 		t.Fatalf("setup: expected 1 tracked snapshot, got %d", len(snaps))
 	}
 
-	// Strand an untracked snapshot file in snapshots/ — a real DB copy with no
-	// row, plus a foreign file prune must NOT touch.
-	snapDir := filepath.Join(dir, "snapshots")
+	// Strand an untracked snapshot file in THIS DB's snapshots/<db>/ dir — a
+	// real DB copy with no row, plus a foreign file prune must NOT touch.
+	snapDir := filepath.Join(dir, "snapshots", "test.db")
 	orphan := filepath.Join(snapDir, "continuity-pre-v6-2020-01-01T00-00-00Z.db")
 	if err := os.WriteFile(orphan, []byte("orphaned snapshot copy"), 0o600); err != nil {
 		t.Fatalf("write orphan: %v", err)
@@ -855,5 +857,77 @@ func TestSnapshot_PruneViaNoMigrateOpenDoesNotMigrate(t *testing.T) {
 	}
 	if v, _ := db.SchemaVersion(); v != 8 {
 		t.Errorf("schema advanced to v%d during prune; must stay v8", v)
+	}
+}
+
+// TestSnapshot_PruneIsolatedAcrossSiblingDBs pins the cross-DB safety contract:
+// two databases sharing a parent directory each keep their snapshots under
+// snapshots/<db-filename>/, so pruning one must never reach the other's
+// rollback point. Without per-DB namespacing, the untracked-file scan would
+// see the sibling's snapshots as "untracked" and delete them.
+func TestSnapshot_PruneIsolatedAcrossSiblingDBs(t *testing.T) {
+	t.Setenv(EnvNoMigrationSnapshot, "")
+
+	dir := t.TempDir() // shared parent for both DBs
+	dbAPath := filepath.Join(dir, "a.db")
+	dbBPath := filepath.Join(dir, "b.db")
+	buildSnapshotDBAtVersion(t, dbAPath, 8)
+	buildSnapshotDBAtVersion(t, dbBPath, 8)
+
+	dbA, err := Open(dbAPath) // v9 risky → snapshot under snapshots/a.db/
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbA.Close()
+	dbB, err := Open(dbBPath) // snapshot under snapshots/b.db/
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbB.Close()
+
+	bSnaps, _ := dbB.ListMigrationSnapshots()
+	if len(bSnaps) != 1 {
+		t.Fatalf("setup: DB B should have 1 snapshot, got %d", len(bSnaps))
+	}
+	bSnapPath := bSnaps[0].Path
+
+	// Prune A. B must be completely untouched — file AND row.
+	if _, err := dbA.PruneMigrationSnapshots(); err != nil {
+		t.Fatalf("prune A: %v", err)
+	}
+	if _, err := os.Stat(bSnapPath); err != nil {
+		t.Errorf("pruning DB A destroyed DB B's snapshot file: %v", err)
+	}
+	if after, _ := dbB.ListMigrationSnapshots(); len(after) != 1 {
+		t.Errorf("pruning DB A cleared DB B's tracking row; B now has %d", len(after))
+	}
+}
+
+// TestSnapshot_ListSurfacesRealQueryErrors pins that ListMigrationSnapshots
+// distinguishes "table absent" (tolerated → empty) from a genuine query
+// failure (surfaced). A catch-all that reported a corrupt/incompatible table
+// as empty would make prune treat still-tracked files as untracked.
+func TestSnapshot_ListSurfacesRealQueryErrors(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Replace the sidecar with an incompatible shape: the table EXISTS but
+	// lacks the expected columns, so the real SELECT fails.
+	if _, err := db.Exec(`DROP TABLE migration_snapshots`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE migration_snapshots (unexpected INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.ListMigrationSnapshots(); err == nil {
+		t.Fatal("ListMigrationSnapshots must surface a real query error, not report empty")
+	}
+	// Prune must propagate the error and NOT proceed to delete anything.
+	if _, err := db.PruneMigrationSnapshots(); err == nil {
+		t.Error("PruneMigrationSnapshots must refuse to run when the snapshot table is unreadable")
 	}
 }

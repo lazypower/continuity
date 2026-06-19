@@ -35,6 +35,18 @@ type MigrationSnapshot struct {
 	BootsSince    int
 }
 
+// snapshotDirForDB returns the per-database directory that holds this DB's
+// migration snapshots: <dbdir>/snapshots/<db-filename>/. Namespacing by the
+// database's own filename is what keeps two databases that happen to share a
+// parent directory (two CONTINUITY_DB targets, or the default DB beside a
+// scratch copy) from ever seeing — let alone deleting — each other's
+// snapshots. Filenames are unique within a directory, so the basename is a
+// stable, collision-free per-DB key: pruning one DB can only ever reach into
+// its own subdirectory.
+func snapshotDirForDB(dbPath string) string {
+	return filepath.Join(filepath.Dir(dbPath), "snapshots", filepath.Base(dbPath))
+}
+
 // ensureSnapshotStateTable creates the sidecar tracking table. Called from
 // migrate() before the migration loop so the table is available whether or
 // not any prior migration has touched it. Deliberately NOT part of the
@@ -81,8 +93,7 @@ func (db *DB) snapshotBeforeRiskyMigration(m migration) (string, error) {
 		return "", nil
 	}
 
-	dbDir := filepath.Dir(db.Path)
-	snapDir := filepath.Join(dbDir, "snapshots")
+	snapDir := snapshotDirForDB(db.Path)
 	if err := os.MkdirAll(snapDir, 0o700); err != nil {
 		return "", fmt.Errorf("create snapshot dir %s: %w", snapDir, err)
 	}
@@ -248,15 +259,29 @@ func (db *DB) TickSnapshotRetention() error {
 // (not nil) when no snapshots are retained. Used by both the boot-time
 // surfacing log and the `continuity snapshot list` command.
 func (db *DB) ListMigrationSnapshots() ([]MigrationSnapshot, error) {
+	// The ONLY tolerable reason this read comes up empty is the sidecar table
+	// not existing yet (a fresh/never-migrated DB, e.g. opened via
+	// OpenNoMigrate). Tell that apart from a genuine query failure — a
+	// catch-all that swallowed real errors would report a corrupt or
+	// incompatible migration_snapshots table as "no snapshots", and prune
+	// would then treat still-tracked files as untracked.
+	var hasTable int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='migration_snapshots'`,
+	).Scan(&hasTable); err != nil {
+		return nil, fmt.Errorf("check migration_snapshots table: %w", err)
+	}
+	if hasTable == 0 {
+		return []MigrationSnapshot{}, nil
+	}
+
 	rows, err := db.Query(`
 		SELECT snapshot_path, pre_version, target_version, created_at, boots_since
 		FROM migration_snapshots
 		ORDER BY created_at DESC
 	`)
 	if err != nil {
-		// migration_snapshots may not exist yet on a fresh install that
-		// hasn't been through migrate() — treat that as empty.
-		return []MigrationSnapshot{}, nil
+		return nil, fmt.Errorf("query migration_snapshots: %w", err)
 	}
 	defer rows.Close()
 
@@ -299,14 +324,16 @@ func (db *DB) PruneMigrationSnapshots() (int, error) {
 		removed[s.Path] = true
 	}
 
-	// 2. Untracked snapshot files: scan the snapshots/ directory for full DB
-	//    copies that have no tracking row. These get stranded when recording a
-	//    snapshot fails after its migration commits, or when a superseded-file
-	//    delete fails — paths that leave the file on disk with no row. Pruning
-	//    only tracked rows would leave these large copies to leak forever,
-	//    contradicting this command's promise to reclaim the safety net fully.
+	// 2. Untracked snapshot files: scan THIS DB's own snapshot directory for
+	//    full DB copies that have no tracking row. These get stranded when
+	//    recording a snapshot fails after its migration commits, or when a
+	//    superseded-file delete fails — paths that leave the file on disk with
+	//    no row. Pruning only tracked rows would leak these copies forever.
+	//    The scan is confined to snapshotDirForDB(db.Path), so it can never
+	//    reach a sibling database's snapshots even when both share a parent
+	//    directory.
 	if db.Path != "" && db.Path != ":memory:" {
-		snapDir := filepath.Join(filepath.Dir(db.Path), "snapshots")
+		snapDir := snapshotDirForDB(db.Path)
 		entries, dirErr := os.ReadDir(snapDir)
 		if dirErr != nil && !os.IsNotExist(dirErr) {
 			return len(removed), fmt.Errorf("scan snapshot dir %s: %w", snapDir, dirErr)

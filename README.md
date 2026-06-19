@@ -290,7 +290,7 @@ The verb exists for the agent to curate its own substrate. Operators don't run i
 
 Migrations are the one place Continuity knowingly performs potentially destructive operations against the user's substrate. SQLite's transaction guarantees catch most failure modes (power loss, disk full, syntax errors all abort cleanly), but they cannot catch a buggy migration that successfully commits the wrong state — a column-order misalignment in an `INSERT SELECT *` rebuild, say.
 
-For that narrow class of failure, Continuity takes an automatic safety snapshot immediately before each migration explicitly marked risky (currently the two full-table rebuilds, v6 and v9). The snapshot is an atomic copy of the live database written via `VACUUM INTO`, named `continuity-pre-vN-<RFC3339>.db`, and lives in `~/.continuity/snapshots/`.
+For that narrow class of failure, Continuity takes an automatic safety snapshot immediately before each migration explicitly marked risky (currently the two full-table rebuilds, v6 and v9). The snapshot is an atomic copy of the live database written via `VACUUM INTO`, named `continuity-pre-vN-<RFC3339>.db`, and lives in a per-database directory, `~/.continuity/snapshots/<db-filename>/` (e.g. `~/.continuity/snapshots/continuity.db/`). Namespacing by database filename keeps two databases that share a parent directory — for instance a `CONTINUITY_DB` scratch copy beside the default — from ever touching each other's snapshots when pruned.
 
 **This is not a backup system.** It is a one-shot safety net during the upgrade window. The policy is intentionally narrow:
 
