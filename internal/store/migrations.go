@@ -259,17 +259,53 @@ func (e *ErrSchemaTooNew) Error() string {
 	)
 }
 
-func (db *DB) migrate() error {
-	// Create schema_versions table if it doesn't exist
-	_, err := db.Exec(`
+// ensureSchemaVersionsTable creates the schema_versions bookkeeping table if it
+// does not exist. Split out so the risky-upgrade detection in Open() can read the
+// current version through the same idempotent create that migrate() relies on.
+func (db *DB) ensureSchemaVersionsTable() error {
+	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_versions (
 			version     INTEGER PRIMARY KEY,
 			description TEXT NOT NULL,
 			applied_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
 		)
-	`)
-	if err != nil {
+	`); err != nil {
 		return fmt.Errorf("create schema_versions: %w", err)
+	}
+	return nil
+}
+
+// riskyUpgradePending reports whether opening this on-disk DB would run a RISKY
+// (destructive table-rebuild) migration: an existing DB (version > 0) on an
+// eligible path with at least one pending risky migration. It is the gate Open()
+// uses to decide whether the migration must run under EXCLUSIVE with a fresh conn
+// (no open handle across the lock transition — Finding 1, Round 6). A pure read:
+// it never mutates the DB beyond the idempotent schema_versions create.
+//
+// Returns (false, maxApplied, nil) for fresh installs (maxApplied == 0),
+// ineligible paths (:memory:/URI), or when only non-risky ALTER migrations are
+// pending (those do not rewrite tables and are safe under the lifetime SHARED
+// lock). Surfaces ErrSchemaTooNew when the DB is newer than this binary supports.
+func (db *DB) riskyUpgradePending() (risky bool, maxApplied int, err error) {
+	if err := db.ensureSchemaVersionsTable(); err != nil {
+		return false, 0, err
+	}
+	if err := db.QueryRow(
+		`SELECT COALESCE(MAX(version), 0) FROM schema_versions`,
+	).Scan(&maxApplied); err != nil {
+		return false, 0, fmt.Errorf("read schema_versions: %w", err)
+	}
+	if head := headVersion(); maxApplied > head {
+		return false, maxApplied, &ErrSchemaTooNew{Found: maxApplied, Supported: head}
+	}
+	_, hasRisky := firstPendingRiskyVersion(maxApplied)
+	return maxApplied > 0 && hasRisky && snapshotEligiblePath(db.Path), maxApplied, nil
+}
+
+func (db *DB) migrate() error {
+	// Create schema_versions table if it doesn't exist
+	if err := db.ensureSchemaVersionsTable(); err != nil {
+		return err
 	}
 
 	// NOTE: the per-DB instance identity is intentionally NOT written here.
@@ -321,27 +357,46 @@ func (db *DB) migrate() error {
 	riskyUpgrade := maxApplied > 0 && hasRisky && snapshotEligiblePath(db.Path)
 
 	if riskyUpgrade {
-		// EXCLUSIVE lock for the restore-point-creation + migration-loop span. This
-		// folds the prior op-lock into the unified flock-based exclusive lock: it
-		// serializes the destructive DDL against every other writable open (which
-		// hold a SHARED lock) AND against a concurrent Restore (also EXCLUSIVE). The
-		// loser of an exclusive contention waits the bounded window then fails closed
-		// (ErrDBLocked) rather than racing into the CREATE/COPY/DROP/RENAME rebuild.
+		// NO-OPEN-HANDLE-ACROSS-LOCK-TRANSITION INVARIANT (Finding 1, Round 6).
+		// The destructive restore-point creation + migration DDL run ONLY under the
+		// EXCLUSIVE lock. There are exactly two ways to be here safely:
 		//
-		// NB: the caller (store.Open) already holds a SHARED lock on this DB for the
-		// open's lifetime. flock is per-open-file-description, so this fresh
-		// EXCLUSIVE acquire opens its OWN fd and is not blocked by our own shared fd;
-		// the in-process RWMutex, however, is NOT re-entrant — see migrateExclusive.
-		release, lerr := db.acquireMigrateExclusive()
+		//   (a) migratingUnderExclusive: Open() already took EXCLUSIVE on a FRESH
+		//       conn AFTER closing the first conn and releasing SHARED — no *sql.DB
+		//       handle existed across the shared→exclusive transition. Run directly,
+		//       NO re-acquire (the in-process RWMutex is not re-entrant).
+		//
+		//   (b) db.lock == nil: the caller's *DB holds NO lifetime SHARED lock (a
+		//       lock-less handle — e.g. a direct migrate() in tests, or an
+		//       ineligible-path open). It NEVER held shared, so self-acquiring a
+		//       standalone EXCLUSIVE here introduces no shared-release-with-live-conn
+		//       window. We take it (bounded, fail closed) and release after the DDL.
+		//
+		// What is FORBIDDEN is the old dance: a *DB that HOLDS a lifetime SHARED lock
+		// (db.lock != nil) self-upgrading to EXCLUSIVE while its conn is open. That is
+		// exactly the Finding-1 hazard; Open() now routes risky upgrades through (a),
+		// so reaching here with a lifetime lock held is a contract violation.
+		if db.migratingUnderExclusive {
+			if err := db.ensureUpgradeRestorePointLocked(maxApplied); err != nil {
+				return err
+			}
+			return db.runPendingMigrations()
+		}
+		if db.lock != nil && db.lock.mu != nil {
+			return fmt.Errorf(
+				"internal: risky migration on a DB holding a lifetime shared lock " +
+					"(no-open-handle-across-lock-transition invariant violated); " +
+					"the risky-upgrade path must transition the lock in Open()")
+		}
+		// Lock-less caller: take a standalone EXCLUSIVE lock across restore-point
+		// creation + the migration loop (bounded wait, fail closed with ErrDBLocked).
+		// This serializes concurrent direct migrate() callers — the loser waits then
+		// fails closed rather than racing into the destructive rebuild.
+		release, lerr := acquireExclusiveLockForOwner(db)
 		if lerr != nil {
 			return lerr
 		}
 		defer release()
-
-		// Restore point first (lock already held — no re-acquire), then the DDL,
-		// all under the same exclusive lock so no concurrent opener can interleave.
-		// When the snapshot is opted out, ensureUpgradeRestorePointLocked just warns
-		// and returns nil — but the exclusive lock above STILL serializes the rebuild.
 		if err := db.ensureUpgradeRestorePointLocked(maxApplied); err != nil {
 			return err
 		}
@@ -349,9 +404,9 @@ func (db *DB) migrate() error {
 	}
 
 	// No risky migration pending (or ineligible path): the restore-point helper
-	// still handles the opt-out/ineligible warnings, but no op-lock is held —
+	// still handles the opt-out/ineligible warnings, but no exclusive lock is held —
 	// non-risky ALTER-only migrations do not rewrite tables and are safe to run
-	// without cross-process serialization.
+	// under the lifetime SHARED lock without cross-process serialization.
 	if err := db.ensureUpgradeRestorePoint(maxApplied); err != nil {
 		return err
 	}

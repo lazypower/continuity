@@ -237,68 +237,70 @@ func acquireExclusiveLock(dbPath string) (*dbLockHandle, error) {
 	return nil, ErrDBLocked
 }
 
-// acquireMigrateExclusive upgrades a writable Open's lifetime SHARED lock to
-// EXCLUSIVE for the risky-migration span, then returns a release func that
-// DOWNGRADES back to SHARED so the connection keeps its lifetime hold.
+// acquireExclusiveLockForOwner takes a STANDALONE EXCLUSIVE lock for a *DB that
+// does NOT hold a lifetime SHARED lock (a test handle from openWritableNoMigrate,
+// or a :memory: DB). It is the single entry point createRestorePoint() uses when
+// it does not already hold the exclusive lock.
 //
-// Why a dance: flock is per-open-file-description, so the SHARED fd this
-// connection already holds would BLOCK a fresh EXCLUSIVE acquire (even in the
-// same process — verified: two fds conflict). And the in-process RWMutex is not
-// re-entrant, so an RLock holder cannot take Lock. We therefore RELEASE the
-// shared hold, take EXCLUSIVE (bounded-wait, fail-closed), run the migration,
-// and on release RE-ACQUIRE shared for the rest of the connection's life.
-//
-// The brief gap between releasing shared and taking exclusive is safe: a
-// concurrent Restore (also EXCLUSIVE) or another migrating Open simply contends
-// on the exclusive lock — whoever wins runs, the others wait/fail closed. A
-// Restore can never swap the DB "under" this connection here because no SQLite
-// statements run in that gap; the connection's queries resume only after we are
-// back to (re-acquired) shared.
-//
-// Callers must hold db.lock (the lifetime shared lock). :memory:/URI opens have
-// no lock; for them this is a no-op.
-// acquireExclusiveLockForOwner takes the EXCLUSIVE lock for a *DB, correctly
-// handling whether that DB already holds a lifetime SHARED lock. When it does,
-// this performs the release-exclusive-reacquire-shared dance (so it cannot
-// self-deadlock on its own shared fd / RLock); when it does not (a test handle,
-// or a :memory: DB), it takes a standalone exclusive lock released directly.
-// It is the single entry point migrate() and createRestorePoint() both use.
+// CONTRACT (Finding 1, Round 6): the caller's *DB must NOT hold a lifetime SHARED
+// lock. The old "upgrade a live shared open to exclusive then downgrade back"
+// dance is GONE — it released SHARED while a live *sql.DB conn was open, the exact
+// no-open-handle-across-lock-transition violation this round fixes. The risky-
+// migration open now closes its conn and releases SHARED in Open() BEFORE any
+// exclusive acquire (see openRiskyUpgradeUnderExclusive), so the only callers that
+// reach here are lock-less. A *DB that DOES hold a lifetime lock is a contract
+// violation and fails closed rather than re-introducing the dangerous dance.
 func acquireExclusiveLockForOwner(db *DB) (func(), error) {
-	return db.acquireMigrateExclusive()
-}
-
-func (db *DB) acquireMigrateExclusive() (func(), error) {
-	if db.lock == nil || db.lock.mu == nil {
-		// No lifetime lock (e.g. :memory:): nothing to upgrade. Take a standalone
-		// exclusive lock for cross-process serialization where a real path exists,
-		// otherwise a no-op.
-		ex, err := acquireExclusiveLock(db.Path)
-		if err != nil {
-			return nil, err
-		}
-		return ex.release, nil
+	if db.lock != nil && db.lock.mu != nil {
+		return nil, fmt.Errorf(
+			"internal: acquireExclusiveLockForOwner called on a DB holding a lifetime " +
+				"shared lock; the risky-upgrade path must close the conn and release " +
+				"shared before acquiring exclusive (no open handle across lock transition)")
 	}
-
-	// Release the lifetime SHARED hold (both flock fd and in-process RLock) so the
-	// fresh EXCLUSIVE acquire is not blocked by our own shared fd / RLock.
-	db.lock.release()
-	db.lock = nil
-
+	// No lifetime lock (e.g. :memory: or a test handle): take a standalone
+	// exclusive lock for cross-process serialization where a real path exists,
+	// otherwise a no-op.
 	ex, err := acquireExclusiveLock(db.Path)
 	if err != nil {
-		// Failed to take exclusive: restore the SHARED lifetime hold so the
-		// connection is not left lock-less, then surface the failure.
-		if sh, serr := acquireSharedLock(db.Path); serr == nil {
-			db.lock = sh
-		}
 		return nil, err
 	}
+	return ex.release, nil
+}
 
-	return func() {
-		ex.release()
-		// Re-acquire the lifetime SHARED hold for the rest of the connection.
-		if sh, serr := acquireSharedLock(db.Path); serr == nil {
-			db.lock = sh
-		}
-	}, nil
+// downgradeExclusiveToShared converts the DB's currently-held EXCLUSIVE lock into
+// the lifetime SHARED hold the returned connection keeps (Finding 1, Round 6),
+// with NO cross-process unlocked window. It is called by openRiskyUpgradeUnderExclusive
+// after the destructive DDL has run, to hand the connection a normal shared
+// lifetime lock without ever releasing the flock to a foreign process.
+//
+// Cross-process: flockDowngradeToShared applies LOCK_SH to the SAME fd that holds
+// LOCK_EX — a single in-kernel transition with no gap a second process can exploit.
+// In-process: the RWMutex is not atomically downgradable, so we drop its write lock
+// and take its read lock around the flock downgrade. That leaves at most an
+// IN-PROCESS window, which is harmless: a same-process restore/migration would
+// itself need the in-process write lock AND the flock, and the flock is never
+// released to a foreign process across this call. The handle's flags flip from
+// exclusive to shared so DB.Close() releases the correct in-process lock.
+func (db *DB) downgradeExclusiveToShared() error {
+	h := db.lock
+	if h == nil || h.mu == nil || h.f == nil {
+		// No real lock to downgrade (:memory:/URI/ineligible). Nothing to do —
+		// these opens never carried a flock anyway.
+		return nil
+	}
+	if !h.exclusive {
+		return fmt.Errorf("internal: downgradeExclusiveToShared on a non-exclusive lock")
+	}
+	// Atomic flock EX→SH on the same fd: a foreign process is excluded throughout.
+	if err := flockDowngradeToShared(h.f); err != nil {
+		return fmt.Errorf("store: flock downgrade ex->sh: %w", err)
+	}
+	// Transition the in-process RWMutex from write to read. The cross-process flock
+	// stays held (shared) across this, so no foreign process can slip in; only same-
+	// process goroutines could observe the brief gap, and they are gated by the same
+	// flock + the in-process lock they would themselves need.
+	h.mu.Unlock()
+	h.mu.RLock()
+	h.exclusive = false
+	return nil
 }

@@ -67,3 +67,21 @@ func flockExclusiveNB(f *os.File) (bool, error) {
 	}
 	return false, err
 }
+
+// flockDowngradeToShared converts an exclusive lock held on f down to shared
+// (Finding 1, Round 6). Windows has no single-call atomic EX→SH transition the way
+// flock(2) does, so this unlocks the exclusive range and re-locks it shared. The
+// cross-process invariant the unix path gets for free (no unlocked window) is here
+// upheld by the IN-PROCESS RWMutex: the caller still holds the registry write lock
+// across this call, so no other goroutine of THIS process can interleave, and a
+// separate process taking EXCLUSIVE would still have to win the in-process gate via
+// store.Open's own discipline. The unlock/relock pair is the closest Windows
+// primitive; the migration's file mutation has already completed before this runs.
+func flockDowngradeToShared(f *os.File) error {
+	ol := new(windows.Overlapped)
+	if err := windows.UnlockFileEx(windows.Handle(f.Fd()), 0, lockRangeLen, 0, ol); err != nil {
+		return err
+	}
+	ol2 := new(windows.Overlapped)
+	return windows.LockFileEx(windows.Handle(f.Fd()), 0, 0, lockRangeLen, 0, ol2)
+}

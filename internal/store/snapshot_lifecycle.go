@@ -18,6 +18,11 @@ import (
 // unless it has first been proven to be ours.
 // =========================================================================
 
+// hookAfterPublishBeforeWALScrub is a TEST-ONLY seam (nil in production) fired in
+// Restore after the restored DB is published and before the stale -wal/-shm scrub.
+// See TestRestore_StaleWALRemovalFailureIsError.
+var hookAfterPublishBeforeWALScrub func(resolvedDB string)
+
 // RecordSuccessfulBoot is called by `serve` AFTER a successful TCP bind. It
 // increments successful_boots on a valid active manifest whose
 // target_schema_version <= currentSchemaVersion. When the count reaches the
@@ -164,29 +169,57 @@ func Status(dbPath string) (*SnapshotStatus, error) {
 // refuses (fails closed) on a corrupt/partial sidecar — the CLI never deletes
 // anything it cannot prove is ours. Never opens the DB.
 //
-// REFUSES WHILE A RESTORE MARKER IS PENDING (Finding 4, Round 5): if a restore
-// crashed, the manifest + snapshot.db are the ONLY material recovery can use. A
-// Prune that deleted them whenever the manifest validates would leave the marker
-// behind with no restore point — every Open would then fail ErrRestoreInterrupted
-// AND `restore --confirm` would also fail (its restore point is gone). So when a
-// marker is present we refuse and tell the operator to complete recovery first.
+// LOCKED AGAINST MIGRATION/RESTORE (Finding 2, Round 6): Prune now acquires the
+// EXCLUSIVE DB lock for the deletion. A risky migration holds EXCLUSIVE across
+// restore-point creation + DDL, and a restore holds EXCLUSIVE for its whole span;
+// without the lock, prune could delete manifest.json / snapshot.db out from under
+// an in-flight migration (whose only rollback material is that restore point) or
+// after a concurrent restore passed its own pre-marker checks. Acquiring EXCLUSIVE
+// here (bounded wait, fail closed with ErrDBLocked) serializes prune against both
+// — whoever holds the DB runs, prune waits then fails closed rather than racing.
+//
+// REFUSES WHILE A RESTORE MARKER IS PENDING (Finding 4, Round 5; re-checked UNDER
+// the lock per Finding 2, Round 6): if a restore crashed, the manifest +
+// snapshot.db are the ONLY material recovery can use. A Prune that deleted them
+// whenever the manifest validates would leave the marker behind with no restore
+// point — every Open would then fail ErrRestoreInterrupted AND `restore --confirm`
+// would also fail (its restore point is gone). We check the marker BEFORE acquiring
+// the lock (fast refusal) AND AGAIN under the lock (a restore that wrote its marker
+// while we waited for the lock must still stop us), so a marker that appears at any
+// point up to the deletion makes prune refuse.
 func Prune(dbPath string) error {
 	sidecar, err := sidecarPath(dbPath)
 	if err != nil {
 		return err
 	}
 
-	// Refuse to delete recovery material while a restore marker is pending. We
-	// check the marker BEFORE validating the manifest so the refusal fires even
-	// when the restore point itself is what recovery still needs.
-	pending, perr := restoreMarkerPending(dbPath)
-	if perr != nil {
-		return fmt.Errorf("prune: check for pending restore: %w", perr)
+	// Fast pre-lock refusal: a marker that already exists blocks prune before we
+	// even contend for the lock. We re-check under the lock below.
+	if err := refuseIfRestoreMarkerPending(dbPath); err != nil {
+		return err
 	}
-	if pending {
-		return fmt.Errorf(
-			"%w: a restore marker is pending for this DB; run `continuity snapshot restore --confirm` to complete recovery before pruning",
-			ErrRestoreInterrupted)
+
+	// Acquire the EXCLUSIVE DB lock so prune serializes against a risky migration
+	// and a restore (both EXCLUSIVE holders). Bounded wait, fail closed: if a
+	// migration/restore holds the DB, prune does NOT delete the recovery material
+	// out from under it — it waits the bounded window then returns ErrDBLocked.
+	lockHandle, lockErr := acquireExclusiveLock(dbPath)
+	if lockErr != nil {
+		if errors.Is(lockErr, ErrDBLocked) {
+			return fmt.Errorf(
+				"%w: the database is in use (a migration or restore may be in progress); retry once it completes",
+				ErrDBLocked)
+		}
+		return fmt.Errorf("prune: acquire exclusive db lock: %w", lockErr)
+	}
+	defer lockHandle.release()
+
+	// RE-CHECK the marker UNDER the lock. A concurrent restore that passed its
+	// pre-marker checks and wrote its marker while we were waiting for the lock
+	// would otherwise have its recovery material deleted; this re-check makes prune
+	// refuse on a marker that appeared after the pre-lock check.
+	if err := refuseIfRestoreMarkerPending(dbPath); err != nil {
+		return err
 	}
 
 	m, err := loadValidManifest(sidecar)
@@ -197,6 +230,24 @@ func Prune(dbPath string) error {
 		return err // corrupt → refuse
 	}
 	return expireRestorePoint(sidecar, m)
+}
+
+// refuseIfRestoreMarkerPending returns an ErrRestoreInterrupted error when a
+// restore marker is present for dbPath, and nil otherwise. Prune calls it twice —
+// once before taking the lock (fast refusal) and once under the lock (a restore
+// that wrote its marker while prune waited for the lock must still stop the
+// deletion).
+func refuseIfRestoreMarkerPending(dbPath string) error {
+	pending, perr := restoreMarkerPending(dbPath)
+	if perr != nil {
+		return fmt.Errorf("prune: check for pending restore: %w", perr)
+	}
+	if pending {
+		return fmt.Errorf(
+			"%w: a restore marker is pending for this DB; run `continuity snapshot restore --confirm` to complete recovery before pruning",
+			ErrRestoreInterrupted)
+	}
+	return nil
 }
 
 // =========================================================================
@@ -444,13 +495,33 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	// it hashes the live DB, finds it equals the snapshot, and COMPLETES rather
 	// than rolling back over the freshly-restored DB.
 
+	// TEST SEAM (Finding 5): fires AFTER publish and BEFORE the stale-WAL scrub. A
+	// test plants an unremovable -wal at the live name here to prove the scrub
+	// failure becomes a restore error, not a false success. nil in production.
+	if hookAfterPublishBeforeWALScrub != nil {
+		hookAfterPublishBeforeWALScrub(resolvedDB)
+	}
+
 	// Ensure no stale -wal/-shm remain at the LIVE names. They were moved aside
 	// above, but a crash could have left a fresh one; remove any that match the
 	// live names so the restored DB is not paired with a foreign WAL.
+	//
+	// A removal FAILURE here is an ERROR, not a discardable best-effort (Finding 5,
+	// Round 6): a stale -wal/-shm left beside the freshly-restored DB can corrupt or
+	// silently mask the restored image when SQLite next opens it, so returning
+	// success with it still present is a false success. The recovery paths
+	// (completeReconciled / finishPendingRestore) already error on the same op;
+	// normal restore now matches. The DB itself IS already published at this point,
+	// so we surface the failure for the operator to clear the stale WAL by hand
+	// rather than pretend the restore is clean.
 	for _, suffix := range []string{"-wal", "-shm"} {
 		live := resolvedDB + suffix
 		if _, statErr := os.Lstat(live); statErr == nil {
-			_ = os.Remove(live)
+			if rmErr := os.Remove(live); rmErr != nil && !os.IsNotExist(rmErr) {
+				return "", fmt.Errorf(
+					"restore: the database was restored to %s but a stale %s could not be removed (%v); "+
+						"remove it by hand before opening the database", resolvedDB, live, rmErr)
+			}
 		}
 	}
 

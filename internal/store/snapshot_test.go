@@ -3,6 +3,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -3286,6 +3287,432 @@ func TestOpen_PendingMarkerIsNoTouchBeforeChmod(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o644 {
 		t.Errorf("Open chmod'd the DB before failing closed: perm=%o, want 0644 (no-touch)", perm)
+	}
+}
+
+// ===========================================================================
+// ROUND 6 (Codex) lock-LIFECYCLE regression tests.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Finding 1 (CENTERPIECE): no open *sql.DB handle may exist across a lock
+// transition. The risky-migration open must CLOSE its conn + RELEASE shared
+// BEFORE acquiring exclusive, then migrate a FRESH conn opened UNDER exclusive —
+// so a concurrent restore that renames the DB triplet in the gap can never make
+// the migration write to the moved-aside (stale) inode.
+// ---------------------------------------------------------------------------
+
+// TestOpen_RiskyUpgrade_NoHandleAcrossLockTransition drives the exact race. In
+// the window AFTER Open() closes its shared conn + releases SHARED and BEFORE it
+// acquires EXCLUSIVE (the test seam), a SECOND actor:
+//  1. holds a foreign EXCLUSIVE lock (a restore in progress), so Open's exclusive
+//     acquire must BLOCK on it rather than race;
+//  2. "restores" by renaming the live v5 DB triplet ASIDE and publishing a
+//     DIFFERENT v5 DB (carrying a sentinel row) at the live path;
+//  3. releases the foreign exclusive lock.
+//
+// Open must then resume, acquire exclusive, and migrate the LIVE path — the
+// swapped-in DB (sentinel present) — NOT the moved-aside inode. Pre-fix, Open held
+// the original conn open across the release-shared/acquire-exclusive gap, so its
+// SQLite fd still pointed at the moved-aside inode and the migration wrote there,
+// leaving the live (restored) DB at v5 and the sentinel un-migrated. This test
+// asserts the swapped-in (live) DB is what got migrated to head.
+func TestOpen_RiskyUpgrade_NoHandleAcrossLockTransition(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// The "swapped-in" live DB the foreign restore will publish: a distinct v5 DB
+	// carrying a sentinel row, built in a sibling dir so it is a different inode.
+	swapDir := t.TempDir()
+	swapSrc := filepath.Join(swapDir, "swap.db")
+	buildDBAtVersionStandalone(t, swapSrc, 5)
+	{
+		raw, err := sql.Open("sqlite", swapSrc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Exec(`
+			INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
+			VALUES ('mem://user/events/swapped-in-live', 'leaf', 'events', 'live', 1, 1)`); err != nil {
+			t.Fatal(err)
+		}
+		raw.Close()
+	}
+	swapBytes, err := os.ReadFile(swapSrc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lp, _ := dbLockPath(dbPath)
+	var hookFired bool
+	hookAfterSharedReleasedBeforeExclusive = func() {
+		hookFired = true
+		// (1) Hold a foreign EXCLUSIVE lock so Open's exclusive acquire blocks on us.
+		holder, oerr := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+		if oerr != nil {
+			t.Errorf("hook: open lock file: %v", oerr)
+			return
+		}
+		if ok, lerr := flockExclusiveNB(holder); lerr != nil || !ok {
+			holder.Close()
+			t.Errorf("hook: hold foreign exclusive: ok=%v err=%v", ok, lerr)
+			return
+		}
+		// (2) "Restore": rename the live triplet ASIDE, publish the swapped-in DB at
+		// the live path (a DIFFERENT inode), so the live path now resolves to the
+		// sentinel DB while the original inode lingers under .moved.
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			if _, statErr := os.Lstat(resolved + suffix); statErr == nil {
+				_ = os.Rename(resolved+suffix, resolved+suffix+".moved")
+			}
+		}
+		if werr := os.WriteFile(resolved, swapBytes, 0o600); werr != nil {
+			t.Errorf("hook: publish swapped-in db: %v", werr)
+		}
+		// (3) Release the foreign exclusive so Open can proceed to acquire it.
+		holder.Close()
+	}
+	defer func() { hookAfterSharedReleasedBeforeExclusive = nil }()
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open after concurrent restore-in-gap: %v", err)
+	}
+	defer db.Close()
+	if !hookFired {
+		t.Fatal("test seam did not fire — Open did not take the risky-upgrade transition path")
+	}
+
+	// The migration must have run on the LIVE (swapped-in) DB: it reaches head AND
+	// the sentinel row survives the v6/v9 rebuilds. If the migration had written to
+	// the moved-aside inode (pre-fix bug), the live DB would still be v5 with no
+	// migrated schema and the sentinel would never have been migrated.
+	v, _ := db.SchemaVersion()
+	if v != headVersion() {
+		t.Errorf("live DB schema = v%d, want head v%d (migration wrote to the stale moved-aside inode?)", v, headVersion())
+	}
+	var cnt int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM mem_nodes WHERE uri='mem://user/events/swapped-in-live'`).Scan(&cnt); err != nil {
+		t.Fatalf("read sentinel on live DB: %v", err)
+	}
+	if cnt != 1 {
+		t.Errorf("sentinel row count on live DB = %d, want 1 (migration ran against the wrong inode)", cnt)
+	}
+
+	// Independently re-open the live path (no migrate) and confirm it is head — the
+	// migration's bytes landed on the live inode, not the moved-aside one.
+	chk, err := OpenNoMigrate(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chk.Close()
+	if cv, _ := chk.SchemaVersion(); cv != headVersion() {
+		t.Errorf("re-opened live DB schema = v%d, want head (migration hit a stale inode)", cv)
+	}
+}
+
+// TestOpen_RiskyUpgrade_BlocksOnForeignExclusive proves the simpler half of the
+// invariant: a foreign EXCLUSIVE holder present for the WHOLE upgrade makes the
+// risky open fail closed (ErrDBLocked), and the DB stays at v5 — no migration runs
+// while another process holds the DB. Held across the seam so the exclusive acquire
+// exhausts its bounded wait.
+func TestOpen_RiskyUpgrade_BlocksOnForeignExclusive(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	release := foreignFlock(t, dbPath, true) // foreign EXCLUSIVE held for the whole open
+	defer release()
+
+	_, err := Open(dbPath)
+	if err == nil {
+		t.Fatal("Open succeeded while a foreign exclusive lock was held; the risky upgrade must fail closed")
+	}
+	if !errors.Is(err, ErrDBLocked) && !contains(err.Error(), "in use") && !contains(err.Error(), "exclusive") {
+		t.Errorf("Open err = %v, want ErrDBLocked / fail-closed on the foreign exclusive", err)
+	}
+
+	// The DB must remain at v5 — the migration never ran against a locked DB.
+	release()
+	chk, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chk.Close()
+	if v, _ := chk.SchemaVersion(); v != 5 {
+		t.Errorf("schema advanced to v%d despite failing closed on the foreign exclusive; want v5", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 2: Prune must acquire the EXCLUSIVE lock and re-check the marker under
+// it, so it can never delete recovery material out from under an in-flight
+// migration/restore (both EXCLUSIVE holders).
+// ---------------------------------------------------------------------------
+
+// TestPrune_FailsClosedWhileExclusiveLockHeld holds a foreign EXCLUSIVE lock
+// (simulating an in-flight risky migration / restore) and asserts `snapshot prune`
+// fails closed (ErrDBLocked) and deletes NOTHING — the snapshot.db + manifest.json
+// the migration would roll back to survive intact. Pre-fix Prune took no DB lock
+// and would happily delete the restore point mid-migration.
+func TestPrune_FailsClosedWhileExclusiveLockHeld(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // creates a valid restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	if _, err := loadValidManifest(sidecar); err != nil {
+		t.Fatalf("expected a valid restore point pre-prune: %v", err)
+	}
+
+	// A foreign EXCLUSIVE holder (an in-flight migration/restore) is present.
+	release := foreignFlock(t, dbPath, true)
+
+	perr := Prune(dbPath)
+	if perr == nil {
+		release()
+		t.Fatal("Prune deleted recovery material while an exclusive lock was held; it must fail closed")
+	}
+	if !errors.Is(perr, ErrDBLocked) && !contains(perr.Error(), "in use") {
+		release()
+		t.Errorf("Prune err = %v, want ErrDBLocked", perr)
+	}
+
+	// Nothing deleted: the restore point survives intact.
+	if _, err := os.Stat(snapshotDBPathIn(sidecar)); err != nil {
+		release()
+		t.Errorf("Prune removed snapshot.db despite failing closed: %v", err)
+	}
+	if _, err := os.Stat(manifestPathIn(sidecar)); err != nil {
+		release()
+		t.Errorf("Prune removed manifest.json despite failing closed: %v", err)
+	}
+
+	// After the lock clears, prune proceeds normally (no wedge).
+	release()
+	if perr := Prune(dbPath); perr != nil {
+		t.Errorf("Prune refused after the exclusive lock cleared: %v", perr)
+	}
+	if _, err := os.Stat(snapshotDBPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("snapshot.db survived the unblocked prune (err=%v)", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 3: DB.Close must close the underlying sql.DB BEFORE releasing the
+// flock — the lock must outlive the last live SQLite handle.
+// ---------------------------------------------------------------------------
+
+// TestDBClose_LockOutlivesSQLHandle asserts the close ORDERING directly: while a
+// long-running query is in flight on a *DB, a concurrent EXCLUSIVE acquire (a
+// restore) must NOT be granted until DB.Close() returns. sql.DB.Close() blocks
+// until the in-flight query drains; the flock is released only after that, so the
+// exclusive acquire is excluded for the whole life of the handle. Pre-fix the
+// flock was dropped FIRST, so the exclusive acquire could be granted while the
+// query (and its underlying SQLite handle) were still alive.
+func TestDBClose_LockOutlivesSQLHandle(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, headVersion()) // already at head: Open holds SHARED, no migration
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pin a single underlying connection and start a query we control the lifetime
+	// of via a registered slow SQLite function, so sql.DB.Close() must wait for it.
+	// Simpler + deterministic: hold a Tx open (a live handle) and Close in a
+	// goroutine; assert a foreign EXCLUSIVE flock acquire is NOT granted until Close
+	// returns. We drive ordering with a channel the Close goroutine signals.
+	conn, err := db.DB.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A live statement handle on this conn keeps SQLite handles open across Close.
+	rows, err := conn.QueryContext(context.Background(), `SELECT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closeReturned := make(chan struct{})
+	go func() {
+		// Release the live handles after a beat, THEN Close. sql.DB.Close blocks
+		// until conn is returned/closed, so the flock release is deferred until then.
+		time.Sleep(150 * time.Millisecond)
+		rows.Close()
+		conn.Close()
+		_ = db.Close()
+		close(closeReturned)
+	}()
+
+	// Probe a foreign EXCLUSIVE acquire repeatedly. It must FAIL (not be granted)
+	// until Close has returned (the flock is still held). The moment it succeeds,
+	// Close must already have returned — i.e. the lock outlived the handle.
+	lp, _ := dbLockPath(dbPath)
+	grantedBeforeClose := false
+	for {
+		select {
+		case <-closeReturned:
+			goto afterClose
+		default:
+		}
+		f, _ := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+		ok, _ := flockExclusiveNB(f)
+		if ok {
+			// Granted while Close has NOT yet signaled → lock was dropped before the
+			// handle closed (the pre-fix bug).
+			select {
+			case <-closeReturned:
+				// raced; Close just returned — acceptable.
+			default:
+				grantedBeforeClose = true
+			}
+			f.Close()
+			goto afterClose
+		}
+		f.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+afterClose:
+	<-closeReturned
+	if grantedBeforeClose {
+		t.Fatal("exclusive lock was granted before DB.Close() returned: the flock was released before the sql.DB handle closed (Finding 3)")
+	}
+	// And after Close, the exclusive acquire is now grantable.
+	f, _ := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+	if ok, _ := flockExclusiveNB(f); !ok {
+		t.Error("exclusive acquire not granted even after DB.Close() returned")
+	}
+	f.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Finding 4: reusing an existing restore point must re-run integrity_check +
+// snapshot schema validation. A hash-consistent but non-SQLite snapshot.db must
+// make the risky migration fail closed, not silently reuse an unusable point.
+// ---------------------------------------------------------------------------
+
+// TestReuse_NonSQLiteSnapshotFailsClosed builds a self-consistent sidecar whose
+// snapshot.db is GARBAGE (not a SQLite DB) but whose manifest records that
+// garbage's real hash/size and a covering lineage/window. loadValidManifest passes
+// (shape + hash + size), so pre-fix createRestorePointLocked REUSED it and let the
+// risky migration proceed with an unusable restore point. Now reuse runs
+// integrity_check + schema validation and FAILS CLOSED with a prune/recreate
+// message — the risky migration does not run.
+func TestReuse_NonSQLiteSnapshotFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	// Compute the lineage fingerprint of the live v5 DB so the planted manifest
+	// matches THIS DB (lineage gate passes → we exercise the integrity gate).
+	live := openWritableNoMigrate(t, dbPath)
+	fp, err := lineageFingerprint(live, 5)
+	live.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Plant a GARBAGE snapshot.db (valid-looking sidecar, but not a SQLite file).
+	if err := os.MkdirAll(sidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	garbage := []byte("this is definitely not a sqlite database, just bytes")
+	if err := os.WriteFile(snapshotDBPathIn(sidecar), garbage, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, size, err := hashFile(snapshotDBPathIn(sidecar))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A self-consistent manifest: shape valid, hash/size match the garbage bytes,
+	// lineage matches this DB, window covers a v5→head risky upgrade.
+	m := &Manifest{
+		Kind:                        manifestKind,
+		FormatVersion:               manifestFormatVersion,
+		SnapshotFile:                snapshotFileName,
+		CreatedAt:                   time.Now().UTC().Format(time.RFC3339),
+		CreatedByVersion:            "test",
+		PreSchemaVersion:            5,
+		TargetSchemaVersion:         headVersion(),
+		FirstRiskySchemaVersion:     6,
+		LineageFingerprint:          fp,
+		SnapshotSHA256:              sum,
+		SnapshotSizeBytes:           size,
+		ExpiresAfterSuccessfulBoots: defaultExpiresAfterBoots,
+	}
+	if err := writeManifestAtomic(sidecar, m); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: loadValidManifest accepts it (the weakness pre-fix relied on).
+	if _, err := loadValidManifest(sidecar); err != nil {
+		t.Fatalf("precondition: planted sidecar should pass loadValidManifest: %v", err)
+	}
+
+	// The risky upgrade must FAIL CLOSED rather than reuse the unusable point.
+	_, oerr := Open(dbPath)
+	if oerr == nil {
+		t.Fatal("Open reused a hash-consistent non-SQLite restore point; want fail-closed")
+	}
+	if !errors.Is(oerr, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("Open err = %v, want ErrSnapshotSidecarCorrupt (integrity gate on reuse)", oerr)
+	}
+	if !contains(oerr.Error(), "integrity_check") {
+		t.Errorf("reuse failure should cite the integrity_check failure; got: %v", oerr)
+	}
+
+	// The DB must remain at v5 — the risky migration did not run.
+	chk, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chk.Close()
+	if v, _ := chk.SchemaVersion(); v != 5 {
+		t.Errorf("schema advanced to v%d despite the unusable restore point; want v5", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Finding 5: a failure to remove stale -wal/-shm AFTER publish must make Restore
+// return an error, never false success (match the recovery-path behavior).
+// ---------------------------------------------------------------------------
+
+// TestRestore_StaleWALRemovalFailureIsError uses the post-publish seam to plant an
+// UNREMOVABLE -wal at the live name AFTER publish and BEFORE the scrub: a directory
+// containing a child, so os.Remove(<db>-wal) fails with ENOTEMPTY. Restore must
+// return an ERROR rather than success — a stale WAL left beside the restored DB is
+// a false-success the bar forbids. Pre-fix the scrub discarded the removal error
+// (`_ = os.Remove(live)`) and returned success with the stale WAL still present.
+func TestRestore_StaleWALRemovalFailureIsError(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // migrate to head + create restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	hookAfterPublishBeforeWALScrub = func(resolvedDB string) {
+		// Plant an UNREMOVABLE -wal at the live name: a non-empty directory, so the
+		// scrub's os.Remove fails with ENOTEMPTY.
+		_ = os.MkdirAll(filepath.Join(resolvedDB+"-wal", "child"), 0o700)
+	}
+	defer func() { hookAfterPublishBeforeWALScrub = nil }()
+
+	_, rerr := Restore(dbPath)
+	if rerr == nil {
+		t.Fatal("Restore returned success despite a stale -wal that could not be removed (false success)")
+	}
+	if !contains(rerr.Error(), "-wal") && !contains(rerr.Error(), "stale") {
+		t.Errorf("Restore err = %v, want a stale-WAL removal error", rerr)
 	}
 }
 

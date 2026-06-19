@@ -1,9 +1,106 @@
 # Restore Recovery Model — fail-closed pivot (Round 3)
 
+> **Round 6 update (Codex):** lock-LIFECYCLE hardening. The flock primitive itself
+> was sound; the bugs were in WHEN locks are acquired/released relative to SQLite
+> open/close and prune. See **"Lock-lifecycle invariants (Round 6)"** at the top.
+
 > **Round 5 update (Codex):** the hand-rolled PID serve-lock / op-lock was
 > REPLACED by an OS-flock shared/exclusive lock. See **"OS flock lock discipline
 > (Round 5)"** below; the Round-3/4 "serve lockfile" / "op-lock" sections are
 > historical context for what the flock lock replaces.
+
+## Lock-lifecycle invariants (Round 6)
+
+These are the load-bearing rules added after the sixth review. The flock primitive
+is unchanged; these constrain its lifecycle.
+
+### 1. NO OPEN *sql.DB HANDLE ACROSS A LOCK TRANSITION (Finding 1, centerpiece)
+
+A SQLite connection is only ever open while the CORRECT lock level is HELD. The
+dangerous shared→exclusive UPGRADE must NEVER happen with a live handle open.
+
+Concretely, `store.Open()` of an existing on-disk DB:
+
+- acquires SHARED, opens the conn, and probes (under SHARED) whether a RISKY
+  migration is pending (`db.riskyUpgradePending()`).
+- **No risky migration pending** → keep SHARED + conn and migrate normally
+  (non-risky ALTER migrations do not rewrite tables; safe under the lifetime
+  SHARED lock). Unchanged.
+- **A risky migration IS pending** (`openRiskyUpgradeUnderExclusive`):
+  1. CLOSE the conn and RELEASE shared — now NO `*sql.DB` handle to this path
+     exists. (`DB.Close()` closes sql.DB FIRST then drops the lock, Finding 3, so
+     the handle is provably gone.)
+  2. acquire EXCLUSIVE (bounded wait, fail closed), then RE-CHECK the
+     interrupted-restore marker under exclusive — a restore that won the gap left
+     a marker; fail closed on it.
+  3. open a FRESH conn AFTER exclusive is held and run the restore-point + DDL
+     under EXCLUSIVE (`migratingUnderExclusive` set; `migrate()` does NOT
+     re-acquire — the in-process RWMutex is not re-entrant).
+  4. ATOMICALLY downgrade the flock EX→SH on the SAME fd
+     (`flockDowngradeToShared`) so there is NO cross-process window in which the
+     DB is unlocked, then hand the connection that lifetime SHARED hold.
+
+The old `acquireMigrateExclusive` "release-shared-with-the-conn-still-open → take
+exclusive → migrate the open conn → downgrade" dance is DELETED: it released SHARED
+while a live conn was open, so a concurrent `restore --confirm` could rename the DB
+triplet aside and the migration would then write to the MOVED-ASIDE inode (the open
+fd kept it alive) while the live path held the restored DB. The invariant asserted
+in code + test: between releasing shared and acquiring exclusive there is NO open
+`*sql.DB` handle to this path; DDL + restore-point creation run only under EXCLUSIVE
+on a conn opened AFTER exclusive is held.
+
+**In-process RWMutex vs the EX→SH downgrade.** flock supports an atomic LOCK_EX→
+LOCK_SH on one fd (no cross-process gap). The in-process RWMutex is NOT atomically
+downgradable, so `downgradeExclusiveToShared` does the flock downgrade first (a real
+second process is excluded throughout by the unbroken flock hold) and then flips the
+in-process mutex Unlock()→RLock(). That leaves at most an IN-PROCESS window, which is
+harmless: a same-process restore/migration would itself need both the in-process
+write lock AND the flock, and the flock never goes to "unlocked / foreign-grantable"
+across the call. A REAL second process can only act after the single in-kernel EX→SH
+transition. Pinned by `TestOpen_RiskyUpgrade_NoHandleAcrossLockTransition` (in-
+process race via a test seam) and `TestOpen_RiskyUpgrade_BlocksOnForeignExclusive`.
+
+### 2. PRUNE IS LOCKED (Finding 2)
+
+`Prune` acquires the EXCLUSIVE DB lock (bounded wait, fail closed with `ErrDBLocked`)
+and re-checks `restoreMarkerPending` UNDER the lock before deleting anything. So
+prune SERIALIZES against a risky migration (EXCLUSIVE across restore-point creation +
+DDL) and a restore (EXCLUSIVE for its whole span): it can never delete
+`manifest.json` / `snapshot.db` — the only recovery material — out from under an
+in-flight migration/restore, nor after a concurrent restore passed its pre-marker
+checks. The marker is checked BEFORE taking the lock (fast refusal) AND again under
+the lock (a restore that wrote its marker while prune waited still stops it). Pinned
+by `TestPrune_FailsClosedWhileExclusiveLockHeld` (and the existing
+`TestPrune_RefusesWhileRestoreMarkerPending`).
+
+### 3. THE LOCK OUTLIVES THE LAST LIVE HANDLE (Finding 3)
+
+`DB.Close()` closes the underlying `sql.DB` FIRST (which can block until in-flight
+queries drain and the SQLite file handles actually close), and only THEN releases
+the flock / RWMutex. A restore's EXCLUSIVE acquire therefore cannot be granted while
+any SQLite handle to the path is still alive. Pinned by
+`TestDBClose_LockOutlivesSQLHandle`.
+
+### 4. REUSE RE-VALIDATES THE RESTORE POINT (Finding 4)
+
+Before REUSING an existing restore point to cover a risky migration,
+`createRestorePointLocked` runs the SAME `PRAGMA integrity_check` + snapshot
+schema-version validation that creation/restore do — `loadValidManifest` only proves
+shape + hash + size, so a self-consistent manifest beside a non-SQLite `snapshot.db`
+(matching recorded hash) would otherwise be reused and the risky migration would
+proceed with an unusable restore point (restore later fails integrity_check). On
+failure it does NOT reuse and does NOT silently proceed: it fails closed with a
+prune/recreate message. Pinned by `TestReuse_NonSQLiteSnapshotFailsClosed`.
+
+### 5. RESTORE WAL/SHM CLEANUP IS NOT BEST-EFFORT (Finding 5)
+
+After publishing the restored DB, a failure to remove a stale live `-wal`/`-shm` is a
+restore ERROR, not a discarded best-effort — returning success with a stale WAL
+beside the restored DB is a false success (the recovery paths already error on the
+same op; normal restore now matches). Pinned by
+`TestRestore_StaleWALRemovalFailureIsError`.
+
+---
 
 This note records the recovery contract for the migration restore point after the
 third cross-model adversarial review (Codex) found the prior crash-recovery model

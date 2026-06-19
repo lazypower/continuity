@@ -704,7 +704,38 @@ func (db *DB) createRestorePointLocked(preVersion, target, firstRisky int) error
 			existing.TargetSchemaVersion >= target &&
 			preVersion < existing.TargetSchemaVersion
 		if covers {
-			return nil // reuse — same lineage AND the existing point still covers us
+			// REUSE INTEGRITY GATE (Finding 4, Round 6): loadValidManifest proved the
+			// manifest's SHAPE + the snapshot.db's hash/size match what the manifest
+			// records, but a self-consistent manifest can still sit beside a
+			// snapshot.db that is NOT a usable SQLite database (garbage bytes whose
+			// recorded hash happens to match a hand-edited/forged manifest). Reusing
+			// it would let the risky migration proceed with a restore point that
+			// `restore --confirm` later fails integrity_check on — defeating the whole
+			// safety feature. Before trusting an EXISTING point to cover this run we
+			// run the SAME PRAGMA integrity_check + snapshot-schema-version validation
+			// that creation and restore do. On failure we DO NOT reuse and DO NOT
+			// silently proceed: fail closed so the operator prunes/recreates.
+			snapPath := snapshotDBPathIn(sidecar)
+			if err := integrityCheck(snapPath); err != nil {
+				return fmt.Errorf(
+					"%w: existing restore point failed integrity_check (%v); "+
+						"run 'continuity snapshot prune --confirm' to remove it and let a fresh restore point be created",
+					ErrSnapshotSidecarCorrupt, err)
+			}
+			sv, svErr := snapshotSchemaVersion(snapPath)
+			if svErr != nil {
+				return fmt.Errorf(
+					"%w: could not read existing restore point's schema version (%v); "+
+						"run 'continuity snapshot prune --confirm' to remove it",
+					ErrSnapshotSidecarCorrupt, svErr)
+			}
+			if sv != existing.PreSchemaVersion {
+				return fmt.Errorf(
+					"%w: existing restore point's snapshot is schema v%d but its manifest records pre-v%d; "+
+						"run 'continuity snapshot prune --confirm' to remove it",
+					ErrSnapshotSidecarCorrupt, sv, existing.PreSchemaVersion)
+			}
+			return nil // reuse — same lineage, covers us, AND the snapshot is a valid DB
 		}
 		// Otherwise the existing point does NOT protect this run: it is either for
 		// an ALREADY-COMPLETED upgrade (current schema >= existing target) or a

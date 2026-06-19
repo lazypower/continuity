@@ -20,22 +20,47 @@ type DB struct {
 	// read-only inspection). Closed by Close so the flock is released when the
 	// connection goes away. See snapshot_lock.go for the lock discipline.
 	lock *dbLockHandle
+
+	// migratingUnderExclusive is set by Open() ONLY for the risky-upgrade
+	// transition (Finding 1, Round 6): Open detected a pending risky migration,
+	// closed the first conn, released SHARED, acquired EXCLUSIVE, and opened THIS
+	// fresh conn under the held exclusive lock. migrate() then runs the
+	// restore-point + destructive DDL WITHOUT re-acquiring the lock (the in-process
+	// RWMutex is not re-entrant and the flock fd is already exclusive). It is the
+	// flag that replaces the old shared→exclusive downgrade-with-a-live-handle
+	// dance: no *sql.DB handle exists across the lock transition.
+	migratingUnderExclusive bool
 }
 
-// Close releases the SHARED advisory lock (if held) AND closes the underlying
-// sql.DB. Releasing the lock here is what bounds a writable open's SHARED hold
-// to the connection lifetime, so a Restore's EXCLUSIVE acquire can proceed once
-// every writer has closed.
+// Close closes the underlying sql.DB FIRST, then releases the SHARED advisory
+// lock (if held). Ordering matters (Finding 3, Round 6): sql.DB.Close() can block
+// until in-flight queries drain and the underlying SQLite file handles are
+// actually closed. If we dropped the flock first, a concurrent Restore could win
+// the EXCLUSIVE lock and rename the DB triplet while those SQLite handles were
+// still alive — the very swap-under-a-live-handle the bar forbids. The lock must
+// OUTLIVE the last live handle, so the flock/RWMutex release happens only after
+// sql.DB.Close() returns. Releasing the lock here is what bounds a writable open's
+// SHARED hold to the connection lifetime, so a Restore's EXCLUSIVE acquire can
+// proceed once every writer has fully closed.
 func (db *DB) Close() error {
+	var closeErr error
+	if db.DB != nil {
+		// Close the underlying handles FIRST so the lock is not dropped while a
+		// SQLite handle to this path is still open.
+		closeErr = db.DB.Close()
+	}
 	if db.lock != nil {
 		db.lock.release()
 		db.lock = nil
 	}
-	if db.DB != nil {
-		return db.DB.Close()
-	}
-	return nil
+	return closeErr
 }
+
+// hookAfterSharedReleasedBeforeExclusive is a TEST-ONLY seam (nil in production)
+// fired inside openRiskyUpgradeUnderExclusive after the SHARED lock is released
+// and before EXCLUSIVE is acquired — the precise window Finding 1's race targets.
+// See TestOpen_RiskyUpgrade_NoHandleAcrossLockTransition.
+var hookAfterSharedReleasedBeforeExclusive func()
 
 // DefaultDBPath returns the default database path: ~/.continuity/continuity.db
 func DefaultDBPath() (string, error) {
@@ -113,9 +138,116 @@ func Open(path string) (*DB, error) {
 		db.Close()
 		return nil, err
 	}
+
+	// NO-OPEN-HANDLE-ACROSS-LOCK-TRANSITION (Finding 1, Round 6).
+	//
+	// Determine — through the SHARED-locked conn — whether opening this DB would
+	// run a RISKY (destructive table-rebuild) migration. If it would, the migration
+	// must run under EXCLUSIVE; but the dangerous shared→exclusive UPGRADE must
+	// never happen with a live SQLite handle open. A concurrent restore could win
+	// that gap, rename the DB triplet aside, and the migration would then write to
+	// the moved-aside inode while the live path holds the restored DB. So we:
+	//
+	//   1. probe risky-pending under SHARED,
+	//   2. if pending: CLOSE this conn + RELEASE shared so NO handle is open,
+	//   3. acquire EXCLUSIVE (bounded wait, fail closed), then re-check the
+	//      interrupted-restore marker — a restore that won the gap left a marker,
+	//   4. open a FRESH conn under the held exclusive lock and run the
+	//      restore-point + DDL there (migrate() with migratingUnderExclusive set),
+	//   5. ATOMICALLY downgrade the flock EX→SH on the SAME fd (no cross-process
+	//      window) and hand the connection that lifetime SHARED hold.
+	//
+	// Non-risky / fresh / ineligible opens keep SHARED + this conn (unchanged).
+	risky, _, rerr := db.riskyUpgradePending()
+	if rerr != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", rerr)
+	}
+	if !risky {
+		// Normal case: migrate under the lifetime SHARED lock with this conn.
+		if err := db.migrate(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+		return db, nil
+	}
+
+	return openRiskyUpgradeUnderExclusive(path, db)
+}
+
+// openRiskyUpgradeUnderExclusive performs the risky-migration open so that NO
+// open *sql.DB handle exists across the shared→exclusive lock transition
+// (Finding 1, Round 6). On entry `shared` is the SHARED-locked conn Open created;
+// it is CLOSED and its SHARED lock RELEASED before any exclusive acquire, so the
+// dangerous upgrade never races a concurrent restore that could rename the DB
+// triplet out from under a live handle. The destructive DDL runs only on a FRESH
+// conn opened AFTER EXCLUSIVE is held; the lock is then atomically downgraded
+// EX→SH on the same fd for the returned connection's lifetime.
+func openRiskyUpgradeUnderExclusive(path string, shared *DB) (*DB, error) {
+	// Step 2: close the conn and release SHARED so NO handle to this path is open
+	// during the lock transition. shared.Close() closes sql.DB FIRST then releases
+	// the flock/RWMutex (Finding 3 ordering), so the handle is provably gone before
+	// the exclusive acquire below.
+	if err := shared.Close(); err != nil {
+		return nil, fmt.Errorf("migrate: close shared conn before exclusive upgrade: %w", err)
+	}
+
+	// TEST SEAM (Finding 1): fires in the exact window the race exploits — AFTER the
+	// shared conn is closed + SHARED released and BEFORE EXCLUSIVE is acquired. A
+	// test installs a hook that, e.g., holds a foreign EXCLUSIVE lock and "restores"
+	// (renames the triplet) here, proving (1) the upgrade BLOCKS on the foreign
+	// exclusive rather than racing, and (2) when it resumes it operates on the LIVE
+	// path / fails closed, never on a stale moved-aside inode. nil in production.
+	if hookAfterSharedReleasedBeforeExclusive != nil {
+		hookAfterSharedReleasedBeforeExclusive()
+	}
+
+	// Step 3: acquire EXCLUSIVE with no open handle in flight. Bounded wait, fail
+	// closed (ErrDBLocked) — never proceed while another process holds the DB.
+	ex, lerr := acquireExclusiveLock(path)
+	if lerr != nil {
+		return nil, fmt.Errorf("migrate: acquire exclusive for risky upgrade: %w", lerr)
+	}
+
+	// A restore could have WON the gap between our shared release and this exclusive
+	// acquire: it would have renamed the triplet and left an interrupted/cleared
+	// marker. Re-check the marker UNDER exclusive so we never migrate a half-restored
+	// or moved-aside DB. Fail closed (release exclusive first).
+	if err := detectRestoreInterrupted(path); err != nil {
+		ex.release()
+		return nil, err
+	}
+
+	// Step 4: open a FRESH conn AFTER exclusive is held. Every byte the migration
+	// writes lands on the inode the live path resolves to right now, under the lock.
+	sqlDB, oerr := sql.Open("sqlite", path)
+	if oerr != nil {
+		ex.release()
+		return nil, fmt.Errorf("migrate: reopen under exclusive: %w", oerr)
+	}
+	db := &DB{DB: sqlDB, Path: path, lock: ex, migratingUnderExclusive: true}
+	if err := db.configurePragmas(); err != nil {
+		db.Close() // closes conn then releases exclusive
+		return nil, err
+	}
 	if err := db.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+
+	// Step 5: the destructive DDL is done. Atomically downgrade the flock EX→SH on
+	// the SAME fd so there is NO cross-process window in which the DB is unlocked
+	// (a separate process taking EXCLUSIVE/SHARED can only do so after this single
+	// in-kernel transition). The in-process RWMutex is NOT atomically downgradable,
+	// so we drop its write lock and take its read lock around the flock downgrade;
+	// that leaves at most an IN-PROCESS window, which is harmless: a same-process
+	// "restore"/migration would itself need the in-process write lock AND the flock,
+	// and the flock never leaves exclusive→shared for a foreign process. A REAL
+	// second process is excluded throughout by the unbroken flock hold.
+	db.migratingUnderExclusive = false
+	if err := db.downgradeExclusiveToShared(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: downgrade exclusive→shared after upgrade: %w", err)
 	}
 	return db, nil
 }

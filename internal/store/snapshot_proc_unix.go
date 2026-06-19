@@ -55,6 +55,20 @@ func flockExclusiveNB(f *os.File) (bool, error) {
 	return false, err
 }
 
+// flockDowngradeToShared ATOMICALLY converts an exclusive (LOCK_EX) lock held on
+// f's open-file-description down to shared (LOCK_SH), WITHOUT an intervening
+// unlocked window (Finding 1, Round 6). flock(2) permits applying LOCK_SH to an
+// fd already holding LOCK_EX as a single in-kernel transition: the lock is never
+// fully released, so no other process can slip an exclusive acquire in between.
+// This is what lets a risky migration run under EXCLUSIVE and then hand the
+// connection a lifetime SHARED hold on the SAME fd with no cross-process gap.
+func flockDowngradeToShared(f *os.File) error {
+	// Blocking form (no LOCK_NB): downgrading EX→SH never has to wait — we already
+	// hold the stronger lock — so this returns immediately, and retrying on EINTR
+	// keeps a signal from spuriously failing the transition.
+	return flockRetryEINTR(f, syscall.LOCK_SH)
+}
+
 // flockRetryEINTR calls flock(2) and retries on EINTR (a signal can interrupt a
 // blocking flock). The fd comes from *os.File so it stays valid for the call.
 func flockRetryEINTR(f *os.File, how int) error {
