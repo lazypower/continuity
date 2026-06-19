@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -66,11 +67,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Record this binary's version in any restore-point manifest the upcoming
+	// Open() writes (it runs migrations, which may create a snapshot).
+	store.SetSnapshotCreatedByVersion("continuity " + VersionString())
+
 	db, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
 	defer db.Close()
+
+	// Hold an advisory serve lock so `continuity snapshot restore` refuses to
+	// swap the DB out from under a live server. Best-effort: a lock-write
+	// failure logs but does not block serving.
+	if release, lockErr := store.AcquireServeLock(dbPath); lockErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not acquire serve lock: %v\n", lockErr)
+	} else {
+		defer release()
+	}
 
 	// Create LLM client and engine
 	var eng *engine.Engine
@@ -164,6 +178,23 @@ func runServe(cmd *cobra.Command, args []string) error {
 		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
+	// Explicit bind so the restore-point boot tick fires only AFTER the
+	// kernel has actually given us the port — a failed bind (e.g. port in
+	// use by a second serve) must NOT count as a successful boot.
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+
+	// Successful boot: bind succeeded. Tick the restore point's boot counter
+	// (and expire it once the threshold is reached). Best-effort — a bad
+	// sidecar must never crash a healthy serve; we log and continue.
+	if curVersion, verr := db.SchemaVersion(); verr == nil {
+		if berr := store.RecordSuccessfulBoot(dbPath, curVersion); berr != nil {
+			fmt.Fprintf(os.Stderr, "warning: restore-point boot tick: %v\n", berr)
+		}
+	}
+
 	// Graceful shutdown
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
@@ -171,7 +202,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	go func() {
 		fmt.Fprintf(os.Stderr, "continuity serving on %s\n", addr)
 		fmt.Fprintf(os.Stderr, "  db: %s\n", dbPath)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 			os.Exit(1)
 		}

@@ -8,6 +8,12 @@ type migration struct {
 	Version     int
 	Description string
 	SQL         string
+	// Risky marks a migration that performs a destructive, non-reversible
+	// rewrite of an existing table (CREATE _new + INSERT SELECT * + DROP +
+	// RENAME). A committed-but-logically-wrong risky migration cannot be
+	// undone by re-running migrate(), so the presence of a pending risky
+	// migration is what triggers an upgrade restore point (see snapshot.go).
+	Risky bool
 }
 
 var migrations = []migration{
@@ -111,6 +117,7 @@ CREATE TABLE mem_vectors (
 	{
 		Version:     6,
 		Description: "mem_nodes: add moments category",
+		Risky:       true,
 		SQL: `
 PRAGMA foreign_keys=OFF;
 
@@ -171,6 +178,7 @@ ALTER TABLE mem_nodes ADD COLUMN superseded_by TEXT;
 	{
 		Version:     9,
 		Description: "mem_nodes: add feedback and reference categories (issue #24)",
+		Risky:       true,
 		SQL: `
 PRAGMA foreign_keys=OFF;
 
@@ -238,7 +246,7 @@ func headVersion() int {
 // Typed error so callers (e.g. a future `continuity doctor` command or a
 // recovery flow) can branch on it without parsing the message string.
 type ErrSchemaTooNew struct {
-	Found    int
+	Found     int
 	Supported int
 }
 
@@ -278,6 +286,17 @@ func (db *DB) migrate() error {
 	}
 	if head := headVersion(); maxApplied > head {
 		return &ErrSchemaTooNew{Found: maxApplied, Supported: head}
+	}
+
+	// Upgrade restore point: if this is an existing on-disk DB (current
+	// version > 0) and the pending migration set contains at least one risky
+	// migration, take ONE restore point of the pre-upgrade state before any
+	// pending migration runs. Fails closed — if the snapshot is required but
+	// cannot be created/validated, abort the migration with no schema change.
+	// Skipped for fresh installs (maxApplied == 0), :memory:, and SQLite
+	// URI/DSN paths (see ensureUpgradeRestorePoint).
+	if err := db.ensureUpgradeRestorePoint(maxApplied); err != nil {
+		return err
 	}
 
 	for _, m := range migrations {

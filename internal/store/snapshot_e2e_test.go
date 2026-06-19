@@ -1,0 +1,239 @@
+//go:build !windows
+
+package store
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/lazypower/continuity/internal/testharness"
+)
+
+// Snapshot e2e tests boot the real `continuity serve` binary against a v5 DB
+// and assert the upgrade restore point is created, expires after successful
+// boots, and that the snapshot CLI verbs behave through the binary. They reuse
+// the buildDBAtVersion / startSubprocessAgainstDB scaffolding from
+// migration_e2e_test.go.
+
+// TestSnapshotE2E_UpgradeFromV5CreatesSidecar boots against a seeded v5 DB and
+// asserts the sidecar + manifest land with pre_schema_version=5 and
+// first_risky_schema_version=6.
+func TestSnapshotE2E_UpgradeFromV5CreatesSidecar(t *testing.T) {
+	if testing.Short() {
+		t.Skip("snapshot e2e: skipped under -short")
+	}
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := t.TempDir()
+
+	dbPath := buildDBAtVersion(t, workDir, 5)
+	seedV5Data(t, dbPath)
+
+	_, _, srv := startSubprocessAgainstDB(t, bin, workDir, dbPath)
+	t.Cleanup(srv.Stop)
+
+	sidecar, err := sidecarPath(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := loadValidManifest(sidecar)
+	if err != nil {
+		t.Fatalf("restore point missing after upgrade boot: %v", err)
+	}
+	if m.PreSchemaVersion != 5 {
+		t.Errorf("pre_schema_version = %d, want 5", m.PreSchemaVersion)
+	}
+	if m.FirstRiskySchemaVersion != 6 {
+		t.Errorf("first_risky_schema_version = %d, want 6", m.FirstRiskySchemaVersion)
+	}
+	// The sidecar dir must be 0700.
+	if info, err := os.Stat(sidecar); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o700 {
+		t.Errorf("sidecar perms = %o, want 0700", info.Mode().Perm())
+	}
+}
+
+// TestSnapshotE2E_SidecarRegularFileFailsClosed makes <db>.snapshot a regular
+// FILE (not a dir) before boot. The risky migration must fail closed: serve
+// exits non-zero and the DB stays at v5.
+func TestSnapshotE2E_SidecarRegularFileFailsClosed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("snapshot e2e: skipped under -short")
+	}
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := t.TempDir()
+
+	dbPath := buildDBAtVersion(t, workDir, 5)
+	seedV5Data(t, dbPath)
+
+	sidecar, err := sidecarPath(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Plant a regular file where the sidecar dir would go.
+	if err := os.WriteFile(sidecar, []byte("not a dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, env := testharness.HermeticEnv(t, workDir, dbPath, 0)
+	res := testharness.RunCLI(t, bin, env, "serve")
+	if res.ExitCode == 0 {
+		t.Errorf("serve exited 0 despite blocked restore point\nstderr:\n%s", res.Stderr)
+	}
+
+	// DB must remain at v5 — no pending migration ran.
+	db, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	v, _ := db.SchemaVersion()
+	if v != 5 {
+		t.Errorf("schema advanced to v%d despite fail-closed; want v5", v)
+	}
+}
+
+// TestSnapshotE2E_StatusCLI_NoSidecarOnFreshCopy migrates a DB, copies just
+// the DB (without its sidecar) to scratch.db, and asserts `snapshot status`
+// reports no restore point for the copy.
+func TestSnapshotE2E_StatusCLI_NoSidecarOnFreshCopy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("snapshot e2e: skipped under -short")
+	}
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := t.TempDir()
+
+	dbPath := buildDBAtVersion(t, workDir, 5)
+	seedV5Data(t, dbPath)
+	_, _, srv := startSubprocessAgainstDB(t, bin, workDir, dbPath)
+	srv.Stop()
+
+	// Copy ONLY the DB to a new path (no sidecar travels with it).
+	scratch := filepath.Join(workDir, "scratch.db")
+	if err := copyFile(dbPath, scratch); err != nil {
+		t.Fatal(err)
+	}
+
+	_, env := testharness.HermeticEnv(t, workDir, scratch, 0)
+	res := testharness.RunCLI(t, bin, env, "snapshot", "status")
+	res.ExpectExit(t, 0)
+	res.ExpectStdoutContains(t, "no restore point")
+}
+
+// TestSnapshotE2E_PruneCLI migrates a DB then prunes via the CLI, asserting
+// the sidecar files are gone afterward and a second prune reports none.
+func TestSnapshotE2E_PruneCLI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("snapshot e2e: skipped under -short")
+	}
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := t.TempDir()
+
+	dbPath := buildDBAtVersion(t, workDir, 5)
+	seedV5Data(t, dbPath)
+	_, _, srv := startSubprocessAgainstDB(t, bin, workDir, dbPath)
+	srv.Stop()
+
+	sidecar, _ := sidecarPath(dbPath)
+	if _, err := loadValidManifest(sidecar); err != nil {
+		t.Fatalf("restore point should exist pre-prune: %v", err)
+	}
+
+	_, env := testharness.HermeticEnv(t, workDir, dbPath, 0)
+
+	// Prune without --confirm must refuse.
+	noConfirm := testharness.RunCLI(t, bin, env, "snapshot", "prune")
+	if noConfirm.ExitCode == 0 {
+		t.Errorf("prune without --confirm exited 0\nstderr:\n%s", noConfirm.Stderr)
+	}
+
+	res := testharness.RunCLI(t, bin, env, "snapshot", "prune", "--confirm")
+	res.ExpectExit(t, 0)
+
+	if _, err := os.Stat(snapshotDBPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("snapshot.db survived prune (err=%v)", err)
+	}
+
+	res2 := testharness.RunCLI(t, bin, env, "snapshot", "prune", "--confirm")
+	if res2.ExitCode == 0 {
+		t.Errorf("second prune exited 0, expected no-restore-point error")
+	}
+}
+
+// TestSnapshotE2E_RestoreCLI_RoundTrip migrates v5→head, mutates, then
+// restores via the CLI and verifies the v5 image returns.
+func TestSnapshotE2E_RestoreCLI_RoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("snapshot e2e: skipped under -short")
+	}
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := t.TempDir()
+
+	dbPath := buildDBAtVersion(t, workDir, 5)
+	seedV5Data(t, dbPath)
+	_, _, srv := startSubprocessAgainstDB(t, bin, workDir, dbPath)
+	srv.Stop() // release the serve lock so restore is allowed
+
+	_, env := testharness.HermeticEnv(t, workDir, dbPath, 0)
+
+	// restore without --confirm refuses.
+	noConfirm := testharness.RunCLI(t, bin, env, "snapshot", "restore")
+	if noConfirm.ExitCode == 0 {
+		t.Errorf("restore without --confirm exited 0")
+	}
+
+	res := testharness.RunCLI(t, bin, env, "snapshot", "restore", "--confirm")
+	res.ExpectExit(t, 0)
+
+	db, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	v, _ := db.SchemaVersion()
+	if v != 5 {
+		t.Errorf("after CLI restore schema = v%d, want v5", v)
+	}
+}
+
+// TestSnapshotE2E_ExpiresAfterThreeBoots boots the binary three times against
+// the same DB; after the third successful bind the sidecar files are gone and
+// the DB itself is untouched (still at head).
+func TestSnapshotE2E_ExpiresAfterThreeBoots(t *testing.T) {
+	if testing.Short() {
+		t.Skip("snapshot e2e: skipped under -short")
+	}
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := t.TempDir()
+
+	dbPath := buildDBAtVersion(t, workDir, 5)
+	seedV5Data(t, dbPath)
+
+	sidecar, _ := sidecarPath(dbPath)
+	for i := 1; i <= 3; i++ {
+		homeDir := t.TempDir()
+		_, env := testharness.HermeticEnv(t, homeDir, dbPath, 0)
+		srv := testharness.StartServeProcess(t, bin, env)
+		testharness.WaitForReady(t, "http://127.0.0.1:"+envGet(env, "CONTINUITY_PORT")+"/api/health")
+		srv.Stop()
+	}
+
+	if _, err := os.Stat(manifestPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("manifest survived 3 boots (err=%v)", err)
+	}
+	if _, err := os.Stat(snapshotDBPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("snapshot.db survived 3 boots (err=%v)", err)
+	}
+
+	// DB still at head and readable.
+	db, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	v, _ := db.SchemaVersion()
+	if v != headVersion() {
+		t.Errorf("db schema = v%d after expiry, want head v%d", v, headVersion())
+	}
+}

@@ -53,6 +53,30 @@ func Open(path string) (*DB, error) {
 	return db, nil
 }
 
+// OpenNoMigrate opens (or attaches to) the SQLite database at path and
+// configures pragmas, but does NOT run migrate(). It is the inspection-only
+// open used by snapshot integrity checks, lineage fingerprinting, and the
+// restore/cleanup commands — none of which should advance the schema of the
+// DB they are examining. The caller MUST Close the returned *DB.
+//
+// Unlike Open it does not create the parent directory or harden permissions:
+// it is meant for files that already exist (or, for staged snapshot temps,
+// files the caller created). Opening a missing file lazily creates an empty
+// DB the way sql.Open("sqlite", ...) always does, so callers that care about
+// existence should stat first.
+func OpenNoMigrate(path string) (*DB, error) {
+	sqlDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite (no migrate): %w", err)
+	}
+	db := &DB{DB: sqlDB, Path: path}
+	if err := db.configurePragmas(); err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
 // OpenMemory opens an in-memory SQLite database for testing.
 func OpenMemory() (*DB, error) {
 	sqlDB, err := sql.Open("sqlite", ":memory:")
