@@ -3,12 +3,25 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+// xmlEscape escapes a value for safe interpolation into a plist <string> element.
+// launchd plists are XML, so a PATH (or binary path) containing &, <, >, or quote
+// characters would otherwise corrupt the file. Uses encoding/xml's escaper.
+func xmlEscape(s string) string {
+	var buf bytes.Buffer
+	if err := xml.EscapeText(&buf, []byte(s)); err != nil {
+		return s
+	}
+	return buf.String()
+}
 
 const (
 	launchAgentLabel = "com.continuity.server"
@@ -63,7 +76,7 @@ func generatePlist() (string, error) {
     <string>%s</string>
 </dict>
 </plist>
-`, launchAgentLabel, self, servicePATH(), logPath, logPath), nil
+`, xmlEscape(launchAgentLabel), xmlEscape(self), xmlEscape(servicePATH()), xmlEscape(logPath), xmlEscape(logPath)), nil
 }
 
 func platformServiceStatus() (installed bool, status string) {

@@ -109,6 +109,17 @@ func SpawnDetachedServe() (int, error) {
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("spawn: %w", err)
 	}
-	// Don't wait on the child — it's fully detached.
-	return cmd.Process.Pid, nil
+	// The child is fully detached (its own session via Setsid) and persists
+	// after we exit. But we are still its PARENT until we exit, so if it crashes
+	// on boot it becomes a ZOMBIE we own. A zombie answers signal-0 liveness
+	// probes as ALIVE, which would mask a crash-on-boot during `continuity
+	// restart`'s verify poll (the bare verifier would fall through to a soft
+	// timeout instead of the hard verifyFailedDead). Reap it in the background so
+	// a crashed child is collected promptly and ProcessAlive(pid) reports false
+	// once it's gone. This is non-blocking: the goroutine waits, the caller (the
+	// autostart hook) returns immediately and may exit at will — once the parent
+	// exits, init/launchd reaps the orphan anyway.
+	pid := cmd.Process.Pid
+	go func() { _ = cmd.Wait() }()
+	return pid, nil
 }

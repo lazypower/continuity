@@ -60,6 +60,35 @@ func TestBuildServicePATH(t *testing.T) {
 			t.Errorf("/usr/bin appeared %d times, want 1: %q", seen["/usr/bin"], got)
 		}
 	})
+
+	t.Run("entries with control chars are dropped (no line injection)", func(t *testing.T) {
+		// A PATH entry containing a newline would inject extra lines into the
+		// generated systemd unit / corrupt the plist. It must be dropped while the
+		// well-formed entries survive. (Fix 2)
+		install := "/good/tools" + sep + "/evil\nEnvironment=FOO=bar" + sep + "/also/good"
+		got := buildServicePATH(install, home)
+		if strings.ContainsAny(got, "\n\r\t") {
+			t.Errorf("buildServicePATH leaked a control char: %q", got)
+		}
+		if strings.Contains(got, "Environment=FOO=bar") {
+			t.Errorf("control-char entry was not dropped (line-injection risk): %q", got)
+		}
+		if !strings.Contains(got, "/good/tools") || !strings.Contains(got, "/also/good") {
+			t.Errorf("well-formed entries should survive control-char neighbor: %q", got)
+		}
+		// Whole result must remain a single logical line.
+		if len(strings.Split(got, "\n")) != 1 {
+			t.Errorf("service PATH must stay one line, got multiple: %q", got)
+		}
+	})
+
+	t.Run("space-containing dir is preserved", func(t *testing.T) {
+		install := "/Applications/My Tools/bin"
+		got := buildServicePATH(install, home)
+		if !strings.Contains(got, "/Applications/My Tools/bin") {
+			t.Errorf("space-containing dir should be preserved: %q", got)
+		}
+	})
 }
 
 func TestResolveBinaryPathFrom(t *testing.T) {

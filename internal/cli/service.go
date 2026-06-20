@@ -51,7 +51,14 @@ func buildServicePATH(installPATH, home string) string {
 	var ordered []string
 	seen := map[string]bool{}
 	add := func(dir string) {
-		if dir == "" || seen[dir] {
+		dir = strings.TrimSpace(dir)
+		// Drop any entry carrying a control char (newline, CR, tab, NUL, …). A
+		// newline in particular would let a PATH entry inject extra lines into the
+		// generated systemd unit (Environment=PATH=...) or break the plist; rather
+		// than try to escape it into a single line, refuse the malformed entry. We
+		// keep the remaining (well-formed) entries so the service still has a
+		// usable PATH.
+		if dir == "" || seen[dir] || containsControlChar(dir) {
 			return
 		}
 		seen[dir] = true
@@ -60,7 +67,7 @@ func buildServicePATH(installPATH, home string) string {
 
 	// Captured install-time PATH first — preserves the user's own ordering.
 	for _, dir := range filepath.SplitList(installPATH) {
-		add(strings.TrimSpace(dir))
+		add(dir)
 	}
 
 	// Then well-known locations the provider binaries commonly live in, so the
@@ -85,6 +92,19 @@ func buildServicePATH(installPATH, home string) string {
 	}
 
 	return strings.Join(ordered, string(os.PathListSeparator))
+}
+
+// containsControlChar reports whether s contains an ASCII control character
+// (including newline, CR, tab, and NUL). Such characters in a PATH entry would
+// corrupt the generated systemd unit (line injection) or plist, so they are
+// rejected in buildServicePATH.
+func containsControlChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveBinaryPathFrom(self, pathLoc string) (string, error) {
