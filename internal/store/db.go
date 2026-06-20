@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -288,7 +289,14 @@ func OpenNoMigrate(path string) (*DB, error) {
 	}
 
 	// Open read-only so an inspection can never advance schema or write WAL.
-	dsn := "file:" + path + "?mode=ro"
+	//
+	// Build the file: URI by percent-escaping the path component (Round 7,
+	// Finding 7). Concatenating a raw filesystem path lets URI-reserved bytes
+	// ('?', '#', '%') reinterpret the DSN — '?' would start the query string (so
+	// the rest of the path becomes options and mode=ro could be dropped or a
+	// different file opened), '#' a fragment, '%' an escape. roFileURI escapes the
+	// path so SQLite opens exactly the intended file, read-only.
+	dsn := roFileURI(path)
 	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite (no migrate): %w", err)
@@ -299,6 +307,19 @@ func OpenNoMigrate(path string) (*DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// roFileURI builds a read-only SQLite "file:" URI for an on-disk path, with the
+// path component percent-escaped so URI-reserved bytes ('?', '#', '%', spaces,
+// …) cannot reinterpret the DSN (Round 7, Finding 7). modernc/SQLite parses the
+// file: URI form; we use url.URL so each path segment is escaped per RFC 3986,
+// then append the read-only query. For an absolute path this yields
+// "file:///escaped/path?mode=ro"; SQLite resolves the leading empty authority to
+// the local file. A relative path (tests/:memory: do not reach here) is escaped
+// the same way and resolved relative to the process CWD by SQLite.
+func roFileURI(path string) string {
+	u := url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}
+	return u.String()
 }
 
 // OpenMemory opens an in-memory SQLite database for testing.

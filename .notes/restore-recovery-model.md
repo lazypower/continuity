@@ -1,8 +1,101 @@
 # Restore Recovery Model — fail-closed pivot (Round 3)
 
+> **Round 7 update (Codex):** STRUCTURAL recovery-safety pass that closes the
+> marker-trust class (no-symlink + content-verify + canonical-token), plus a
+> Windows lock-downgrade fix, a dedicated serve lock, marker-durability-before-
+> destructive-step, and a SQLite-URI fix. See **"Recovery safety invariants
+> (Round 7)"** immediately below.
+
 > **Round 6 update (Codex):** lock-LIFECYCLE hardening. The flock primitive itself
 > was sound; the bugs were in WHEN locks are acquired/released relative to SQLite
 > open/close and prune. See **"Lock-lifecycle invariants (Round 6)"** at the top.
+
+## Recovery safety invariants (Round 7)
+
+The seventh review found the RECOVERY destructive path still trusted marker
+fields enough to (1) follow symlinks while hashing/renaming and (2) delete a file
+it could not prove it created. These are the load-bearing rules added to close
+that as a CLASS, enforced uniformly across `snapshot_restore_marker.go`
+(reconcile/complete/rollback) AND `snapshot_lifecycle.go` `Restore`.
+
+### 1. NO SYMLINKS ANYWHERE IN RECOVERY (Findings 1 & 2)
+
+Every path recovery reads / hashes / renames / removes — the live DB, the
+`<db>.pre-restore.*` backup, the `.restore.staged.*` staged file, the published
+DB after rename, the live `-wal`/`-shm` — is `lstat`-gated (`assertRecoverableFile`)
+and REJECTED if it is a symlink (or otherwise non-regular). Hashing uses
+`hashFileNoFollow` (O_NOFOLLOW open + fstat regular-file check), NEVER the
+symlink-following `hashFile`. After publishing/rolling-back a file at the live DB
+path, `assertLiveDBNotSymlink` fails closed if the live DB is a symlink — recovery
+never leaves a symlink as the database. A symlink in ANY of these positions ⇒
+fail closed, touch nothing. This is what defeats a forged marker whose
+`backup_prefix` is a symlink to another directory's DB: the provenance hash opens
+O_NOFOLLOW (ELOOP) and the rollback rename's `assertRecoverableFile` rejects it,
+so no cross-path clobber occurs.
+
+### 2. CANONICAL-DERIVED PATHS FROM A SAFE TOKEN (Findings 1 & 2)
+
+`resolveCanonicalRestore` reconstructs the backup and staged paths from the
+canonical resolved DB path + a marker TOKEN constrained to a safe charset
+(`tokenIsSafe`: ASCII letters/digits/`.`/`-`/`_`, no path separator, no `..`). The
+marker's `backup_prefix` must equal EXACTLY `<resolvedDB>.pre-restore.<token>` and
+its `staged_path` EXACTLY `<dbDir>/.restore.staged.<token>` for a safe token;
+anything else fails closed. A reconstructed path can therefore only ever name a
+sibling of this DB under names a real restore of THIS DB would have produced —
+never another directory, never a traversal.
+
+### 3. CONTENT-VERIFY BEFORE ANY DESTRUCTIVE ACTION (Findings 1 & 2)
+
+- A backup is renamed over the live DB ONLY if it is a regular, non-symlink file
+  whose hash == the marker's recorded `original_db_sha256` (provenance, already
+  present) AND its path is the canonical reconstruction.
+- A staged file is DELETED ONLY if it is a regular, non-symlink file whose hash ==
+  the validated snapshot.db hash (`removeProvenStaged`) — proving it is OUR staged
+  copy. An unproven staged file (wrong hash, symlink, unreadable, or no snapshot
+  hash to verify against) is LEFT IN PLACE, not deleted. A stray temp is safe;
+  deleting an unproven file (e.g. a forged marker's `.restore.staged.keep.db`) is
+  not. This is the Finding-2 fix: deletion was previously driven by the
+  `.restore.staged.` prefix alone.
+
+### 4. DEDICATED SERVE LOCK (Finding 4)
+
+`serve` now takes a DEDICATED, serve-only EXCLUSIVE lock (`AcquireServeLock`,
+`<resolvedDB>.serve.lock`) before opening the DB; a SECOND serve for the same DB
+refuses to start (`ErrServeLockHeld`). This lock is SEPARATE from the DB
+shared/exclusive lock, so it does NOT block ordinary CLI commands — only other
+serves contend on it. serve still takes the DB SHARED lock (via `store.Open`) for
+restore-exclusion. This restores single-serve exclusivity so boot retention
+(`RecordSuccessfulBoot`) counts independent serve SESSIONS again, not concurrent
+starts: previously N coexisting serves = N ticks and the restore point could
+expire early.
+
+### 5. MARKER DURABILITY BEFORE THE FIRST DESTRUCTIVE STEP (Finding 6)
+
+`writeRestoreMarkerAtomic` now FAILS CLOSED (not warns) if the sidecar dir fsync
+fails — the marker MUST be durable before `Restore` moves the live DB aside. The
+post-move-aside and post-publish DB-dir fsyncs in `Restore` are likewise errors,
+not warnings. A power loss with a non-durable marker would leave a torn restore
+with NO marker, so the next `Open` would fabricate a fresh DB instead of returning
+`ErrRestoreInterrupted` — the data the restore point existed to protect, silently
+destroyed.
+
+### 6. WINDOWS EX→SH DOWNGRADE HOLDS A LOCK CONTINUOUSLY (Finding 3)
+
+Windows has no atomic flock EX→SH. `flockDowngradeToShared` (windows) now takes a
+SHARED lock on a bridge sub-range (byte 1) on a SECOND handle BEFORE releasing the
+EXCLUSIVE primary-range lock, then re-takes SHARED on the primary range. A foreign
+EXCLUSIVE acquirer must lock the WHOLE range and so still conflicts with the bridge
+byte during the unlock/relock window — no fully-unlocked cross-process gap while a
+migrated SQLite conn is live. Unix keeps the atomic single-fd downgrade. Pinned by
+`TestFlockDowngrade_NoForeignExclusiveInGap` (windows seam).
+
+### 7. OpenNoMigrate BUILDS A SAFE URI (Finding 7)
+
+`OpenNoMigrate` percent-escapes the path into the `file:` DSN (`roFileURI`) instead
+of concatenating it raw, and `snapshotEligiblePath` rejects paths containing
+URI-reserved bytes (`?`, `#`, `%`). A path with `#`/`%` now opens the intended file
+read-only instead of being mis-parsed into a different filename or silently
+dropping `mode=ro`.
 
 > **Round 5 update (Codex):** the hand-rolled PID serve-lock / op-lock was
 > REPLACED by an OS-flock shared/exclusive lock. See **"OS flock lock discipline

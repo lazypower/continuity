@@ -3716,4 +3716,305 @@ func TestRestore_StaleWALRemovalFailureIsError(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// ROUND 7 — structural recovery safety (Findings 1 & 2 as a CLASS), Windows
+// downgrade sequencing (3), serve lock (4 — see e2e), marker durability (6),
+// OpenNoMigrate URI (7).
+// ---------------------------------------------------------------------------
+
+// TestRecover_ForgedBackupSymlinkToForeignDB_FailsClosed is the CENTERPIECE test
+// for Finding 1: a forged not-yet-published marker whose backup_prefix (".db"
+// suffix) is a SYMLINK to a DB in ANOTHER directory, with the marker's
+// original_db_sha256 set to that foreign DB's hash so the provenance hash would
+// MATCH if recovery followed the symlink. Pre-fix, reconcile's hashIfPresent used
+// the symlink-following hashFile, so the hash matched and rollback renamed the
+// symlink's target over the live DB — a cross-path restore escalation. The fix
+// hashes O_NOFOLLOW and lstat-rejects the symlink, so recovery FAILS CLOSED: the
+// foreign target is untouched, the live path is untouched, and no symlink is
+// published as the live DB.
+func TestRecover_ForgedBackupSymlinkToForeignDB_FailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// A DB in a SIBLING directory the attacker wants clobbered/pulled in.
+	foreignDir := t.TempDir()
+	foreignDB := filepath.Join(foreignDir, "target.db")
+	if err := os.WriteFile(foreignDB, []byte("FOREIGN DB BYTES — must not be touched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	foreignSum, _, err := hashFile(foreignDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Manufacture the torn pre-publish state: live DB MISSING, a SAFE-TOKEN backup
+	// name that is itself a SYMLINK to the foreign DB, a staged copy present, and a
+	// marker whose original_db_sha256 == the foreign DB hash (so a symlink-following
+	// hash would falsely "prove" provenance).
+	backupPrefix := resolved + ".pre-restore.forged"
+	if err := os.Symlink(foreignDB, backupPrefix); err != nil {
+		t.Fatal(err)
+	}
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.forged.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+	// Remove the live DB triplet so reconcile takes the rollback (CASE B) branch.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Remove(resolved + suffix)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: []string{""}, DBPublished: false,
+		OriginalDBSHA256: foreignSum,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	rerr := recoverPendingRestore(dbPath)
+	if rerr == nil {
+		t.Fatal("recovery did not fail closed on a backup_prefix symlink to a foreign DB")
+	}
+	if !errors.Is(rerr, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", rerr)
+	}
+	// The foreign DB must be byte-intact and never renamed away.
+	got, gerr := os.ReadFile(foreignDB)
+	if gerr != nil || string(got) != "FOREIGN DB BYTES — must not be touched" {
+		t.Errorf("foreign DB disturbed by forged-symlink recovery: data=%q err=%v", got, gerr)
+	}
+	// The live DB path must NOT have been published as a symlink (or as the foreign
+	// bytes). It should still be absent (recovery touched nothing).
+	if fi, lerr := os.Lstat(resolved); lerr == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			t.Error("a symlink was published as the live DB")
+		}
+		if data, _ := os.ReadFile(resolved); string(data) == "FOREIGN DB BYTES — must not be touched" {
+			t.Error("foreign DB bytes were pulled into the live DB path")
+		}
+	}
+}
+
+// TestRecover_UnprovenStagedFileNotDeleted is the Finding 2 regression: a forged
+// PUBLISHED marker whose staged_path is a SAFE-TOKEN-named but UNRELATED file
+// (".restore.staged.keep.db") that recovery did NOT create. Pre-fix, the COMPLETE
+// path os.Remove'd the staged file based only on the ".restore.staged." prefix —
+// deleting an unrelated file. The fix only deletes a staged file it can PROVE is
+// ours (regular, non-symlink, hash == snapshot.db hash); an unproven file is LEFT
+// in place. Here the file's content does NOT match the snapshot, so it must
+// survive.
+func TestRecover_UnprovenStagedFileNotDeleted(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// An unrelated file in the DB dir that happens to carry the staged infix and a
+	// safe token, but is NOT our staged copy (content differs from snapshot.db).
+	keep := filepath.Join(filepath.Dir(resolved), ".restore.staged.keep.db")
+	if err := os.WriteFile(keep, []byte("DO NOT DELETE — not our staged copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Published marker so the COMPLETE path runs (which is what removes staged).
+	// The live DB already IS the restored image (it equals snapshot.db after the
+	// Open above migrated to head? No — set the live DB to the snapshot so CASE A
+	// COMPLETE runs). Make the live DB byte-equal to snapshot.db.
+	if err := copyFile(snapshotDBPathIn(sidecar), resolved); err != nil {
+		t.Fatal(err)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: keep,
+		BackupPrefix: "", MovedSuffixes: nil, DBPublished: true,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recovery completes (live == snapshot) but must NOT delete the unproven file.
+	if rerr := recoverPendingRestore(dbPath); rerr != nil {
+		t.Fatalf("recover complete: %v", rerr)
+	}
+	if _, serr := os.Stat(keep); serr != nil {
+		t.Errorf("recovery deleted an unproven staged-named file: %v", serr)
+	}
+	got, _ := os.ReadFile(keep)
+	if string(got) != "DO NOT DELETE — not our staged copy" {
+		t.Errorf("unproven staged file content changed: %q", got)
+	}
+}
+
+// TestRecover_ProvenStagedFileDeleted is the positive counterpart to the test
+// above and exercises requirement (c)'s completion path: a staged file that IS a
+// byte-for-byte copy of snapshot.db (provably ours) is deleted on completion.
+func TestRecover_ProvenStagedFileDeleted(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.ours.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+	// Make the live DB the restored image so CASE A COMPLETE runs.
+	if err := copyFile(snapshotDBPathIn(sidecar), resolved); err != nil {
+		t.Fatal(err)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
+		BackupPrefix: "", MovedSuffixes: nil, DBPublished: true,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+	if rerr := recoverPendingRestore(dbPath); rerr != nil {
+		t.Fatalf("recover complete: %v", rerr)
+	}
+	if _, serr := os.Stat(staged); !os.IsNotExist(serr) {
+		t.Errorf("our proven staged copy was not removed on completion (err=%v)", serr)
+	}
+}
+
+// TestRecover_StagedTokenWithSeparatorRejected pins the safe-token gate: a marker
+// whose staged basename carries the staged infix but a token containing a path
+// separator surrogate (here a ".." traversal) is rejected by tokenIsSafe, so the
+// canonical reconstruction never names a file outside the DB's own set.
+func TestRecover_StagedTokenWithTraversalRejected(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	resolved, _ := resolveDBPath(dbPath)
+
+	if tokenIsSafe("..") || tokenIsSafe("a/b") || tokenIsSafe("a..b") || tokenIsSafe("") {
+		t.Fatal("tokenIsSafe accepted an unsafe token")
+	}
+	if !tokenIsSafe("20060102T150405Z.1234.db") || !tokenIsSafe("forged") {
+		t.Fatal("tokenIsSafe rejected a legitimate token")
+	}
+	// And a marker carrying a traversal token is refused via resolveCanonicalRestore.
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged...")
+	mk := &restoreMarker{Version: 1, RestoredDBPath: resolved, StagedPath: staged, DBPublished: true}
+	if _, cerr := resolveCanonicalRestore(dbPath, resolved+snapshotSidecarSuffix, mk); !errors.Is(cerr, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("resolveCanonicalRestore accepted a traversal staged token: %v", cerr)
+	}
+}
+
+// TestRestore_MarkerDirFsyncFailureFailsClosed is the Finding 6 regression: if
+// the marker's directory fsync fails (the marker is NOT durable), Restore must
+// FAIL CLOSED before the first destructive move-aside — the live DB must be
+// untouched. Pre-fix, the dir fsync failure was logged as a warning and Restore
+// proceeded to move the DB aside; a power loss then left a torn restore with no
+// durable marker. The seam forces the failure deterministically.
+func TestRestore_MarkerDirFsyncFailureFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // migrate to head + create restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Snapshot the live DB bytes so we can prove they are untouched after a refusal.
+	before, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hookMarkerDirFsync = func(sidecar string) error {
+		return fmt.Errorf("forced marker-dir fsync failure")
+	}
+	defer func() { hookMarkerDirFsync = nil }()
+
+	_, rerr := Restore(dbPath)
+	if rerr == nil {
+		t.Fatal("Restore did not fail closed on a non-durable marker")
+	}
+	if !contains(rerr.Error(), "durable") && !contains(rerr.Error(), "fsync") {
+		t.Errorf("Restore err = %v, want a marker-durability error", rerr)
+	}
+	// The live DB must be untouched — no move-aside happened.
+	after, _, herr := hashFile(resolved)
+	if herr != nil {
+		t.Fatalf("live DB missing after a refused restore (move-aside happened): %v", herr)
+	}
+	if after != before {
+		t.Error("live DB changed despite the restore failing closed before publish")
+	}
+	// No backup must have been created (no destructive step).
+	matches, _ := filepath.Glob(resolved + ".pre-restore.*")
+	if len(matches) != 0 {
+		t.Errorf("a pre-restore backup was created despite fail-closed: %v", matches)
+	}
+}
+
+// TestOpenNoMigrate_ReservedCharPathOpensIntendedFileReadOnly is the Finding 7
+// regression: a DB path containing URI-reserved characters ('#' and '%') must
+// open the INTENDED file (read-only), not a mis-parsed different filename, and
+// must stay read-only. Pre-fix, OpenNoMigrate concatenated the raw path into
+// "file:<path>?mode=ro"; '#'/'%' reinterpreted the DSN so SQLite could open a
+// different file or drop mode=ro. The fix percent-escapes the path via roFileURI.
+func TestOpenNoMigrate_ReservedCharPathOpensIntendedFileReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	// A filename with '#' and '%' — ordinary bytes on the filesystem, reserved in
+	// a URI. (snapshotEligiblePath rejects these for snapshots, but OpenNoMigrate
+	// must still open the intended file correctly.)
+	dbPath := filepath.Join(dir, "weird#name%20.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	rdb, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("OpenNoMigrate on a reserved-char path failed: %v", err)
+	}
+	defer rdb.Close()
+	// It must have opened THIS file: a known schema_versions row is present.
+	v, verr := rdb.SchemaVersion()
+	if verr != nil {
+		t.Fatalf("read schema of intended file: %v", verr)
+	}
+	if v != 5 {
+		t.Errorf("OpenNoMigrate opened the wrong/empty file: schema v%d, want 5", v)
+	}
+	// It must be READ-ONLY: a write fails. (mode=ro must not have been dropped.)
+	if _, werr := rdb.Exec(`CREATE TABLE should_fail (x INTEGER)`); werr == nil {
+		t.Error("OpenNoMigrate connection is writable; mode=ro was dropped by URI mis-parse")
+	}
+	// And roFileURI must percent-escape the reserved bytes.
+	uri := roFileURI(dbPath)
+	if contains(uri, "weird#name") || contains(uri, "%20.db") {
+		t.Errorf("roFileURI did not escape reserved characters: %s", uri)
+	}
+	if !contains(uri, "mode=ro") {
+		t.Errorf("roFileURI dropped mode=ro: %s", uri)
+	}
+}
+
 func contains(s, sub string) bool { return strings.Contains(s, sub) }

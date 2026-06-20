@@ -455,6 +455,9 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		moved:            movedSuffixes,
 		published:        false,
 		originalDBSHA256: originalDBSHA256,
+		// The validated restore point's snapshot.db hash, so removeProvenStaged can
+		// PROVE the staged temp is ours before deleting it on a rollback (Round 7).
+		snapshotSHA256: m.SnapshotSHA256,
 	}
 
 	// Move the current triplet aside to the unique pre-restore names. We do NOT
@@ -470,10 +473,15 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		}
 	}
 	// fsync the DB dir so the moved-aside originals are DURABLE before we publish
-	// over their old names (Finding 5): a power loss mid-restore must leave the
-	// originals findable for rollback, not silently reverted to the live names.
+	// over their old names. FAIL-CLOSED (Round 7, Finding 6): a power loss
+	// mid-restore must leave the moved-aside originals findable for rollback, not
+	// silently reverted to the live names. If the dir cannot be synced we roll the
+	// move-aside back (the durable marker still describes it) and abort rather than
+	// publish over a non-durable move.
 	if err := fsyncDir(dbDir); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: restore: fsync db dir after move-aside: %v\n", err)
+		_ = finishPendingRestore(cr)
+		_ = os.Remove(staged)
+		return "", fmt.Errorf("restore: fsync db dir after move-aside (originals must be durable before publish): %w", err)
 	}
 
 	// Rename the staged snapshot into the live DB path (atomic on same dir).
@@ -483,10 +491,21 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		_ = os.Remove(staged)
 		return "", fmt.Errorf("restore: publish restored db: %w", err)
 	}
+	// After publishing, the live DB path must be a real regular file, never a
+	// symlink (Round 7, Findings 1 & 2): never leave a symlink as the live DB.
+	if err := assertLiveDBNotSymlink(resolvedDB); err != nil {
+		return "", fmt.Errorf("restore: %w", err)
+	}
 	_ = os.Chmod(resolvedDB, 0o600)
-	// fsync the DB dir so the restored DB's directory entry is durable (Finding 5).
+	// fsync the DB dir so the restored DB's directory entry is durable. FAIL-CLOSED
+	// (Round 7, Finding 6): the published DB's directory entry must reach disk
+	// before we report success and clear the marker — otherwise a power loss could
+	// lose the publish while the marker is already gone. The DB IS published at
+	// this point, so we surface the failure for the operator (the marker is still
+	// present and recovery will complete against reality) rather than pretend the
+	// restore durably succeeded.
 	if err := fsyncDir(dbDir); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: restore: fsync db dir after publish: %v\n", err)
+		return "", fmt.Errorf("restore: the database was restored to %s but its directory entry could not be made durable (%v); the restore marker remains for recovery — re-run `continuity snapshot restore --confirm`", resolvedDB, err)
 	}
 
 	// PUBLISHED. From here, the staged image IS the live DB. The pre-publish

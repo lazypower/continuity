@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -55,6 +56,18 @@ import (
 // lock and the data it guards are always the same real DB.
 const dbLockSuffix = ".lock"
 
+// serveLockSuffix is appended to the canonical DB path to derive the DEDICATED
+// serve-exclusion lock file (Round 7, Finding 4). It is SEPARATE from the DB
+// shared/exclusive lock so it does NOT block ordinary CLI commands (which only
+// take the DB shared lock): ONLY `serve` contends on it, EXCLUSIVELY, so a second
+// serve for the same DB refuses to start. This restores the single-serve
+// invariant the flock model lost — with multiple serves all taking the DB SHARED
+// lock, each successful boot ticked RecordSuccessfulBoot, so N concurrent serves
+// = N ticks and the restore point could expire early. With the dedicated lock,
+// only one serve runs per DB, so boot retention counts independent serve sessions
+// again, not concurrent starts.
+const serveLockSuffix = ".serve.lock"
+
 // exclusiveWaitAttempts / exclusiveWaitInterval bound how long an EXCLUSIVE
 // acquire (restore, risky migration) waits for shared/other holders to clear
 // before failing closed. ~5s total: long enough for a healthy writable open to
@@ -103,6 +116,12 @@ type dbLockHandle struct {
 	exclusive bool
 	mu        *sync.RWMutex
 	f         *os.File
+	// bridge is a SECOND lock-file handle the windows EX→SH downgrade holds a
+	// SHARED sub-range lock on so an inter-process lock is held continuously across
+	// the non-atomic downgrade (Round 7, Finding 3). nil on unix (the atomic
+	// flock downgrade needs no bridge) and until a downgrade runs. Closed by
+	// release alongside f.
+	bridge *os.File
 }
 
 // release drops the kernel flock (by closing the fd) then the in-process
@@ -118,6 +137,11 @@ func (h *dbLockHandle) release() {
 			// description. We do not call flockUnlock separately: close is the
 			// canonical drop and avoids a double-unlock race.
 			_ = h.f.Close()
+		}
+		if h.bridge != nil {
+			// The windows downgrade's second (bridge) handle, if any. Closing it
+			// releases its shared sub-range lock.
+			_ = h.bridge.Close()
 		}
 		if h.mu != nil {
 			if h.exclusive {
@@ -267,6 +291,69 @@ func acquireExclusiveLockForOwner(db *DB) (func(), error) {
 	return ex.release, nil
 }
 
+// ErrServeLockHeld is returned by AcquireServeLock when another `serve` process
+// already holds the dedicated serve lock for this DB. The second serve fails
+// closed (refuses to start) rather than coexisting and double-ticking boot
+// retention (Round 7, Finding 4).
+var ErrServeLockHeld = errors.New("store: another continuity serve is already running for this database")
+
+// ServeLock is the handle returned by AcquireServeLock. Release (or Close) drops
+// the dedicated serve lock; the kernel also auto-releases it on process death, so
+// a crashed serve never wedges the next one.
+type ServeLock struct {
+	f *os.File
+}
+
+// Release drops the dedicated serve lock. Idempotent.
+func (s *ServeLock) Release() {
+	if s == nil || s.f == nil {
+		return
+	}
+	_ = s.f.Close()
+	s.f = nil
+}
+
+// AcquireServeLock takes the DEDICATED, serve-only EXCLUSIVE lock for dbPath
+// (Round 7, Finding 4). It is NON-BLOCKING: if another serve already holds it the
+// call FAILS CLOSED immediately with ErrServeLockHeld rather than waiting, so a
+// second serve for the same DB refuses to start. This lock is SEPARATE from the
+// DB shared/exclusive lock store.Open/Restore use, so it does NOT serialize or
+// block ordinary CLI commands — only other serves contend on it. serve still
+// takes the DB SHARED lock (via store.Open) for restore-exclusion; this lock only
+// makes serve sessions mutually exclusive so boot retention counts sessions, not
+// concurrent starts.
+//
+// Ineligible paths (:memory:/URI/DSN) cannot host a lock file → a no-op handle.
+func AcquireServeLock(dbPath string) (*ServeLock, error) {
+	if !snapshotEligiblePath(dbPath) {
+		return &ServeLock{}, nil
+	}
+	resolved, err := canonicalDBPath(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	path := resolved + serveLockSuffix
+	// Ensure the parent dir exists so the lock file can be created (a fresh DB's
+	// dir is created by store.Open, but AcquireServeLock may run first).
+	if mkErr := os.MkdirAll(filepath.Dir(path), 0o700); mkErr != nil {
+		return nil, fmt.Errorf("store: create serve lock dir: %w", mkErr)
+	}
+	f, oerr := openLockFile(path)
+	if oerr != nil {
+		return nil, fmt.Errorf("store: open serve lock file: %w", oerr)
+	}
+	ok, lerr := flockExclusiveNB(f)
+	if lerr != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("store: serve-lock db: %w", lerr)
+	}
+	if !ok {
+		_ = f.Close()
+		return nil, ErrServeLockHeld
+	}
+	return &ServeLock{f: f}, nil
+}
+
 // downgradeExclusiveToShared converts the DB's currently-held EXCLUSIVE lock into
 // the lifetime SHARED hold the returned connection keeps (Finding 1, Round 6),
 // with NO cross-process unlocked window. It is called by openRiskyUpgradeUnderExclusive
@@ -291,8 +378,14 @@ func (db *DB) downgradeExclusiveToShared() error {
 	if !h.exclusive {
 		return fmt.Errorf("internal: downgradeExclusiveToShared on a non-exclusive lock")
 	}
-	// Atomic flock EX→SH on the same fd: a foreign process is excluded throughout.
-	if err := flockDowngradeToShared(h.f); err != nil {
+	// Cross-process downgrade with NO unlocked window (Round 7, Finding 3). On
+	// unix this is the atomic flock EX→SH on the same fd. On windows — which has
+	// no atomic EX→SH — it acquires a SHARED lock on a SECOND handle BEFORE
+	// releasing the EXCLUSIVE one, so an inter-process lock is held CONTINUOUSLY
+	// across the transition and a concurrent restore can never grab EXCLUSIVE in a
+	// gap while the migrated SQLite conn is still live. The handle h.f keeps is
+	// updated to whichever fd now holds the shared lock.
+	if err := flockDowngradeToShared(h); err != nil {
 		return fmt.Errorf("store: flock downgrade ex->sh: %w", err)
 	}
 	// Transition the in-process RWMutex from write to read. The cross-process flock

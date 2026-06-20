@@ -71,15 +71,30 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Open() writes (it runs migrations, which may create a snapshot).
 	store.SetSnapshotCreatedByVersion("continuity " + VersionString())
 
+	// DEDICATED SERVE LOCK (Round 7, Finding 4). Take the serve-only exclusive
+	// lock BEFORE opening the DB so a SECOND serve for the same DB refuses to start
+	// rather than coexisting. With the flock model, multiple serves could all take
+	// the DB SHARED lock and each successful boot ticked RecordSuccessfulBoot — so
+	// N concurrent serves = N ticks and the restore point could expire early, and
+	// the "second serve refuses" invariant was gone. This lock is SEPARATE from the
+	// DB shared/exclusive lock, so it does NOT block ordinary CLI commands; only
+	// other serves contend on it. It auto-releases on process death.
+	serveLock, slErr := store.AcquireServeLock(dbPath)
+	if slErr != nil {
+		return fmt.Errorf("serve: %w", slErr)
+	}
+	defer serveLock.Release()
+
 	// Open the DB. store.Open now takes a SHARED advisory lock (flock) held for
 	// the connection's lifetime and covering the migration window: a concurrent
 	// EXCLUSIVE holder (a restore in progress) makes the shared acquire wait then
 	// re-check the interrupted-restore marker, and a risky migration upgrades to
-	// EXCLUSIVE internally. Serve no longer needs a separate serve-lock — multiple
-	// serves coexisting is fine for SHARED reads/writes through SQLite's own
-	// locking, while a restore is what must (and does) exclude them. If a restore
-	// is in progress, Open fails closed (ErrRestoreInterrupted or a lock error)
-	// and serve refuses to start. db.Close() releases the shared lock.
+	// EXCLUSIVE internally. The DB SHARED lock is what a restore must (and does)
+	// exclude; the DEDICATED serve lock acquired above is what keeps a SECOND serve
+	// from starting (Round 7, Finding 4) so boot retention counts independent serve
+	// sessions, not concurrent starts. If a restore is in progress, Open fails
+	// closed (ErrRestoreInterrupted or a lock error) and serve refuses to start.
+	// db.Close() releases the shared lock.
 	db, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)

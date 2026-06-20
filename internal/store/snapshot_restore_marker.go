@@ -78,6 +78,49 @@ const preRestoreInfix = ".pre-restore."
 // a plain file in the DB directory whose basename carries this infix.
 const stagedInfix = ".restore.staged."
 
+// safeTokenRune reports whether r may appear in the recovery-safe token that the
+// canonical backup/staged names are built from (Round 7, Findings 1 & 2). The
+// token is the variable tail after the fixed canonical prefix; constraining it
+// to this charset means a reconstructed backup/staged path can NEVER contain a
+// path separator, a ".." traversal, or any byte that lets the marker redirect
+// recovery at a file outside this DB's own canonical set. Allowed: ASCII
+// letters, digits, '.', '-', '_'. A '.' is permitted (timestamps + pid + suffix
+// use it) but ".." is rejected separately by tokenIsSafe.
+func safeTokenRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z':
+		return true
+	case r >= 'A' && r <= 'Z':
+		return true
+	case r >= '0' && r <= '9':
+		return true
+	case r == '.' || r == '-' || r == '_':
+		return true
+	default:
+		return false
+	}
+}
+
+// tokenIsSafe reports whether tok is a non-empty recovery-safe token: every rune
+// is in the safe charset AND it contains no ".." traversal. A path separator can
+// never appear (it is not in the charset), so a token that passes this can only
+// name a sibling of the canonical prefix — never another directory, never a
+// traversal (Round 7, Findings 1 & 2).
+func tokenIsSafe(tok string) bool {
+	if tok == "" {
+		return false
+	}
+	if strings.Contains(tok, "..") {
+		return false
+	}
+	for _, r := range tok {
+		if !safeTokenRune(r) {
+			return false
+		}
+	}
+	return true
+}
+
 // restoreMarker is the on-disk recovery record. All paths are absolute/resolved
 // so recovery does not depend on the process CWD. NONE of these fields is
 // trusted as authority by resume — see resolveCanonicalRestore.
@@ -135,14 +178,36 @@ func writeRestoreMarkerAtomic(sidecar string, mk *restoreMarker) error {
 		return fmt.Errorf("restore: publish marker: %w", err)
 	}
 	// fsync the sidecar dir so the marker rename is DURABLE before the first
-	// destructive rename relies on it (Finding 5): a power loss after the marker
-	// content was synced but its directory entry was not would otherwise leave a
-	// torn restore with NO marker, defeating recovery entirely.
+	// destructive rename relies on it. This is FAIL-CLOSED (Round 7, Finding 6):
+	// the marker MUST be durable before Restore moves the live DB aside. A power
+	// loss with a non-durable marker leaves a torn restore with NO marker — the
+	// next Open would see no marker beside a missing DB and FABRICATE a fresh DB
+	// instead of returning ErrRestoreInterrupted, silently destroying the data the
+	// restore point existed to protect. So a marker-dir fsync failure here is a
+	// hard error: the caller must NOT proceed to the destructive move-aside. The
+	// test seam lets a test force the failure deterministically.
+	if hookMarkerDirFsync != nil {
+		if err := hookMarkerDirFsync(sidecar); err != nil {
+			_ = removeRestoreMarker(sidecar)
+			return fmt.Errorf("restore: fsync marker dir (marker must be durable before any destructive step): %w", err)
+		}
+		return nil
+	}
 	if err := fsyncDir(sidecar); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: restore: fsync sidecar dir after marker: %v\n", err)
+		// Roll back the just-published marker so we do not leave a non-durable
+		// marker the caller would (wrongly) treat as a committed recovery point.
+		_ = removeRestoreMarker(sidecar)
+		return fmt.Errorf("restore: fsync marker dir (marker must be durable before any destructive step): %w", err)
 	}
 	return nil
 }
+
+// hookMarkerDirFsync is a TEST-ONLY seam (nil in production). When set, it
+// REPLACES the sidecar-dir fsync inside writeRestoreMarkerAtomic so a test can
+// force the durability failure deterministically (no real FS that refuses dir
+// fsync is needed) and assert Restore fails closed BEFORE the destructive
+// move-aside (Round 7, Finding 6).
+var hookMarkerDirFsync func(sidecar string) error
 
 // restoreMarkerVersion is the only marker schema version this binary writes and
 // accepts. A marker with a different (or zero) version is rejected as a hard
@@ -255,41 +320,63 @@ func resolveCanonicalRestore(dbPath string, sidecar string, mk *restoreMarker) (
 	}
 	dbDir := filepath.Dir(resolvedDB)
 
-	// Validate the staged path: it must be a plain file inside the DB dir whose
-	// name carries the staged infix. Recompute it from the canonical dir + the
-	// marker's BASENAME only (never trust the directory component).
+	// CANONICAL-DERIVED PATHS ONLY (Round 7, Findings 1 & 2). Every path recovery
+	// will read/hash/rename/remove is RECONSTRUCTED here from the canonical
+	// resolved DB path + a recovery-safe TOKEN extracted from the marker. The
+	// marker's raw path fields are honoured ONLY when they EXACTLY equal that
+	// reconstruction; a token carrying a path separator, a ".." traversal, or any
+	// byte outside the safe charset fails closed. A marker can therefore never
+	// name a backup that is a symlink to another directory's DB, nor a staged path
+	// that is an unrelated file — the reconstructed path is always a sibling of
+	// this DB under names only a real restore of THIS DB would have produced.
+
+	// Validate the staged path: <dbDir>/.restore.staged.<token>, safe token, and
+	// the marker's spelling must equal that exact reconstruction.
 	staged := ""
 	if mk.StagedPath != "" {
-		// The marker's directory component must equal the canonical DB dir; only
-		// the basename is otherwise honoured, and only if it carries the staged
-		// infix. Anything else (a staged path in another directory, a traversal,
-		// a non-staged name) fails closed rather than being removed.
-		if filepath.Dir(filepath.Clean(mk.StagedPath)) != dbDir {
+		clean := filepath.Clean(mk.StagedPath)
+		if filepath.Dir(clean) != dbDir {
 			return nil, fmt.Errorf("%w: restore marker staged path outside db dir", ErrSnapshotSidecarCorrupt)
 		}
-		base := filepath.Base(mk.StagedPath)
-		if !strings.HasPrefix(base, stagedInfix) || base != filepath.Clean(base) {
+		base := filepath.Base(clean)
+		if !strings.HasPrefix(base, stagedInfix) {
 			return nil, fmt.Errorf("%w: restore marker staged name not canonical", ErrSnapshotSidecarCorrupt)
 		}
-		staged = filepath.Join(dbDir, base)
+		token := strings.TrimPrefix(base, stagedInfix)
+		if !tokenIsSafe(token) {
+			return nil, fmt.Errorf("%w: restore marker staged token not in safe charset", ErrSnapshotSidecarCorrupt)
+		}
+		// Reconstruct from canonical dir + safe basename and require an exact match
+		// with the marker's own spelling — no trust placed in the raw field beyond
+		// equality with the reconstruction.
+		want := filepath.Join(dbDir, stagedInfix+token)
+		if clean != want {
+			return nil, fmt.Errorf("%w: restore marker staged path is not the canonical reconstruction", ErrSnapshotSidecarCorrupt)
+		}
+		staged = want
 	}
 
-	// Validate the backup prefix: it must begin with "<resolvedDB>.pre-restore."
-	// so rollback can only rename moved-aside originals back into the live names,
-	// never pull an arbitrary file into the DB path.
+	// Validate the backup prefix: "<resolvedDB>.pre-restore.<token>", safe token,
+	// reconstructed and required to match exactly. Rollback can then only rename a
+	// moved-aside original back into the live names, never pull an arbitrary file
+	// (least of all a symlink to a foreign DB) into the DB path.
 	backup := ""
 	if mk.BackupPrefix != "" {
 		wantPrefix := resolvedDB + preRestoreInfix
 		if !strings.HasPrefix(mk.BackupPrefix, wantPrefix) {
 			return nil, fmt.Errorf("%w: restore marker backup prefix outside canonical set", ErrSnapshotSidecarCorrupt)
 		}
-		// Defense in depth: no separators may appear after the canonical prefix
-		// (a backup name is a sibling of the DB, never in a subdirectory).
-		tail := strings.TrimPrefix(mk.BackupPrefix, wantPrefix)
-		if strings.ContainsRune(tail, os.PathSeparator) {
-			return nil, fmt.Errorf("%w: restore marker backup prefix escapes db dir", ErrSnapshotSidecarCorrupt)
+		token := strings.TrimPrefix(mk.BackupPrefix, wantPrefix)
+		if !tokenIsSafe(token) {
+			return nil, fmt.Errorf("%w: restore marker backup token not in safe charset", ErrSnapshotSidecarCorrupt)
 		}
-		backup = mk.BackupPrefix
+		// Exact canonical reconstruction (the safe token excludes separators, so
+		// this is already a sibling of the DB; the equality check is belt-and-braces).
+		want := wantPrefix + token
+		if mk.BackupPrefix != want {
+			return nil, fmt.Errorf("%w: restore marker backup prefix is not the canonical reconstruction", ErrSnapshotSidecarCorrupt)
+		}
+		backup = want
 	}
 
 	// Constrain moved suffixes to the known triplet set.
@@ -519,13 +606,13 @@ func reconcilePendingRestore(cr *canonicalRestore) error {
 	// the live DB is still the UNTOUCHED ORIGINAL (its hash == the marker's
 	// recorded original_db_sha256), no DB backup was created yet, and a staged copy
 	// may or may not exist. NO destructive step happened, so there is nothing to
-	// roll back: clear the marker, drop any orphaned staged temp, and leave the
-	// (original) DB intact. Without this case reconcile fell through to the generic
-	// fail-closed below and the DB stayed permanently ErrRestoreInterrupted with no
-	// recovery path — exactly the wedge this fixes.
+	// roll back: clear the marker, drop any orphaned staged temp we can PROVE is
+	// ours, and leave the (original) DB intact. Without this case reconcile fell
+	// through to the generic fail-closed below and the DB stayed permanently
+	// ErrRestoreInterrupted with no recovery path — exactly the wedge this fixes.
 	if livePresent && cr.originalDBSHA256 != "" && liveSum == cr.originalDBSHA256 && !dbBackupPresent {
-		if cr.staged != "" {
-			_ = os.Remove(cr.staged)
+		if derr := removeProvenStaged(cr); derr != nil {
+			return derr
 		}
 		fmt.Fprintf(os.Stderr, "  restore reconciled: no destructive step occurred (live db is the untouched original); cleared marker for %s\n", db)
 		return removeRestoreMarker(cr.sidecar)
@@ -556,19 +643,30 @@ func reconcilePendingRestore(cr *canonicalRestore) error {
 }
 
 // completeReconciled finishes a proven-published restore: scrub stale live
-// -wal/-shm (they belong to the OLD DB), drop any orphaned staged temp, remove
-// the marker. The live DB is the restored image and is never touched.
+// -wal/-shm (they belong to the OLD DB), drop any orphaned staged temp we can
+// PROVE is ours, remove the marker. The live DB is the restored image and is
+// never touched. Every -wal/-shm we are about to remove is first symlink-gated:
+// a forged marker must never make recovery os.Remove a symlink at the live
+// -wal/-shm position (Round 7, Findings 1 & 2).
 func completeReconciled(cr *canonicalRestore) error {
 	db := cr.resolvedDB
 	for _, suffix := range []string{"-wal", "-shm"} {
-		if lstatExists(db + suffix) {
-			if rmErr := os.Remove(db + suffix); rmErr != nil && !os.IsNotExist(rmErr) {
-				return fmt.Errorf("restore recover: scrub %s%s: %w", db, suffix, rmErr)
+		side := db + suffix
+		if lstatExists(side) {
+			if err := assertRecoverableFile(side); err != nil {
+				return fmt.Errorf("restore recover: scrub %s: %w", side, err)
+			}
+			if rmErr := os.Remove(side); rmErr != nil && !os.IsNotExist(rmErr) {
+				return fmt.Errorf("restore recover: scrub %s: %w", side, rmErr)
 			}
 		}
 	}
-	if cr.staged != "" {
-		_ = os.Remove(cr.staged)
+	// The live DB we just declared restored must not be a symlink (Round 7).
+	if err := assertLiveDBNotSymlink(db); err != nil {
+		return err
+	}
+	if derr := removeProvenStaged(cr); derr != nil {
+		return derr
 	}
 	fmt.Fprintf(os.Stderr, "  restore reconciled: live db is the restored snapshot; completed %s\n", db)
 	return removeRestoreMarker(cr.sidecar)
@@ -576,7 +674,10 @@ func completeReconciled(cr *canonicalRestore) error {
 
 // rollbackReconciled moves the (provenance-verified) moved-aside originals back
 // into the live names and drops the staged copy. Called only after the DB
-// backup's hash was proven to match the recorded original.
+// backup's hash was proven to match the recorded original. Every path it
+// touches — each live name it clears, each backup it renames in — is
+// symlink-gated first: a forged marker must never make recovery remove or
+// publish a symlink (Round 7, Findings 1 & 2).
 func rollbackReconciled(cr *canonicalRestore) error {
 	db := cr.resolvedDB
 	for _, suffix := range cr.moved {
@@ -585,7 +686,18 @@ func rollbackReconciled(cr *canonicalRestore) error {
 		if !lstatExists(backup) {
 			continue // nothing to roll back for this suffix
 		}
+		// The moved-aside original we are about to rename back over the live name
+		// must be a real regular file, never a symlink (the "" suffix was already
+		// provenance-hashed via hashIfPresent; -wal/-shm get their guard here).
+		if err := assertRecoverableFile(backup); err != nil {
+			return fmt.Errorf("restore rollback: backup %s: %w", backup, err)
+		}
 		if lstatExists(live) {
+			// Whatever currently sits at the live name must be a real file we may
+			// remove — never a symlink pointing elsewhere.
+			if err := assertRecoverableFile(live); err != nil {
+				return fmt.Errorf("restore rollback: live %s: %w", live, err)
+			}
 			if rmErr := os.Remove(live); rmErr != nil && !os.IsNotExist(rmErr) {
 				return fmt.Errorf("restore rollback: clear %s: %w", live, rmErr)
 			}
@@ -594,11 +706,71 @@ func rollbackReconciled(cr *canonicalRestore) error {
 			return fmt.Errorf("restore rollback: restore %s: %w", live, err)
 		}
 	}
-	if cr.staged != "" {
-		_ = os.Remove(cr.staged)
+	// After publishing the rolled-back original, the live DB must not be a symlink.
+	if err := assertLiveDBNotSymlink(db); err != nil {
+		return err
+	}
+	if derr := removeProvenStaged(cr); derr != nil {
+		return derr
 	}
 	fmt.Fprintf(os.Stderr, "  restore rolled back: interrupted restore of %s reverted to pre-restore state\n", db)
 	return removeRestoreMarker(cr.sidecar)
+}
+
+// removeProvenStaged deletes the staged file ONLY if we can prove it is our
+// staged copy: a present, non-symlink regular file whose content hash equals the
+// snapshot.db hash (Round 7, Finding 2). A staged path that is absent is a no-op.
+// A staged path that exists but is a symlink, is non-regular, cannot be hashed,
+// or whose hash does NOT match the snapshot is LEFT IN PLACE (not deleted) — a
+// stray temp is harmless, but deleting an unproven file (e.g. an unrelated
+// `.restore.staged.keep.db` a forged marker named) is exactly what the bar
+// forbids. Leaving it is the fail-safe choice; we surface a note but do not error
+// so a benign stray temp never blocks recovery from completing.
+func removeProvenStaged(cr *canonicalRestore) error {
+	if cr.staged == "" {
+		return nil
+	}
+	if !lstatExists(cr.staged) {
+		return nil
+	}
+	if cr.snapshotSHA256 == "" {
+		// No proven snapshot hash to verify against → cannot prove ownership → leave it.
+		fmt.Fprintf(os.Stderr, "  restore recover: leaving unproven staged file in place (no snapshot hash to verify): %s\n", cr.staged)
+		return nil
+	}
+	sum, _, herr := hashIfPresent(cr.staged)
+	if herr != nil {
+		// A symlink / non-regular / unreadable staged path: do NOT delete it.
+		fmt.Fprintf(os.Stderr, "  restore recover: leaving staged file we cannot verify in place: %s (%v)\n", cr.staged, herr)
+		return nil
+	}
+	if sum != cr.snapshotSHA256 {
+		fmt.Fprintf(os.Stderr, "  restore recover: leaving staged file in place — content does not match the snapshot (not provably ours): %s\n", cr.staged)
+		return nil
+	}
+	if rmErr := os.Remove(cr.staged); rmErr != nil && !os.IsNotExist(rmErr) {
+		return fmt.Errorf("restore recover: remove proven staged file %s: %w", cr.staged, rmErr)
+	}
+	return nil
+}
+
+// assertLiveDBNotSymlink fails closed if the live DB path is a symlink (Round 7,
+// Findings 1 & 2). Recovery must NEVER leave a symlink as the live DB: after any
+// publish/rollback that lands a file at the DB path, the path must be a real
+// regular file (or absent), never a redirection. A symlink here means something
+// outside the canonical set was published — fail closed and touch nothing more.
+func assertLiveDBNotSymlink(db string) error {
+	info, err := os.Lstat(db)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: live db path %s is a symlink after recovery; refusing to leave a symlink as the database", ErrSnapshotSidecarCorrupt, db)
+	}
+	return nil
 }
 
 // lstatExists reports whether path exists (does not follow the final symlink).
@@ -607,18 +779,49 @@ func lstatExists(path string) bool {
 	return err == nil
 }
 
+// assertRecoverableFile fails closed unless path is a present, NON-symlink,
+// regular file (Round 7, Findings 1 & 2). Every position recovery is about to
+// read/hash/rename/remove (the live DB, the pre-restore backup, the staged file,
+// the published DB) is gated through this so a symlink a forged marker planted is
+// rejected — recovery touches nothing it cannot prove is a real regular file of
+// its own. A missing file is NOT an error here (callers distinguish absence via
+// lstatExists); only a present-but-non-regular/symlink entry fails closed.
+func assertRecoverableFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s is a symlink", ErrSnapshotSidecarCorrupt, filepath.Base(path))
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%w: %s is not a regular file", ErrSnapshotSidecarCorrupt, filepath.Base(path))
+	}
+	return nil
+}
+
 // hashIfPresent returns ("sha256:<hex>", true, nil) for a present regular file,
 // ("", false, nil) when it does not exist, and a non-nil error for any other
 // stat/read failure. Used by reconciliation to learn the ACTUAL on-disk state of
 // the live DB and the moved-aside backup rather than trusting the marker.
+//
+// NO-SYMLINK (Round 7, Findings 1 & 2): a present entry is lstat-rejected if it
+// is a symlink (or otherwise non-regular) and the bytes are hashed via
+// hashFileNoFollow — NEVER the symlink-following hashFile. A forged marker that
+// points the live-DB or backup position at a symlink to a foreign file can
+// therefore never make recovery hash that foreign file and then act on the
+// match; it fails closed instead.
 func hashIfPresent(path string) (string, bool, error) {
-	if _, err := os.Lstat(path); err != nil {
-		if os.IsNotExist(err) {
-			return "", false, nil
-		}
+	if !lstatExists(path) {
+		return "", false, nil
+	}
+	if err := assertRecoverableFile(path); err != nil {
 		return "", false, err
 	}
-	sum, _, err := hashFile(path)
+	sum, _, err := hashFileNoFollow(path)
 	if err != nil {
 		return "", false, err
 	}
@@ -636,16 +839,24 @@ func finishPendingRestore(cr *canonicalRestore) error {
 	if cr.published {
 		// The staged snapshot already became the live DB. Just finish: scrub any
 		// stale live -wal/-shm (they belong to the OLD DB, not the restored one)
-		// and drop the now-orphaned staged temp if it somehow remains.
+		// and drop the now-orphaned staged temp if it somehow remains. Symlink-gate
+		// every -wal/-shm before removing it (Round 7, Findings 1 & 2).
 		for _, suffix := range []string{"-wal", "-shm"} {
-			if _, err := os.Lstat(db + suffix); err == nil {
-				if rmErr := os.Remove(db + suffix); rmErr != nil && !os.IsNotExist(rmErr) {
-					return fmt.Errorf("restore resume: scrub %s%s: %w", db, suffix, rmErr)
+			side := db + suffix
+			if lstatExists(side) {
+				if err := assertRecoverableFile(side); err != nil {
+					return fmt.Errorf("restore resume: scrub %s: %w", side, err)
+				}
+				if rmErr := os.Remove(side); rmErr != nil && !os.IsNotExist(rmErr) {
+					return fmt.Errorf("restore resume: scrub %s: %w", side, rmErr)
 				}
 			}
 		}
-		if cr.staged != "" {
-			_ = os.Remove(cr.staged)
+		if err := assertLiveDBNotSymlink(db); err != nil {
+			return err
+		}
+		if derr := removeProvenStaged(cr); derr != nil {
+			return derr
 		}
 		fmt.Fprintf(os.Stderr, "  restore resumed: completed interrupted restore of %s\n", db)
 		return removeRestoreMarker(cr.sidecar)
@@ -655,20 +866,28 @@ func finishPendingRestore(cr *canonicalRestore) error {
 	// is left exactly where they were before restore began.
 	//
 	// Anything currently at the live names (a partial/foreign file from the
-	// crash) is removed first, then each moved-aside original is moved back.
+	// crash) is removed first, then each moved-aside original is moved back. Every
+	// position is symlink-gated before remove/rename (Round 7, Findings 1 & 2).
 	for _, suffix := range cr.moved {
 		live := db + suffix
 		backup := cr.backup + suffix
 		if cr.backup == "" {
 			break // no backup prefix recorded — nothing to roll back
 		}
-		if _, err := os.Lstat(backup); err != nil {
+		if !lstatExists(backup) {
 			// Backup not present — nothing to roll back for this suffix.
 			continue
 		}
+		if err := assertRecoverableFile(backup); err != nil {
+			return fmt.Errorf("restore rollback: backup %s: %w", backup, err)
+		}
 		// Clear whatever currently occupies the live name (best-effort): if the
-		// rename below would fail because a partial file sits there, remove it.
-		if _, err := os.Lstat(live); err == nil {
+		// rename below would fail because a partial file sits there, remove it —
+		// but never remove a symlink at that position.
+		if lstatExists(live) {
+			if err := assertRecoverableFile(live); err != nil {
+				return fmt.Errorf("restore rollback: live %s: %w", live, err)
+			}
 			if rmErr := os.Remove(live); rmErr != nil && !os.IsNotExist(rmErr) {
 				return fmt.Errorf("restore rollback: clear %s: %w", live, rmErr)
 			}
@@ -677,9 +896,12 @@ func finishPendingRestore(cr *canonicalRestore) error {
 			return fmt.Errorf("restore rollback: restore %s: %w", live, err)
 		}
 	}
-	// Drop the staged snapshot copy that never got published.
-	if cr.staged != "" {
-		_ = os.Remove(cr.staged)
+	if err := assertLiveDBNotSymlink(db); err != nil {
+		return err
+	}
+	// Drop the staged snapshot copy that never got published, but only if proven ours.
+	if derr := removeProvenStaged(cr); derr != nil {
+		return derr
 	}
 	fmt.Fprintf(os.Stderr, "  restore rolled back: interrupted restore of %s reverted to pre-restore state\n", db)
 	return removeRestoreMarker(cr.sidecar)

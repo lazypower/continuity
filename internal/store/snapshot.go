@@ -142,7 +142,15 @@ func snapshotEligiblePath(path string) bool {
 	if strings.HasPrefix(p, "file:") {
 		return false
 	}
-	if strings.ContainsAny(p, "?") {
+	// URI-reserved characters make a "file:<path>?mode=ro" DSN ambiguous: '?'
+	// starts the query (so the rest of the path would be parsed as options), '#'
+	// starts a fragment, and '%' starts a percent-escape that could reinterpret
+	// following bytes. SQLite parses these specially even though the filesystem
+	// treats them as ordinary path bytes, so a path containing any of them could
+	// open a DIFFERENT file or silently drop mode=ro (Round 7, Finding 7). Refuse
+	// such paths for snapshot/restore eligibility entirely; OpenNoMigrate also
+	// percent-escapes the path it builds into a DSN as defense in depth.
+	if strings.ContainsAny(p, "?#%") {
 		return false
 	}
 	return true
@@ -405,6 +413,37 @@ func hashFile(path string) (string, int64, error) {
 		return "", 0, err
 	}
 	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return "", 0, err
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), n, nil
+}
+
+// hashFileNoFollow returns ("sha256:<hex>", size, nil) for a REGULAR file at
+// path, opened WITHOUT following a final-component symlink (O_NOFOLLOW). It is
+// the hash the destructive recovery paths MUST use instead of the
+// symlink-following hashFile (Round 7, Findings 1 & 2): a forged/corrupt marker
+// must never make recovery hash (and then trust) a file reached through a
+// symlink the marker pointed at — that is how a backup_prefix symlinked to
+// another directory's DB could be pulled over the live DB. A symlink at path
+// makes openNoFollow fail (ELOOP on unix); we additionally fstat the opened
+// descriptor and reject anything that is not a regular file, so even a race that
+// swapped the path after the open cannot smuggle a non-regular file through.
+func hashFileNoFollow(path string) (string, int64, error) {
+	f, err := openNoFollow(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	info, serr := f.Stat()
+	if serr != nil {
+		return "", 0, serr
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", 0, fmt.Errorf("%w: %s is not a regular file", ErrSnapshotSidecarCorrupt, filepath.Base(path))
+	}
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {

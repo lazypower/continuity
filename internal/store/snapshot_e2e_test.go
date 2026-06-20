@@ -3,9 +3,12 @@
 package store
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/lazypower/continuity/internal/testharness"
 )
@@ -254,11 +257,19 @@ func TestSnapshotE2E_ServeRefusesWhileExclusiveRestoreLockHeld(t *testing.T) {
 	testharness.WaitForReady(t, url3+"/api/health")
 }
 
-// TestSnapshotE2E_TwoServesShareCoexist pins the new SHARED-lock contract: two
-// serves against the SAME DB (different HOMEs + ports) both boot — neither
-// excludes the other, because writable opens take SHARED, not exclusive. (A
-// restore is what must exclude them; that is the test above.)
-func TestSnapshotE2E_TwoServesShareCoexist(t *testing.T) {
+// TestSnapshotE2E_SecondServeRefuses pins the DEDICATED serve-lock contract
+// (Round 7, Finding 4): a SECOND `serve` for the SAME DB (different HOME + port)
+// must REFUSE to start while the first serve holds the dedicated serve lock —
+// reversing the prior "two serves coexist" behavior. That coexistence let each
+// serve tick RecordSuccessfulBoot, so concurrent serves over-ticked retention and
+// could expire the restore point early. With the dedicated serve lock, only one
+// serve runs per DB, so boot retention counts independent serve SESSIONS, not
+// concurrent starts.
+//
+// Pre-fix (no dedicated serve lock) the second serve also became ready and this
+// test's WaitForReady on url2 would SUCCEED — failing the assertion below that it
+// must NOT be ready and must exit non-zero.
+func TestSnapshotE2E_SecondServeRefuses(t *testing.T) {
 	if testing.Short() {
 		t.Skip("snapshot e2e: skipped under -short")
 	}
@@ -268,16 +279,35 @@ func TestSnapshotE2E_TwoServesShareCoexist(t *testing.T) {
 	dbPath := buildDBAtVersion(t, workDir, 5)
 	seedV5Data(t, dbPath)
 
+	// First serve takes the dedicated serve lock and comes ready.
 	url1, _, srv1 := startSubprocessAgainstDB(t, bin, workDir, dbPath)
 	t.Cleanup(srv1.Stop)
+	testharness.WaitForReady(t, url1+"/api/health")
 
+	// Second serve against the SAME DB must refuse: it never becomes ready and
+	// exits non-zero with the serve-lock message.
 	home2 := t.TempDir()
 	url2, env2 := testharness.HermeticEnv(t, home2, dbPath, 0)
 	srv2 := testharness.StartServeProcess(t, bin, env2)
 	t.Cleanup(srv2.Stop)
-	// Both must come ready — shared locks coexist.
-	testharness.WaitForReady(t, url1+"/api/health")
-	testharness.WaitForReady(t, url2+"/api/health")
+
+	// It must NOT come ready. Poll briefly; readiness here is a failure.
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, err := client.Get(url2 + "/api/health"); err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				t.Fatalf("second serve for the same DB became ready; dedicated serve lock did not exclude it")
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// And it must have exited (refused) with the serve-lock message on stderr.
+	testharness.WaitForCondition(t, 5*time.Second, "second serve did not exit after refusing", func() bool {
+		return strings.Contains(srv2.Stderr(), "already running")
+	})
 }
 
 // TestSnapshotE2E_FirstRunServeIntoMissingDir is the missing-dir regression: a
