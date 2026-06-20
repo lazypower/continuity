@@ -3,11 +3,33 @@
 package hooks
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 )
+
+func TestClassifyServiceStat(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool // true = managed (conservative)
+	}{
+		{"nil (file present) -> managed", nil, true},
+		{"IsNotExist -> bare", &fs.PathError{Op: "stat", Err: fs.ErrNotExist}, false},
+		{"permission denied -> managed (conservative)", &fs.PathError{Op: "stat", Err: fs.ErrPermission}, true},
+		{"opaque stat error -> managed (conservative)", errors.New("transient i/o error"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyServiceStat(tt.err); got != tt.want {
+				t.Errorf("classifyServiceStat(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestServiceManagedDetection(t *testing.T) {
 	// serviceManaged() keys off the platform service definition file existing on

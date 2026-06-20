@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -257,16 +256,10 @@ func init() {
 }
 
 func runRestart(cmd *cobra.Command, args []string) error {
-	// Serialize concurrent `continuity restart` invocations so two of them can't
-	// race the kill/respawn (e.g. both confirm the same pid, both SIGTERM, then
-	// two respawns fight over the port). A simple per-user file lock is
-	// proportionate for a single-user localhost tool.
-	unlock, err := acquireRestartLock()
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
+	// Note: the bounce critical section is serialized by the restart lock acquired
+	// inside hooks.ConfirmAndBounce (the shared kill path), so the interactive
+	// confirmation prompt below runs BEFORE any lock is held and can never block a
+	// concurrent bounce.
 	client := hooks.NewClient()
 
 	hs, statusErr := client.Status()
@@ -341,6 +334,10 @@ func runRestart(cmd *cobra.Command, args []string) error {
 		// as this same continuity pid.
 		oldPID := hs.PID
 		if err := hooks.ConfirmAndBounce(client, oldPID); err != nil {
+			if hooks.IsRestartLockHeld(err) {
+				// A concurrent restart/bounce already holds the lock; do NOT kill.
+				return fmt.Errorf("%v.\n  Wait for it to finish, then re-run `continuity restart` if needed", err)
+			}
 			return fmt.Errorf("bounce server: %w", err)
 		}
 		return verifyBounce(client, oldPID)
@@ -382,58 +379,6 @@ func verifyBounce(client *hooks.Client, oldPID int) error {
 	return fmt.Errorf(
 		"server did not come back healthy within 10s — it may have failed to start or a migration may have errored.\n  Check the log: %s/.continuity/serve.log",
 		home)
-}
-
-// restartLockStaleAfter bounds how long a lock file is honored. A restart
-// (graceful stop + respawn + 10s health poll) finishes well within this; a lock
-// older than this is assumed orphaned by a crashed invocation and is reclaimed.
-const restartLockStaleAfter = 2 * time.Minute
-
-// acquireRestartLock takes a per-user advisory file lock at
-// ~/.continuity/restart.lock via O_CREATE|O_EXCL. It returns a release function
-// (safe to defer) on success. A pre-existing lock newer than
-// restartLockStaleAfter blocks (returns an error); an older one is treated as
-// stale, removed, and re-acquired. This is best-effort mutual exclusion
-// appropriate for a single-user tool — not a robust distributed lock.
-func acquireRestartLock() (func(), error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		// Can't locate the lock dir; proceed without locking rather than block a
-		// legitimate restart. Locking is a safety nicety, not a correctness gate.
-		return func() {}, nil
-	}
-	dir := filepath.Join(home, ".continuity")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return func() {}, nil
-	}
-	path := filepath.Join(dir, "restart.lock")
-
-	tryCreate := func() (*os.File, error) {
-		return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	}
-
-	f, err := tryCreate()
-	if err != nil {
-		if !os.IsExist(err) {
-			return func() {}, nil // unexpected FS error: don't block the restart
-		}
-		// Lock exists. Reclaim it only if it is clearly stale.
-		info, statErr := os.Stat(path)
-		if statErr != nil || time.Since(info.ModTime()) < restartLockStaleAfter {
-			return nil, fmt.Errorf(
-				"another `continuity restart` appears to be in progress (lock: %s).\n  If you're sure none is, remove that file and retry", path)
-		}
-		_ = os.Remove(path)
-		f, err = tryCreate()
-		if err != nil {
-			return nil, fmt.Errorf(
-				"another `continuity restart` raced the lock (%s); retry in a moment", path)
-		}
-	}
-
-	_, _ = fmt.Fprintf(f, "pid %d\n", os.Getpid())
-	_ = f.Close()
-	return func() { _ = os.Remove(path) }, nil
 }
 
 // configuredAddr returns the human-facing address the client is targeting, for

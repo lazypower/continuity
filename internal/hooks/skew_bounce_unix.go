@@ -44,5 +44,22 @@ func serviceManaged() bool {
 		return true
 	}
 	_, err = os.Stat(path)
-	return err == nil
+	return classifyServiceStat(err)
+}
+
+// classifyServiceStat decides whether a service-definition stat result means the
+// install is service-managed. It is deliberately conservative: a definitive
+// "file does not exist" (IsNotExist) is the ONLY way to conclude "bare"; ANY
+// other stat error (permission denied, transient I/O, an unreadable parent dir)
+// is treated as MANAGED so the hook warns rather than bare-killing what may be a
+// genuinely service-managed server. nil err (file present) is managed.
+func classifyServiceStat(err error) bool {
+	if err == nil {
+		return true // definition exists -> managed
+	}
+	if os.IsNotExist(err) {
+		return false // definitively not installed -> bare
+	}
+	// Any other stat error: can't tell. Assume managed (warn, never bounce).
+	return true
 }

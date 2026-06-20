@@ -24,24 +24,35 @@ func platformServiceState() serviceState {
 	st := serviceState{installed: true, kind: "systemd", status: mgrUnknown}
 	out, err := exec.Command("systemctl", "--user", "is-active", "continuity").CombinedOutput()
 	state := strings.TrimSpace(string(out))
-	// `systemctl is-active` exits non-zero for inactive/failed units, so a
-	// non-nil err is EXPECTED and not itself a probe failure — branch on the
-	// printed state. A recognized state ("active"/"inactive"/"failed"/...) is a
-	// trustworthy answer; empty output (systemctl missing, no output) is a
-	// genuine probe failure and stays unknown so we route through the manager,
-	// never to a bare kill.
-	switch {
-	case state == "active":
-		st.status = mgrActive
-	case state == "":
-		st.status = mgrUnknown
-	default:
-		// inactive, failed, activating, deactivating, etc. — definitively "not
-		// active"; treat as a known inactive unit to (re)start via the manager.
-		st.status = mgrInactive
-	}
-	_ = err
+	st.status = classifyIsActive(state, err)
 	return st
+}
+
+// classifyIsActive maps the trimmed `systemctl --user is-active` output (and the
+// command error) to a managerStatus. `is-active` exits non-zero for
+// inactive/failed units, so a non-nil err is EXPECTED for those and is NOT itself
+// a probe failure — we branch on the printed ActiveState.
+//
+// Only the KNOWN systemd ActiveState values are trusted. "active" -> mgrActive;
+// the known not-running states -> mgrInactive. ANYTHING ELSE — empty output,
+// unrecognized text, or diagnostics like "Failed to connect to bus..." — is a
+// genuine probe failure and maps to mgrUnknown, which routes through the service
+// manager and NEVER to a bare kill (the safe direction). An unrecognized state
+// accompanied by err != nil is the canonical bus-error case and stays unknown.
+func classifyIsActive(state string, err error) managerStatus {
+	switch state {
+	case "active":
+		return mgrActive
+	case "inactive", "failed", "activating", "deactivating", "reloading":
+		// Known systemd ActiveState values that mean "not currently serving":
+		// definitively not active -> (re)start via the manager.
+		return mgrInactive
+	default:
+		// Empty output, unparseable text, or a D-Bus/connection diagnostic
+		// (especially when err != nil): we could not trustworthily ask the
+		// manager. Stay unknown so the caller defers to the manager, never bare.
+		return mgrUnknown
+	}
 }
 
 // platformServiceRestart bounces the systemd user unit, letting systemd manage

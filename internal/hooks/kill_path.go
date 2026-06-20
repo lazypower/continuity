@@ -98,7 +98,22 @@ func ConfirmKillTarget(c *Client, expectPID int) (*HealthStatus, error) {
 // `continuity restart`'s bare bounce and the hook auto-bounce, so the safety
 // gate can never be bypassed by one caller. Returns an error (without having
 // signalled) if the pre-signal gate fails.
+//
+// It serializes the entire critical section (revalidate -> signal -> respawn)
+// under the per-user restart lock so two concurrent bounces can never race the
+// same pid. The lock is acquired HERE, not in callers, so both the CLI bare path
+// and the hook auto-bounce share one lock at one location. Any blocking work a
+// caller wants to do (interactive confirmation, prompts) MUST happen before
+// calling this, so the prompt is never held inside the lock. If the lock is held
+// by another live bounce this returns *errRestartLockHeld (see
+// IsRestartLockHeld) WITHOUT signalling.
 func ConfirmAndBounce(c *Client, expectPID int) error {
+	unlock, err := acquireRestartLock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	live, err := ConfirmKillTarget(c, expectPID)
 	if err != nil {
 		return err

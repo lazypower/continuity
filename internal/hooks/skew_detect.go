@@ -111,6 +111,13 @@ func surfaceServerSkewFromHealth(client *Client, hs *HealthStatus) {
 		// the hook can never SIGTERM a process it hasn't strongly confirmed is
 		// continuity.
 		if err := ConfirmAndBounce(client, hs.PID); err != nil {
+			if IsRestartLockHeld(err) {
+				// Another restart/bounce is already handling it; skip silently-ish.
+				// Non-fatal by construction — the concurrent bounce does the work.
+				fmt.Fprintln(os.Stderr,
+					"continuity: a restart/bounce is already in progress — skipping hook auto-bounce")
+				return
+			}
 			// Non-fatal: fall back to the warning so the user still knows.
 			fmt.Fprintf(os.Stderr,
 				"continuity: auto-bounce of stale server failed (%v) — run `continuity restart`\n", err)
