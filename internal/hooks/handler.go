@@ -24,23 +24,28 @@ func Handle(event string, stdin io.Reader) {
 
 	client := NewClient()
 
-	// Check server health — degrade gracefully if down
-	if !client.Healthy() {
-		if event == "start" {
+	if event == "start" {
+		// On the start path use a SINGLE /api/health round-trip for both liveness
+		// AND skew surfacing (previously Healthy() + Status() = two 5s-timeout
+		// trips). Status() error => treat as not-healthy and run the existing
+		// autostart logic; success => surface any stale-server skew from the same
+		// payload. Strictly non-fatal: never blocks the session.
+		hs, err := client.Status()
+		if err != nil || hs == nil || hs.Status != "ok" {
 			if TryAutostart() {
-				// Server now healthy — fall through to handleStart
+				// Server now healthy — fall through to handleStart.
 			} else {
 				WriteSessionStartOutput("")
 				return
 			}
 		} else {
-			return // silent exit for other events
+			surfaceServerSkewFromHealth(client, hs)
 		}
-	} else if event == "start" {
-		// Server is already running and healthy. Surface (and optionally bounce)
-		// a stale post-upgrade server so it can't hide. Best-effort and strictly
-		// non-fatal — never blocks the session.
-		surfaceServerSkew(client)
+	} else {
+		// Non-start events: liveness only; degrade silently if down.
+		if !client.Healthy() {
+			return
+		}
 	}
 
 	switch event {

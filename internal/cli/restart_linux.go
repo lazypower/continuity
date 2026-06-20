@@ -21,11 +21,26 @@ func platformServiceState() serviceState {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return serviceState{kind: "systemd"}
 	}
-	st := serviceState{installed: true, kind: "systemd"}
+	st := serviceState{installed: true, kind: "systemd", status: mgrUnknown}
 	out, err := exec.Command("systemctl", "--user", "is-active", "continuity").CombinedOutput()
-	if err == nil && strings.TrimSpace(string(out)) == "active" {
-		st.managerActive = true
+	state := strings.TrimSpace(string(out))
+	// `systemctl is-active` exits non-zero for inactive/failed units, so a
+	// non-nil err is EXPECTED and not itself a probe failure — branch on the
+	// printed state. A recognized state ("active"/"inactive"/"failed"/...) is a
+	// trustworthy answer; empty output (systemctl missing, no output) is a
+	// genuine probe failure and stays unknown so we route through the manager,
+	// never to a bare kill.
+	switch {
+	case state == "active":
+		st.status = mgrActive
+	case state == "":
+		st.status = mgrUnknown
+	default:
+		// inactive, failed, activating, deactivating, etc. — definitively "not
+		// active"; treat as a known inactive unit to (re)start via the manager.
+		st.status = mgrInactive
 	}
+	_ = err
 	return st
 }
 

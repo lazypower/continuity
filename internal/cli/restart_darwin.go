@@ -10,9 +10,10 @@ import (
 )
 
 // platformServiceState reports how (if at all) the continuity service is managed
-// on macOS: whether a LaunchAgent plist is installed and whether launchd has it
-// loaded. "managerActive" gates the kickstart path; an installed-but-unloaded
-// plist is treated as bare (or start-via-load).
+// on macOS: whether a LaunchAgent plist is installed and the tri-state launchd
+// probe result (active / inactive / unknown-on-probe-failure). A failed
+// `launchctl list` leaves status unknown so the decision routes through the
+// manager rather than ever bare-killing a possibly-managed server.
 func platformServiceState() serviceState {
 	path, err := plistPath()
 	if err != nil {
@@ -21,10 +22,18 @@ func platformServiceState() serviceState {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return serviceState{kind: "launchd"}
 	}
-	st := serviceState{installed: true, kind: "launchd"}
+	st := serviceState{installed: true, kind: "launchd", status: mgrUnknown}
 	out, err := exec.Command("launchctl", "list").CombinedOutput()
-	if err == nil && strings.Contains(string(out), launchAgentLabel) {
-		st.managerActive = true
+	if err != nil {
+		// Probe failed (launchctl missing/errored): leave status unknown so the
+		// decision routes through the manager, NEVER to a bare kill.
+		return st
+	}
+	if strings.Contains(string(out), launchAgentLabel) {
+		st.status = mgrActive
+	} else {
+		// launchctl answered and our label is not loaded: definitively inactive.
+		st.status = mgrInactive
 	}
 	return st
 }
@@ -55,7 +64,7 @@ func platformServiceStart() error {
 		return err
 	}
 	// If it's already loaded, kickstart it; otherwise load it.
-	if platformServiceState().managerActive {
+	if platformServiceState().status == mgrActive {
 		return platformServiceRestart()
 	}
 	if out, err := exec.Command("launchctl", "load", path).CombinedOutput(); err != nil {

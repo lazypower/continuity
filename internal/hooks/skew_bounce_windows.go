@@ -3,7 +3,6 @@
 package hooks
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -23,10 +22,3 @@ func bounceMarkerPath() (string, error) {
 // detached respawn, so the hook must never attempt an auto-bounce — it only
 // warns.
 func serviceManaged() bool { return true }
-
-// bounceBareServer is unsupported on Windows. It exists so the decision logic
-// compiles cross-platform; it is never reached because serviceManaged() pins the
-// action to warn-only.
-func bounceBareServer(pid int) error {
-	return fmt.Errorf("auto-bounce is not supported on Windows")
-}

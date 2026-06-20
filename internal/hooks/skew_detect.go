@@ -80,7 +80,16 @@ func surfaceServerSkew(client *Client) {
 		// proceeds; this is best-effort surfacing only.
 		return
 	}
+	surfaceServerSkewFromHealth(client, hs)
+}
 
+// surfaceServerSkewFromHealth is surfaceServerSkew given an already-fetched
+// health payload, so the session-start path can reuse its single /api/health
+// round-trip rather than issuing a second one.
+func surfaceServerSkewFromHealth(client *Client, hs *HealthStatus) {
+	if hs == nil {
+		return
+	}
 	skewErr := CompatibilityCheck(hs)
 	action := decideSkewAction(skewErr, bounceMarkerEnabled(), serviceManaged())
 
@@ -97,7 +106,11 @@ func surfaceServerSkew(client *Client) {
 		return
 
 	case skewBounce:
-		if err := bounceBareServer(hs.PID); err != nil {
+		// Route through the shared safe kill path: it re-validates identity
+		// (TOCTOU) and best-effort exe-matches immediately before signalling, so
+		// the hook can never SIGTERM a process it hasn't strongly confirmed is
+		// continuity.
+		if err := ConfirmAndBounce(client, hs.PID); err != nil {
 			// Non-fatal: fall back to the warning so the user still knows.
 			fmt.Fprintf(os.Stderr,
 				"continuity: auto-bounce of stale server failed (%v) — run `continuity restart`\n", err)

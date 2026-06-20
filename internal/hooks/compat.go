@@ -26,6 +26,30 @@ type HealthStatus struct {
 	Exe           string  `json:"exe"`
 }
 
+// IsContinuityServer reports whether a decoded /api/health payload strongly
+// identifies as a continuity server — the single gate any pid-signalling path
+// (continuity restart's bare bounce, the hook auto-bounce) MUST pass before it
+// sends a signal. It is deliberately stricter than mere liveness:
+//
+//	status == "ok"      — the server's invariant status string
+//	pid > 0             — a real process to (potentially) signal
+//	api_version > 0     — a distinctive field an unrelated server won't emit
+//	schema_head > 0     — likewise; together these two make a coincidental
+//	                      match by some other localhost process implausible
+//
+// This is proportionate to the real threat (accidental local collision / pid
+// reuse), not a malicious forge. A legacy pre-#36 continuity server decodes
+// api_version==0 / schema_head==0 and so FAILS this gate by design: it must not
+// be bare-killed (callers route it to a manager restart or refuse — see the
+// restart decision matrix).
+func IsContinuityServer(hs *HealthStatus) bool {
+	return hs != nil &&
+		hs.Status == "ok" &&
+		hs.PID > 0 &&
+		hs.APIVersion > 0 &&
+		hs.SchemaHead > 0
+}
+
 // Status fetches and parses /api/health from the server. Unlike Healthy(),
 // which discards the body and only reports reachability, this returns the full
 // decoded compatibility payload so callers can run skew detection.
