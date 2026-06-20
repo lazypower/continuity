@@ -242,6 +242,14 @@ func headVersion() int {
 	return migrations[len(migrations)-1].Version
 }
 
+// HeadSchemaVersion returns the highest schema version this binary knows how to
+// apply. It is the exported accessor over headVersion(), used by the health
+// endpoint to advertise the binary's schema ceiling so a client can detect
+// when it is talking to a server built against an older (or newer) schema.
+func HeadSchemaVersion() int {
+	return headVersion()
+}
+
 // ErrSchemaTooNew signals that the database has been migrated by a newer
 // continuity binary than the one currently running. Treated as a fast-fail
 // at startup so the operator sees a clear remediation message instead of

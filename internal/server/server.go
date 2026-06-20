@@ -3,10 +3,12 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/lazypower/continuity/internal/buildinfo"
 	"github.com/lazypower/continuity/internal/engine"
 	"github.com/lazypower/continuity/internal/store"
 )
@@ -88,12 +90,30 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		dbOK = false
 	}
 
+	// Current applied schema version of the open DB. Best-effort: a read error
+	// surfaces as 0 rather than failing the health check, since the endpoint's
+	// primary job is liveness. dbOK already reflects connectivity trouble.
+	schemaCurrent, _ := s.db.SchemaVersion()
+
+	// os.Executable is best-effort; an empty string is acceptable for clients.
+	exe, _ := os.Executable()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
+		// Existing fields, preserved for backward-compat.
 		"status":  "ok",
 		"version": s.version,
 		"uptime":  time.Since(s.started).Seconds(),
-		"db": dbOK,
+		"db":      dbOK,
+
+		// Compatibility/skew-detection fields (issue #36).
+		"api_version":    buildinfo.APIVersion,
+		"schema_head":    store.HeadSchemaVersion(),
+		"schema_current": schemaCurrent,
+		"pid":            os.Getpid(),
+		"started_at":     s.started.Unix(),
+		"db_path":        s.db.Path,
+		"exe":            exe,
 	})
 }
 
