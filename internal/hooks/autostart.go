@@ -43,23 +43,49 @@ func TryAutostart() bool {
 		return false
 	}
 
-	self, err := os.Executable()
+	pid, err := SpawnDetachedServe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "continuity: autostart: resolve binary: %v\n", err)
+		fmt.Fprintf(os.Stderr, "continuity: autostart: %v\n", err)
 		return false
 	}
 
-	// Log file for the spawned server
+	// Poll health for up to 3 seconds
+	client := NewClient()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.Healthy() {
+			fmt.Fprintf(os.Stderr, "continuity: autostart: server launched (pid %d)\n", pid)
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	fmt.Fprintf(os.Stderr, "continuity: autostart: server did not become healthy within 3s\n")
+	return false
+}
+
+// SpawnDetachedServe launches `continuity serve` as a fully detached background
+// process (new session via Setsid), logging to ~/.continuity/serve.log. It
+// returns the spawned PID. Port binding is the lock: a redundant spawn will
+// fail to bind and exit, so this is safe to call when a (now-stopped) server
+// previously held the port. Used by both autostart and `continuity restart`.
+func SpawnDetachedServe() (int, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return 0, fmt.Errorf("resolve binary: %w", err)
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "continuity: autostart: home dir: %v\n", err)
-		return false
+		return 0, fmt.Errorf("home dir: %w", err)
 	}
 	logPath := filepath.Join(home, ".continuity", "serve.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
+		return 0, fmt.Errorf("create state dir: %w", err)
+	}
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "continuity: autostart: open log: %v\n", err)
-		return false
+		return 0, fmt.Errorf("open log: %w", err)
 	}
 	// Tighten existing log files from previous installs (0644 → 0600)
 	if info, err := logFile.Stat(); err == nil && info.Mode().Perm()&0077 != 0 {
@@ -69,8 +95,10 @@ func TryAutostart() bool {
 	devNull, err := os.Open(os.DevNull)
 	if err != nil {
 		logFile.Close()
-		return false
+		return 0, fmt.Errorf("open devnull: %w", err)
 	}
+	defer logFile.Close()
+	defer devNull.Close()
 
 	cmd := exec.Command(self, "serve")
 	cmd.Stdout = logFile
@@ -79,27 +107,8 @@ func TryAutostart() bool {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "continuity: autostart: spawn: %v\n", err)
-		logFile.Close()
-		devNull.Close()
-		return false
+		return 0, fmt.Errorf("spawn: %w", err)
 	}
-
-	// Don't wait on the child — it's fully detached
-	logFile.Close()
-	devNull.Close()
-
-	// Poll health for up to 3 seconds
-	client := NewClient()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if client.Healthy() {
-			fmt.Fprintf(os.Stderr, "continuity: autostart: server launched (pid %d)\n", cmd.Process.Pid)
-			return true
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	fmt.Fprintf(os.Stderr, "continuity: autostart: server did not become healthy within 3s\n")
-	return false
+	// Don't wait on the child — it's fully detached.
+	return cmd.Process.Pid, nil
 }

@@ -72,6 +72,9 @@ func runRemember(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid category %q (valid: %s)", rememberCategory, strings.Join(valid, ", "))
 	}
 
+	// Non-blocking skew preflight: surface a stale server before we write.
+	warnIfSkewed()
+
 	client := hooks.NewClient()
 	if !client.Healthy() {
 		return fmt.Errorf("continuity server is not running — start it with: continuity serve")

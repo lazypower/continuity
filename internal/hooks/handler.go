@@ -36,6 +36,11 @@ func Handle(event string, stdin io.Reader) {
 		} else {
 			return // silent exit for other events
 		}
+	} else if event == "start" {
+		// Server is already running and healthy. Surface (and optionally bounce)
+		// a stale post-upgrade server so it can't hide. Best-effort and strictly
+		// non-fatal — never blocks the session.
+		surfaceServerSkew(client)
 	}
 
 	switch event {
