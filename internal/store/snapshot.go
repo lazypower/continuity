@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -85,24 +84,6 @@ func SetSnapshotCreatedByVersion(v string) {
 	}
 }
 
-// warnedSymlinkedLeaf de-dups the "snapshots unsupported for a symlinked DB file"
-// warning to ONE emission per distinct DB path per process, so a process that
-// opens the same symlinked DB repeatedly does not spam stderr.
-var warnedSymlinkedLeaf sync.Map // map[string]struct{}
-
-// warnSnapshotSymlinkedLeaf emits the one-time stderr warning that the snapshot /
-// restore feature is unsupported for a symlinked DB FILE. The risky migration
-// still PROCEEDS; this only tells the operator how to enable restore points
-// (point CONTINUITY_DB at the real file). Keyed per path so it fires once.
-func warnSnapshotSymlinkedLeaf(dbPath string) {
-	if _, loaded := warnedSymlinkedLeaf.LoadOrStore(dbPath, struct{}{}); loaded {
-		return
-	}
-	fmt.Fprintf(os.Stderr,
-		"warning: migration safety snapshots are not supported for a symlinked database file %s; "+
-			"point CONTINUITY_DB at the real file to enable them\n", dbPath)
-}
-
 // Manifest is the format_version 1 sidecar manifest. All fields are persisted
 // to manifest.json; no field holds an absolute path.
 type Manifest struct {
@@ -146,18 +127,55 @@ var (
 	ErrSnapshotSidecarCorrupt = errors.New("snapshot: sidecar exists but is corrupt or partial")
 	// ErrNoRestorePoint is returned when no (valid) restore point exists.
 	ErrNoRestorePoint = errors.New("snapshot: no restore point")
+	// ErrSymlinkedDBUnsupported is returned when the database FILE itself (the
+	// path's leaf) is a symlink. continuity does not support a symlinked database
+	// file: every DB open (store.Open / OpenNoMigrate) and every path-derived
+	// snapshot operation (Status / Restore / Prune) FAILS CLOSED with this error
+	// BEFORE touching any file, rather than try to resolve a symlinked leaf (the
+	// recurring complexity/bug source across review rounds). The operator must
+	// point CONTINUITY_DB at the real file. Parent-DIRECTORY symlinks (real leaf)
+	// remain fully supported — only a symlinked LEAF is refused.
+	ErrSymlinkedDBUnsupported = errors.New("store: continuity does not support a symlinked database file")
 )
+
+// refuseSymlinkedDBLeaf fails closed with ErrSymlinkedDBUnsupported when the DB
+// FILE itself (the path's final component) is a symlink. It lstats the ABSOLUTE
+// path's leaf (canonicalDBPath only resolves the PARENT dir and keeps the leaf,
+// so a symlinked leaf survives into the canonical path and would still lstat as a
+// link). A non-existent leaf, or any lstat error other than "is a symlink",
+// returns nil — eligibility / existence is decided by the other gates in that
+// case; this gate ONLY refuses a present symlinked leaf.
+//
+// This is the SINGLE up-front refusal every DB open and every path-derived
+// snapshot operation runs before any MkdirAll / lock acquire / sql.Open / file
+// touch, so a symlinked-leaf DB never reaches migrations, the marker check, or a
+// sidecar derivation.
+func refuseSymlinkedDBLeaf(dbPath string) error {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return nil
+	}
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf(
+			"%w %s; set CONTINUITY_DB to the real file",
+			ErrSymlinkedDBUnsupported, dbPath)
+	}
+	return nil
+}
 
 // snapshotEligiblePath reports whether path can host a path-owned sidecar /
 // lock. Rejects in-memory DBs and SQLite URI/DSN spellings (file:..., ?... )
 // whose real on-disk location is ambiguous to derive a sidecar from.
 //
-// NOTE: this is a PATH-SHAPE check only. It deliberately does NOT reject a
-// symlinked DB FILE (leaf): SQLite follows such a symlink, so Open / migrations /
-// the per-DB lock must still WORK for it — the lock keys to the canonical
-// (dir-resolved, leaf-kept) path. Only the SNAPSHOT/RESTORE feature is disabled
-// for a symlinked leaf, and that is decided separately by snapshotLeafIsSymlink /
-// the eligibility gate in ensureUpgradeRestorePoint, NOT here.
+// NOTE: this is a PATH-SHAPE check only. A symlinked DB FILE (leaf) is refused
+// up front by refuseSymlinkedDBLeaf at every DB open and path-derived snapshot
+// operation (it never reaches this check), so this function only ever sees a real
+// (non-symlinked) leaf — it concerns the path SHAPE (:memory:/URI/reserved-char),
+// not symlink status.
 func snapshotEligiblePath(path string) bool {
 	p := strings.TrimSpace(path)
 	if p == "" || p == ":memory:" {
@@ -180,30 +198,6 @@ func snapshotEligiblePath(path string) bool {
 		return false
 	}
 	return true
-}
-
-// snapshotLeafIsSymlink reports whether the DB FILE itself (the final path
-// component) is a symlink. A symlinked DB file is INELIGIBLE for the snapshot /
-// restore feature: we drop support for resolving a symlinked leaf (the recurring
-// complexity source) and instead disable snapshots for it (see
-// ensureUpgradeRestorePoint, Status/Restore/Prune). SQLite still follows the
-// symlink for ordinary Open / migrations / locking — only snapshots are off.
-//
-// The check is on the ABS path's leaf, NOT the canonical path (canonicalDBPath
-// resolves only the PARENT dir and keeps the leaf, so a symlinked leaf survives
-// into the canonical path and an lstat there would still see the link). A
-// non-existent leaf, or any lstat error other than "is a symlink", reports false
-// — eligibility is decided by the other gates in that case.
-func snapshotLeafIsSymlink(dbPath string) bool {
-	abs, err := filepath.Abs(dbPath)
-	if err != nil {
-		return false
-	}
-	info, err := os.Lstat(abs)
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeSymlink != 0
 }
 
 // canonicalDBPath resolves a DB path to its single real on-disk target, the
@@ -542,6 +536,16 @@ func fsyncFile(path string) error {
 // leaves a published manifest naming non-durable snapshot bytes (Round 9, Finding 1A).
 var hookSnapshotDirFsync func(sidecar string) error
 
+// hookAfterManifestRename is a TEST-ONLY seam (nil in production). When set it
+// fires inside writeManifestAtomic AFTER manifest.json has been renamed into the
+// sidecar and BEFORE the function returns; a non-nil return makes the manifest
+// publish FAIL despite the manifest file already being on disk. It models a
+// transient fsync/publish failure that nonetheless left a manifest.json behind,
+// so a test can assert the failed-creation cleanup removes BOTH snapshot.db AND
+// the just-renamed manifest.json — leaving NO partial (manifest-only) sidecar
+// (Change 2).
+var hookAfterManifestRename func(sidecar string) error
+
 // fsyncSnapshotDir makes the sidecar directory durable after a snapshot.db /
 // manifest.json publish, routed through the hookSnapshotDirFsync test seam when
 // set. FAIL-CLOSED by contract (Round 9, Finding 1A): the caller treats a non-nil
@@ -745,14 +749,11 @@ func (db *DB) ensureUpgradeRestorePoint(preVersion int) error {
 		return nil
 	}
 
-	// SYMLINKED DB FILE (leaf) => snapshots UNSUPPORTED. Skip the restore point
-	// with a one-time warning and let the risky migration PROCEED — same shape as
-	// the :memory:/URI/opt-out skip path; we never FAIL the migration for it. The
-	// per-DB lock and SQLite's symlink-following Open still work for it.
-	if snapshotLeafIsSymlink(db.Path) {
-		warnSnapshotSymlinkedLeaf(db.Path)
-		return nil
-	}
+	// A symlinked DB FILE (leaf) never reaches here: store.Open / OpenNoMigrate
+	// refuse it up front with ErrSymlinkedDBUnsupported (refuseSymlinkedDBLeaf),
+	// BEFORE any open/migration. db.Path therefore always names a real, non-symlinked
+	// leaf at this point — there is no "proceed unprotected through a symlinked leaf"
+	// case anymore.
 
 	optOut := os.Getenv(envDisableSnapshot) == "1"
 
@@ -795,15 +796,9 @@ func (db *DB) ensureUpgradeRestorePointLocked(preVersion int) error {
 	if !hasRisky {
 		return nil
 	}
-	// SYMLINKED DB FILE (leaf) => snapshots UNSUPPORTED: skip with a one-time
-	// warning and let the (already-locked) risky migration PROCEED. migrate() still
-	// took the EXCLUSIVE lock around this call + the DDL (the lock keys to the
-	// canonical dir-resolved path), so serialization is preserved; we simply decline
-	// to create a restore point. We never FAIL the migration for a symlinked leaf.
-	if snapshotLeafIsSymlink(db.Path) {
-		warnSnapshotSymlinkedLeaf(db.Path)
-		return nil
-	}
+	// A symlinked DB FILE (leaf) never reaches here: store.Open refused it up front
+	// with ErrSymlinkedDBUnsupported before any open/migration, so db.Path always
+	// names a real, non-symlinked leaf at this point.
 	// Eligibility was already checked by migrate() before taking the lock (this
 	// path is only entered for an eligible risky upgrade), but re-assert
 	// defensively rather than assume.
@@ -981,14 +976,32 @@ func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky i
 	}
 	_ = os.Chmod(sidecar, 0o700)
 
-	// failClosed removes this call's partial artifacts (the named temp, if any)
-	// and — only when WE created the sidecar dir this call — the now-empty sidecar
-	// dir, so a failed snapshot creation leaves NO partial restore point behind
-	// (Finding 6). It never touches a pre-existing sidecar or any file it cannot
-	// prove this call created.
+	// failClosed removes this call's partial artifacts and — only when WE created
+	// the sidecar dir this call — the now-empty sidecar dir, so a failed snapshot
+	// creation leaves NO partial restore point behind (Finding 6). It removes BOTH
+	// the named temp (if any) AND the published snapshot.db / manifest.json this
+	// call created inside the sidecar, so a transient publish failure cannot leave a
+	// MANIFEST-ONLY (or snapshot-only) sidecar that every later run treats as corrupt
+	// and that prune refuses to remove (Change 2). All three names are provably ours:
+	// this call holds the op-lock and O_EXCL-created/renamed every one of them, so no
+	// concurrent process could have published them. It never touches a pre-existing
+	// sidecar or any file it cannot prove this call created.
 	failClosed := func(tmp string, e error) error {
 		if tmp != "" {
 			_ = os.Remove(tmp)
+		}
+		// Remove the whole sidecar CONTENT this call published (snapshot.db +
+		// manifest.json), not just the temp — otherwise a manifest-publish failure
+		// after the snapshot.db rename would wedge the sidecar with a partial
+		// (manifest-only / snapshot-only) restore point that fails closed forever and
+		// that prune will not delete (it is not a valid manifest). Best-effort, and
+		// only on paths we created this call under the held lock.
+		for _, p := range []string{snapshotDBPathIn(sidecar), manifestPathIn(sidecar)} {
+			if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
+				fmt.Fprintf(os.Stderr,
+					"warning: snapshot: remove partial %s on fail-closed cleanup: %v\n",
+					filepath.Base(p), rmErr)
+			}
 		}
 		if !sidecarPreexisted {
 			removeOwnedEmptySidecar(sidecar)
@@ -1112,16 +1125,15 @@ func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky i
 		LastRestoredAt:              nil,
 	}
 	if err := writeManifestAtomic(sidecar, m); err != nil {
-		// Snapshot.db published but the manifest write failed: the sidecar is now
-		// partial. We hold the op-lock and renamed OUR OWN proven-owned temp into
-		// snapshot.db this call, so it is provably ours to scrub (no concurrent
-		// process could have published it under the lock). Remove the partial
-		// snapshot.db and our sidecar dir so no half-built restore point lingers
-		// (Finding 6) — leaving a snapshot.db with no manifest would just fail
-		// closed on every later run.
-		if rmErr := os.Remove(finalSnap); rmErr != nil && !os.IsNotExist(rmErr) {
-			fmt.Fprintf(os.Stderr, "warning: snapshot: remove partial snapshot.db after manifest failure: %v\n", rmErr)
-		}
+		// Snapshot.db was published but the manifest publish failed (e.g. a transient
+		// fsync/rename failure that nonetheless left a manifest.json renamed in). The
+		// sidecar is now partial: it may hold snapshot.db, OR snapshot.db + a
+		// manifest.json that does not describe a durable point, OR a manifest-only
+		// remnant. failClosed removes BOTH snapshot.db AND manifest.json (provably
+		// ours — op-lock held, every name O_EXCL-created/renamed this call) and the
+		// sidecar dir if we created it, so NO partial restore point lingers. Leaving a
+		// manifest-only sidecar would fail closed on every later run AND prune would
+		// refuse to remove it (it is not a valid manifest), wedging the DB (Change 2).
 		return failClosed("", err)
 	}
 
@@ -1178,6 +1190,15 @@ func writeManifestAtomic(sidecar string, m *Manifest) error {
 		return fmt.Errorf("snapshot: publish manifest: %w", err)
 	}
 	_ = os.Chmod(manifestPathIn(sidecar), 0o600)
+	// TEST SEAM (Change 2): model a publish failure that occurs AFTER manifest.json
+	// is already renamed in. Returning an error here leaves manifest.json on disk and
+	// makes writeManifestAtomic fail, exercising writeRestorePoint's failed-creation
+	// cleanup (which must remove BOTH snapshot.db and this manifest.json). nil in prod.
+	if hookAfterManifestRename != nil {
+		if err := hookAfterManifestRename(sidecar); err != nil {
+			return fmt.Errorf("snapshot: publish manifest: %w", err)
+		}
+	}
 	// fsync the sidecar dir so the manifest rename is durable across power loss.
 	// FAIL CLOSED (Round 9, Finding 1A): this was previously a warning, so a
 	// just-synced manifest file whose DIRECTORY ENTRY never reached disk could

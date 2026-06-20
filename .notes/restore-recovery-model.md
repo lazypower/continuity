@@ -533,25 +533,47 @@ This still closes the original hole (a serve-via-symlinked-dir and a
 restore-via-real-path contend on **one** lock and share **one** sidecar) without
 any leaf-symlink resolution.
 
-### A symlinked DB FILE (leaf) = snapshots UNSUPPORTED (skipped + warned)
+### A symlinked DB FILE (leaf) = REFUSED for ALL operations (Round 11)
 
-A symlinked DB **file** is detected by `snapshotLeafIsSymlink` (lstat the abs path,
-`ModeSymlink` set). For such a DB the snapshot/restore feature is **disabled**:
+> **Round 11 scoping cut (operator-approved):** the Round-10 "keep the symlink leaf,
+> skip snapshots + proceed" approach was a **broken middle**. It split lock / sidecar
+> / marker ownership between the symlink and its target and let a risky migration run
+> on a symlinked-leaf DB **unprotected**. The clean fix replaces it: a symlinked DB
+> **file** is **REFUSED entirely** — every DB open and every path-derived snapshot
+> operation **fails closed** before touching any file.
 
-- `ensureUpgradeRestorePoint*` **SKIPS** restore-point creation with a one-time
-  WARNING ("migration safety snapshots are not supported for a symlinked database
-  file `<path>`; point CONTINUITY_DB at the real file to enable them") and the
-  risky migration **PROCEEDS** — same shape as the `:memory:`/URI/opt-out skip. We
-  **never FAIL** the migration for a symlinked leaf.
-- `Status` / `Restore` / `Prune` report **no restore point** cleanly (no lock, no
-  side effects) — `probeRestorePointAbsent` short-circuits to `ErrNoRestorePoint`.
-- **Open / migrations / the lock still WORK** on a symlinked-leaf DB (SQLite
-  follows the symlink). The per-DB lock keys to the canonical (dir-resolved,
-  leaf-kept) path. Only the snapshot/restore feature is off.
+A symlinked DB **file** is detected by `refuseSymlinkedDBLeaf` (lstat the abs path,
+`ModeSymlink` set → `ErrSymlinkedDBUnsupported`). The refusal is the SINGLE up-front
+gate every entry point runs **before** any `MkdirAll` / lock acquire / `sql.Open` /
+marker check / sidecar derivation:
 
-`snapshotEligiblePath` is unchanged (it stays a path-SHAPE check: `:memory:`/URI/
-reserved-char), so the lock/sidecar derivation still works for a symlinked leaf —
-the feature gate is decided separately in `ensureUpgradeRestorePoint`.
+- **`store.Open` and `store.OpenNoMigrate`** return `ErrSymlinkedDBUnsupported`
+  immediately — BEFORE the interrupted-restore marker check, the lock, and
+  `sql.Open`. The message is actionable: *"continuity does not support a symlinked
+  database file `<path>`; set CONTINUITY_DB to the real file"*. Therefore `serve`
+  and **every** `openDB()` CLI command (profile/tree/dedup/remember/retract/import/
+  extract) fail closed with this message.
+- **`Status` / `Restore` / `Prune`** (which derive the sidecar from the path) refuse
+  with the **same** `ErrSymlinkedDBUnsupported` (NOT `ErrNoRestorePoint` — a
+  symlinked leaf is an **unsupported configuration**, not an absent restore point).
+  Restore/Prune refuse inside `probeRestorePointAbsent` (run first), so no lock file
+  is ever created or contended.
+- **No "proceed unprotected" case exists.** A symlinked-leaf DB never reaches
+  migration (Open refuses first), so `ensureUpgradeRestorePoint*` always sees a real,
+  non-symlinked leaf. The Round-10 `snapshotLeafIsSymlink`-based skip blocks,
+  `warnSnapshotSymlinkedLeaf`, and the one-time warning were **DELETED**.
+
+Parent-**directory** symlinks (real leaf) remain **fully supported**:
+`canonicalDBPath` resolves only the parent dir (`filepath.Join(EvalSymlinks(Dir(abs)),
+Base(abs))`) and keeps the verbatim leaf, so it now only ever sees a real
+(non-symlinked) leaf. `snapshotEligiblePath` is unchanged (a path-SHAPE check:
+`:memory:`/URI/reserved-char). Pinned by `TestSnapshot_SymlinkedDBLeaf_Unsupported`
+(Open/OpenNoMigrate/Status/Restore/Prune all fail closed with
+`ErrSymlinkedDBUnsupported`, NO sidecar/lock/marker created beside either the link or
+the real DB, real DB byte-untouched) and the retained parent-dir-symlink tests
+(`TestSidecarPath_ParentDirSymlinkResolves`,
+`TestCanonicalDBPath_ParentDirSymlinkAgreesLockAndSidecar`,
+`TestDBLock_ParentDirSymlinkUnifiedWithReal`).
 
 ### Managed files are NEVER opened through a symlink (the "keep half")
 
@@ -605,6 +627,47 @@ the DB unmutated). A stray identity row left by a snapshot that fails AFTER that
 write is BENIGN (no data/schema loss, DB stays at its pre-version). On ANY
 snapshot-creation failure the partial SIDECAR we created this call is removed
 (never a pre-existing or foreign-populated one); the benign identity row is left.
+
+### `instance_id` in the DB is ACCEPTED DESIGN (Round 11, Change 3)
+
+Codex has repeatedly flagged `continuity_meta.instance_id` as "metadata inside the
+DB," contrasting it with the design's stance that snapshot-tracking metadata stays
+OUT of the DB. This is **accepted design, not a defect**, and is pinned here so it is
+not re-litigated each round:
+
+- `instance_id` is **per-DB IDENTITY**, not snapshot-tracking metadata. It records
+  *which database this is*, not *whether/where a snapshot exists*. The "no metadata in
+  the DB" rule is specifically about **snapshot tracking** (no absolute paths, no
+  manifest rows, no "a restore point exists" flag) so that a copied/renamed DB does
+  not inherit stale snapshot state — list/status/prune are path-owned and never open
+  the DB. Identity is the opposite concern.
+- It is **required to live in the DB** precisely so a faithful copy (`cp` /
+  `VACUUM INTO`) **carries it** — that is what lets a snapshot's lineage fingerprint
+  match its source DB and reject a sidecar transplanted next to an unrelated DB. An
+  out-of-DB identity could not survive a copy and would defeat the lineage gate.
+- A **benign identity row persisting after a failed snapshot is accepted**: it causes
+  **no data or schema loss** (the DB stays at its pre-version), and a later successful
+  snapshot reuses the same id. We scrub the partial SIDECAR on failure, never the
+  identity row. (See "`instance_id` is IDENTITY, not tracking metadata" above.)
+
+No code change for this item — it documents the accepted boundary.
+
+## Failed snapshot-creation leaves NO partial sidecar (Round 11, Change 2)
+
+`writeRestorePoint`'s `failClosed` cleanup removes the **whole sidecar content it
+created this call** — BOTH `snapshot.db` AND any `manifest.json` this attempt
+published — not just the named temp. Previously the manifest-failure branch removed
+only `snapshot.db`, so a manifest publish that failed **after** `manifest.json` was
+already renamed in (a transient fsync/publish failure) left a **manifest-only** (or
+`snapshot.db`-only) sidecar. Such a partial sidecar fails closed on **every** later
+`Open`/`Status` (`loadValidManifest` → corrupt/"snapshot missing") AND `Prune`
+**refuses** to delete it (it is not a valid restore point) — wedging the DB. The
+cleanup now scrubs both files (provably ours — the op-lock is held and every name was
+`O_EXCL`-created/renamed this call), so a transient creation failure leaves the
+sidecar with **neither** file (or removed entirely if we created the dir), and a
+subsequent `Open` is never blocked by a corrupt sidecar. Test seam
+`hookAfterManifestRename` (fires after the `manifest.json` rename); pinned by
+`TestCreate_ManifestPublishFailureLeavesNoPartialSidecar`.
 
 ## KNOWN LIMITATION — fork ambiguity (Finding 7) — DO NOT cross-pollinate sidecars
 

@@ -83,6 +83,17 @@ func DefaultDBPath() (string, error) {
 // (or exclusive-restore-in-progress) Open is no-touch: it never chmod's the DB
 // before failing closed.
 func Open(path string) (*DB, error) {
+	// REFUSE A SYMLINKED DB FILE (leaf) up front, for ALL operations (Change 1).
+	// continuity does not support a symlinked database file: rather than resolve a
+	// symlinked leaf (the recurring complexity/bug source across review rounds) we
+	// FAIL CLOSED with ErrSymlinkedDBUnsupported BEFORE the interrupted-restore
+	// marker check, MkdirAll, lock acquisition, or sql.Open — so a symlinked-leaf DB
+	// never reaches migrations, the marker check, or any file touch. Parent-DIRECTORY
+	// symlinks (real leaf) remain fully supported (canonicalDBPath resolves them).
+	if err := refuseSymlinkedDBLeaf(path); err != nil {
+		return nil, err
+	}
+
 	// FAIL CLOSED on an interrupted restore BEFORE touching the DB (Findings 1, 2,
 	// 4, 5). A torn restore leaves a marker in the sidecar; the DB on disk may be
 	// missing, torn, or mid-swap. We must NEVER auto-resume here, and we must not
@@ -270,6 +281,16 @@ var ErrDBMissing = errors.New("store: database file does not exist")
 // file first and return ErrDBMissing when it is absent. This is what stops
 // restore from silently materializing an empty DB over a missing live one.
 func OpenNoMigrate(path string) (*DB, error) {
+	// REFUSE A SYMLINKED DB FILE (leaf) up front, exactly like Open (Change 1):
+	// every DB open — including the inspection-only path reached by non-server
+	// commands and by snapshot lineage/integrity checks of the LIVE DB — fails
+	// closed with ErrSymlinkedDBUnsupported before any stat/sql.Open. (Snapshot
+	// IMAGE inspection inside the sidecar passes the sidecar's snapshot.db path,
+	// which is a real file, so integrity/lineage checks are unaffected.)
+	if err := refuseSymlinkedDBLeaf(path); err != nil {
+		return nil, err
+	}
+
 	// FAIL CLOSED on an interrupted restore, exactly like Open (Findings 1, 2,
 	// 4). The inspection-only path is reached by non-server commands too; it must
 	// never read through a half-restored DB beside a pending marker. Recovery is

@@ -134,11 +134,12 @@ type SnapshotStatus struct {
 // Status derives the sidecar from dbPath and reports the restore point state
 // WITHOUT opening the DB. Ineligible paths report "not present".
 func Status(dbPath string) (*SnapshotStatus, error) {
-	// A symlinked DB FILE (leaf) does not support snapshots: report "not present"
-	// cleanly rather than inspect a sidecar derived beside it (snapshots are never
-	// created for it, so any sidecar there would be foreign).
-	if snapshotLeafIsSymlink(dbPath) {
-		return &SnapshotStatus{Present: false}, nil
+	// A symlinked DB FILE (leaf) is an UNSUPPORTED config, not an absent restore
+	// point: refuse with ErrSymlinkedDBUnsupported (Change 1) rather than report
+	// "not present", matching Open/OpenNoMigrate/Restore/Prune. The operator must
+	// point CONTINUITY_DB at the real file.
+	if err := refuseSymlinkedDBLeaf(dbPath); err != nil {
+		return nil, err
 	}
 	sidecar, err := sidecarPath(dbPath)
 	if err != nil {
@@ -268,12 +269,13 @@ func Prune(dbPath string) error {
 //
 // Ineligible paths (:memory:/URI) have no sidecar → ErrNoRestorePoint.
 func probeRestorePointAbsent(dbPath string) error {
-	// A symlinked DB FILE (leaf) does not support snapshots: there is provably no
-	// restore point continuity would have created for it, so restore/prune report
-	// ErrNoRestorePoint cleanly (no lock taken, no side effects) — same as an
-	// ineligible :memory:/URI path.
-	if snapshotLeafIsSymlink(dbPath) {
-		return ErrNoRestorePoint
+	// A symlinked DB FILE (leaf) is an UNSUPPORTED config, not an absent restore
+	// point (Change 1): Restore/Prune call this FIRST, so refusing here with
+	// ErrSymlinkedDBUnsupported makes both fail closed up front — before any lock
+	// file is created or contended — rather than report ErrNoRestorePoint. The
+	// operator must point CONTINUITY_DB at the real file.
+	if err := refuseSymlinkedDBLeaf(dbPath); err != nil {
+		return err
 	}
 	sidecar, err := sidecarPath(dbPath)
 	if err != nil {

@@ -3,6 +3,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -179,9 +180,17 @@ func TestSidecarPath_ParentDirSymlinkResolves(t *testing.T) {
 	if got != want {
 		t.Errorf("parent-dir-symlinked DB sidecar differs from real:\n linkdir=%s\n real=%s", got, want)
 	}
-	// And the leaf is NOT a symlink, so snapshots remain SUPPORTED for it.
-	if snapshotLeafIsSymlink(viaLinkDir) {
-		t.Errorf("snapshotLeafIsSymlink reported a parent-dir-symlinked path's real leaf as a symlink")
+	// And the LEAF is NOT a symlink (only the parent dir is), so the symlinked-leaf
+	// refusal does NOT fire: a DB reached through a symlinked parent dir is fully
+	// supported. refuseSymlinkedDBLeaf returns nil, and Open through it succeeds.
+	if rerr := refuseSymlinkedDBLeaf(viaLinkDir); rerr != nil {
+		t.Errorf("refuseSymlinkedDBLeaf rejected a parent-dir-symlinked path's real leaf: %v", rerr)
+	}
+	dbViaLink, oerr := Open(viaLinkDir)
+	if oerr != nil {
+		t.Errorf("Open through a symlinked PARENT DIR (real leaf) must work: %v", oerr)
+	} else {
+		dbViaLink.Close()
 	}
 }
 
@@ -1062,93 +1071,106 @@ func TestDBLock_SharedAllowsManyExclusiveExcludes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Symlinked DB FILE (leaf): snapshots UNSUPPORTED, migration still proceeds.
-// The leaf-symlink resolution + dangling machinery were DROPPED; a symlinked DB
-// file disables only the snapshot/restore feature, never Open/migrations/lock.
+// Symlinked DB FILE (leaf): REFUSED for ALL operations (Change 1).
+// continuity does not support a symlinked database file. The prior round's
+// "skip snapshots + proceed unprotected" approach was DELETED: a symlinked leaf
+// now FAILS CLOSED at Open/OpenNoMigrate/serve/Status/Restore/Prune with
+// ErrSymlinkedDBUnsupported, BEFORE any file is touched — no migration runs, and
+// no sidecar/lock/marker is created beside either the link or the real DB.
 // ---------------------------------------------------------------------------
 
-// TestSnapshot_SymlinkedDBLeaf_Unsupported drives the REAL Open/migrate path
-// THROUGH a symlinked DB file across a RISKY upgrade (v5 → head). Snapshots are
-// unsupported for a symlinked leaf, so:
-//   - no restore point is created (no sidecar beside the real DB),
-//   - the risky migration nonetheless COMPLETES (Open succeeds, schema advances),
-//     SQLite following the symlink,
-//   - Status / Restore / Prune via the link report no restore point cleanly.
+// TestSnapshot_SymlinkedDBLeaf_Unsupported asserts the clean refusal: every DB
+// entry point (Open, OpenNoMigrate, and therefore serve + every openDB CLI
+// command) plus the path-derived snapshot operations (Status, Restore, Prune)
+// FAIL CLOSED with ErrSymlinkedDBUnsupported on a symlinked-leaf path, create NO
+// sidecar/lock/marker beside either the link or the real DB, and leave the real
+// DB byte-untouched (still at its pre-version). Pre-fix (the round-10 skip+proceed
+// path) Open SUCCEEDED, ran the risky migration through the link, and advanced the
+// real DB's schema — so this test fails before the fix.
 func TestSnapshot_SymlinkedDBLeaf_Unsupported(t *testing.T) {
 	realDir := t.TempDir()
 	realDB := filepath.Join(realDir, "real.db")
 	buildDBAtVersionStandalone(t, realDB, 5)
 
-	// Seed a pre-upgrade row so we can prove the migration ran on the real file.
-	{
-		raw, err := sql.Open("sqlite", realDB)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := raw.Exec(`
-			INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
-			VALUES ('mem://user/events/sym-marker', 'leaf', 'events', 'pre', 1, 1)`); err != nil {
-			t.Fatal(err)
-		}
-		raw.Close()
+	// Record the real DB's pre-state so we can prove it is byte-untouched: a refused
+	// symlinked-leaf open must NOT migrate (or otherwise mutate) the real file.
+	realBefore, err := os.ReadFile(realDB)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Point a SYMLINK at the real DB file and open THROUGH it. The risky upgrade
-	// must proceed (snapshots are merely skipped), advancing the schema to head.
+	// Point a SYMLINK at the real DB file. Every operation THROUGH it must refuse.
 	linkDir := t.TempDir()
 	link := filepath.Join(linkDir, "link.db")
 	if err := os.Symlink(realDB, link); err != nil {
 		t.Fatal(err)
 	}
-	if !snapshotLeafIsSymlink(link) {
-		t.Fatal("test setup: link leaf not detected as a symlink")
+
+	// Open (the path serve + every openDB CLI command takes) FAILS CLOSED.
+	if db, oerr := Open(link); !errors.Is(oerr, ErrSymlinkedDBUnsupported) {
+		if db != nil {
+			db.Close()
+		}
+		t.Fatalf("Open(symlinked leaf): err = %v, want ErrSymlinkedDBUnsupported", oerr)
+	}
+	// The message must be clear + actionable (names the path, points to the real file).
+	if _, oerr := Open(link); oerr == nil ||
+		!contains(oerr.Error(), link) || !contains(oerr.Error(), "CONTINUITY_DB") {
+		t.Errorf("Open(symlinked leaf) message not actionable: %v", oerr)
 	}
 
-	db, err := Open(link)
-	if err != nil {
-		t.Fatalf("Open through symlinked leaf failed (migration must proceed): %v", err)
-	}
-	v, _ := db.SchemaVersion()
-	db.Close()
-	if v != headVersion() {
-		t.Errorf("schema after risky upgrade through symlinked leaf = v%d, want head v%d", v, headVersion())
+	// OpenNoMigrate (inspection-only; live-DB lineage/integrity checks) FAILS CLOSED.
+	if rdb, oerr := OpenNoMigrate(link); !errors.Is(oerr, ErrSymlinkedDBUnsupported) {
+		if rdb != nil {
+			rdb.Close()
+		}
+		t.Errorf("OpenNoMigrate(symlinked leaf): err = %v, want ErrSymlinkedDBUnsupported", oerr)
 	}
 
-	// NO sidecar was created beside the real DB — snapshots are unsupported for a
-	// symlinked leaf, so the feature took NO action.
-	realSidecar := realDB + snapshotSidecarSuffix
-	if _, serr := os.Lstat(realSidecar); !os.IsNotExist(serr) {
-		t.Errorf("a sidecar was created beside a symlinked-leaf DB: %v", serr)
+	// Status / Restore / Prune all FAIL CLOSED with the SAME unsupported-config error
+	// (NOT ErrNoRestorePoint — a symlinked leaf is an unsupported configuration, not
+	// an absent restore point).
+	if _, serr := Status(link); !errors.Is(serr, ErrSymlinkedDBUnsupported) {
+		t.Errorf("Status(symlinked leaf): err = %v, want ErrSymlinkedDBUnsupported", serr)
+	}
+	if _, rerr := Restore(link); !errors.Is(rerr, ErrSymlinkedDBUnsupported) {
+		t.Errorf("Restore(symlinked leaf): err = %v, want ErrSymlinkedDBUnsupported", rerr)
+	}
+	if perr := Prune(link); !errors.Is(perr, ErrSymlinkedDBUnsupported) {
+		t.Errorf("Prune(symlinked leaf): err = %v, want ErrSymlinkedDBUnsupported", perr)
 	}
 
-	// Status via the link reports "not present" cleanly (never touches a sidecar).
-	st, serr := Status(link)
-	if serr != nil {
-		t.Fatalf("Status via symlinked leaf: %v", serr)
-	}
-	if st.Present {
-		t.Errorf("Status reported a restore point for a symlinked-leaf DB: %+v", st)
-	}
-
-	// Restore / Prune via the link report ErrNoRestorePoint cleanly (no lock, no
-	// side effects), exactly like an ineligible :memory:/URI path.
-	if _, rerr := Restore(link); !errors.Is(rerr, ErrNoRestorePoint) {
-		t.Errorf("Restore via symlinked leaf: err = %v, want ErrNoRestorePoint", rerr)
-	}
-	if perr := Prune(link); !errors.Is(perr, ErrNoRestorePoint) {
-		t.Errorf("Prune via symlinked leaf: err = %v, want ErrNoRestorePoint", perr)
+	// NO sidecar / lock / marker file was created beside EITHER the link or the real
+	// DB — the refusal happens before any file touch.
+	for _, base := range []string{link, realDB} {
+		for _, suffix := range []string{snapshotSidecarSuffix, ".lock", ".serve.lock"} {
+			if _, statErr := os.Lstat(base + suffix); !os.IsNotExist(statErr) {
+				t.Errorf("a %s file was created beside %s on a refused symlinked-leaf op: %v",
+					suffix, base, statErr)
+			}
+		}
 	}
 
-	// The link must STILL be a symlink to the real DB (never renamed/replaced),
-	// and the real DB still opens.
+	// The link must STILL be a symlink to the real DB (never renamed/replaced).
 	if fi, lerr := os.Lstat(link); lerr != nil || fi.Mode()&os.ModeSymlink == 0 {
 		t.Errorf("link is no longer a symlink to the real DB (lerr=%v)", lerr)
 	}
-	rdb, oerr := OpenNoMigrate(realDB)
-	if oerr != nil {
-		t.Fatalf("real DB no longer opens after symlinked-leaf upgrade: %v", oerr)
+
+	// The real DB is byte-untouched (no migration ran) and still opens at v5.
+	realAfter, rerr := os.ReadFile(realDB)
+	if rerr != nil {
+		t.Fatal(rerr)
 	}
-	rdb.Close()
+	if !bytes.Equal(realBefore, realAfter) {
+		t.Error("real DB was mutated despite the symlinked-leaf refusal (a migration must not have run)")
+	}
+	v, verr := schemaVersionOnDisk(t, realDB)
+	if verr != nil {
+		t.Fatalf("read real DB schema after refused symlinked-leaf ops: %v", verr)
+	}
+	if v != 5 {
+		t.Errorf("real DB schema = v%d after refused symlinked-leaf ops, want 5 (no migration)", v)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -4377,6 +4399,70 @@ func TestCreate_SnapshotDirFsyncFailure_FailsClosedNoManifest(t *testing.T) {
 	}
 	if v != 5 {
 		t.Errorf("risky migration was not aborted: on-disk schema v%d, want 5", v)
+	}
+}
+
+// TestCreate_ManifestPublishFailureLeavesNoPartialSidecar is the Change 2
+// regression. writeManifestAtomic is forced to FAIL after manifest.json was already
+// renamed into the sidecar (the hookAfterManifestRename seam) — modelling a transient
+// fsync/publish failure that nonetheless left a manifest.json behind. The
+// failed-creation cleanup must remove BOTH snapshot.db AND that manifest.json, so the
+// sidecar is left with NEITHER file — never a manifest-only (or snapshot-only) wedge
+// that every later run treats as corrupt and that prune refuses to remove.
+//
+// Pre-fix writeRestorePoint's manifest-failure branch removed ONLY snapshot.db, so a
+// post-rename manifest publish failure left a MANIFEST-ONLY sidecar: loadValidManifest
+// then failed closed ("snapshot.db missing") on every subsequent Open/Status, and
+// Prune refused to remove it (not a valid restore point) — wedging the DB. This test
+// fails before the fix because the manifest.json survives.
+func TestCreate_ManifestPublishFailureLeavesNoPartialSidecar(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	// Force the manifest publish to fail AFTER manifest.json is renamed in. snapshot.db
+	// has been published by this point (the seam fires inside writeManifestAtomic).
+	hookAfterManifestRename = func(string) error { return fmt.Errorf("forced post-rename manifest publish failure") }
+	defer func() { hookAfterManifestRename = nil }()
+
+	db, err := Open(dbPath) // v5 → head: risky migration creates the restore point first
+	if err == nil {
+		db.Close()
+		t.Fatal("Open(risky migration) succeeded despite a forced manifest publish failure; it must fail closed")
+	}
+
+	// NEITHER snapshot.db NOR manifest.json may remain — no partial/wedged sidecar.
+	if _, serr := os.Lstat(snapshotDBPathIn(sidecar)); !os.IsNotExist(serr) {
+		t.Errorf("snapshot.db left behind after manifest publish failure: %v", serr)
+	}
+	if _, merr := os.Lstat(manifestPathIn(sidecar)); !os.IsNotExist(merr) {
+		t.Errorf("manifest.json (manifest-only wedge) left behind after manifest publish failure: %v", merr)
+	}
+	// The sidecar dir itself should be gone (we created it this call and it is now empty).
+	if _, derr := os.Lstat(sidecar); !os.IsNotExist(derr) {
+		t.Errorf("empty partial sidecar dir left behind: %v", derr)
+	}
+
+	// A subsequent Open must NOT be blocked by a corrupt sidecar — clear the seam and
+	// re-open; the risky migration now creates a fresh restore point and completes.
+	hookAfterManifestRename = nil
+	db2, oerr := Open(dbPath)
+	if oerr != nil {
+		t.Fatalf("re-Open after a failed restore-point creation was blocked by a partial sidecar: %v", oerr)
+	}
+	v, _ := db2.SchemaVersion()
+	db2.Close()
+	if v != headVersion() {
+		t.Errorf("re-Open schema = v%d, want head v%d", v, headVersion())
+	}
+	// And the fresh restore point is now valid.
+	st, serr := Status(dbPath)
+	if serr != nil {
+		t.Fatalf("Status after recovery re-Open: %v", serr)
+	}
+	if !st.Present || st.Problem != "" {
+		t.Errorf("expected a valid restore point after recovery re-Open, got %+v", st)
 	}
 }
 
