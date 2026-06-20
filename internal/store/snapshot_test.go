@@ -5420,3 +5420,196 @@ func TestHardenPermissions_SkipsSymlinkedWALSHM(t *testing.T) {
 		t.Errorf("hardenPermissions did not tighten the real DB leaf: perm=%o, want 0600", perm)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Round 13 — correctness edges (platform dir-fsync, decisive prune, restore/status
+// schema verification)
+// ---------------------------------------------------------------------------
+
+// TestFsyncDir_RealDirectorySucceeds is the Round-13 Finding-1 regression (unix
+// side). On unix, fsyncDir must perform a REAL directory-handle Sync and SUCCEED on
+// a normal directory — durability hardening that several callers treat as fatal.
+// (The Windows side of Finding 1 makes platformFsyncDir a NO-OP because File.Sync on
+// a directory handle errors there; that path is exercised only by `GOOS=windows go
+// build`, no runner needed.) This proves the unix hook is wired and durable, not a
+// no-op.
+func TestFsyncDir_RealDirectorySucceeds(t *testing.T) {
+	dir := t.TempDir()
+	// A file creation + dir fsync is the exact shape callers rely on.
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsyncDir(dir); err != nil {
+		t.Fatalf("fsyncDir on a real directory failed on unix (must perform a real, "+
+			"successful Sync): %v", err)
+	}
+}
+
+// TestPrune_RemovesOwnedTempLeftover is the Round-13 Finding-2 regression (case a).
+// A sidecar wedged by an aborted CREATION — a leftover snapshot.tmp.* and NO manifest
+// — was NOT cleanable: loadValidManifest rejected it as corrupt and the old prune
+// removed ONLY the two canonical files, so the snapshot.tmp.* (and thus the sidecar
+// dir) survived and the operator stayed wedged. The decisive prune removes ALL owned
+// sidecar contents (canonical files AND owned temp patterns) and rmdir's the empty
+// dir. This installs a lone snapshot.tmp.* leftover and asserts prune removes it and
+// the dir, returning success; it fails pre-fix (the temp + dir remain).
+func TestPrune_RemovesOwnedTempLeftover(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	sidecar, _ := sidecarPath(dbPath)
+	if err := os.MkdirAll(sidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Aborted-creation leftover: an owned snapshot.tmp.* temp, no manifest, no snapshot.db.
+	leftover := filepath.Join(sidecar, "snapshot.tmp.12345.deadbeefcafef00d")
+	if err := os.WriteFile(leftover, []byte("partial vacuum"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: this sidecar does not validate (no manifest) — the wedged state.
+	if _, lerr := loadValidManifest(sidecar); lerr == nil || errors.Is(lerr, ErrNoRestorePoint) {
+		t.Fatalf("setup: leftover sidecar should be corrupt, got %v", lerr)
+	}
+
+	if perr := Prune(dbPath); perr != nil {
+		t.Fatalf("prune owned-temp leftover: err=%v, want nil (removed)", perr)
+	}
+	if _, err := os.Lstat(leftover); !os.IsNotExist(err) {
+		t.Errorf("owned snapshot.tmp.* leftover survived prune (err=%v)", err)
+	}
+	if _, err := os.Lstat(sidecar); !os.IsNotExist(err) {
+		t.Errorf("empty sidecar dir not removed after prune (err=%v)", err)
+	}
+}
+
+// TestPrune_LeavesForeignFileAndErrors is the Round-13 Finding-2 regression (case b).
+// Prune must be HONEST: it must NEVER delete a foreign/unrecognized sidecar entry and
+// must NOT report success while one wedges the dir. This plants a foreign notes.txt
+// (plus an owned snapshot.tmp.* to prove the owned file IS removed alongside) and
+// asserts: prune returns an error naming the residual, the foreign file SURVIVES, the
+// sidecar dir SURVIVES, and the owned temp was removed. Pre-fix prune either reported
+// success or refused-corrupt without removing the owned temp.
+func TestPrune_LeavesForeignFileAndErrors(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	sidecar, _ := sidecarPath(dbPath)
+	if err := os.MkdirAll(sidecar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(sidecar, "notes.txt")
+	if err := os.WriteFile(foreign, []byte("operator's own notes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ownedTemp := filepath.Join(sidecar, "manifest.tmp.999.0123456789abcdef")
+	if err := os.WriteFile(ownedTemp, []byte("partial manifest"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	perr := Prune(dbPath)
+	if perr == nil {
+		t.Fatal("prune reported success while a FOREIGN file remained; want an error naming it")
+	}
+	if !strings.Contains(perr.Error(), "notes.txt") {
+		t.Errorf("prune error must name the foreign residual; got %v", perr)
+	}
+	// Foreign file and dir survive untouched.
+	if _, err := os.Lstat(foreign); err != nil {
+		t.Errorf("prune deleted or lost the FOREIGN file (must never touch it): %v", err)
+	}
+	if _, err := os.Lstat(sidecar); err != nil {
+		t.Errorf("prune removed the sidecar dir while a foreign file remained: %v", err)
+	}
+	// The owned temp WAS removed (decisive on our own files even when foreign remains).
+	if _, err := os.Lstat(ownedTemp); !os.IsNotExist(err) {
+		t.Errorf("owned manifest.tmp.* not removed (err=%v)", err)
+	}
+}
+
+// TestRestoreStatus_SnapshotSchemaMismatchFailsClosed is the Round-13 Finding-3
+// regression. Restore/Status previously trusted only manifest shape + hash + size +
+// integrity_check, so a snapshot.db SWAPPED to a different schema version — with the
+// manifest's hash/size updated to match — passed every gate. Restore would then
+// publish a DB at the WRONG schema, and Status would report a clean "present". The fix
+// verifies snapshotSchemaVersion(snapshot.db) == manifest.PreSchemaVersion in BOTH
+// Restore (fails closed before the destructive swap) and Status (reports invalid). This
+// builds a valid pre-v5 restore point, swaps snapshot.db for a real v6 SQLite DB (hash/
+// size re-recorded so loadValidManifest still passes and integrity_check still says ok),
+// and asserts Restore fails closed and Status reports corrupt. It fails pre-fix.
+func TestRestoreStatus_SnapshotSchemaMismatchFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	db, err := Open(dbPath) // creates a valid pre-v5 restore point, migrates to head
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	m, err := loadValidManifest(sidecar)
+	if err != nil {
+		t.Fatalf("setup: restore point should be valid: %v", err)
+	}
+	if m.PreSchemaVersion != 5 {
+		t.Fatalf("setup: pre_schema_version = %d, want 5", m.PreSchemaVersion)
+	}
+
+	// Build a real SQLite DB at a DIFFERENT schema version (v6) and swap it in as
+	// snapshot.db. It passes integrity_check (a valid DB) but is schema v6 != pre-v5.
+	wrongVerDB := filepath.Join(t.TempDir(), "wrong.db")
+	buildDBAtVersionStandalone(t, wrongVerDB, 6)
+	if err := copyFile(wrongVerDB, snapshotDBPathIn(sidecar)); err != nil {
+		t.Fatal(err)
+	}
+	// Re-record hash/size so loadValidManifest still passes — the exact "hash-consistent
+	// but wrong schema" tamper the new check must catch.
+	sum, size, err := hashFile(snapshotDBPathIn(sidecar))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.SnapshotSHA256 = sum
+	m.SnapshotSizeBytes = size
+	if err := writeManifestAtomic(sidecar, m); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: hash-consistent (loadValidManifest passes) and the swapped DB is valid
+	// SQLite (integrity_check ok) — only the schema version is wrong.
+	if _, lerr := loadValidManifest(sidecar); lerr != nil {
+		t.Fatalf("setup: manifest should be hash-consistent with the v6 snapshot: %v", lerr)
+	}
+	if ierr := integrityCheck(snapshotDBPathIn(sidecar)); ierr != nil {
+		t.Fatalf("setup: swapped snapshot should pass integrity_check (valid SQLite): %v", ierr)
+	}
+
+	// Restore must FAIL CLOSED on the schema mismatch — and must NOT have swapped the
+	// live DB (no moved-aside backup created).
+	if _, rerr := Restore(dbPath); rerr == nil {
+		t.Fatal("restore published a snapshot at the WRONG schema version; want fail closed")
+	} else if !errors.Is(rerr, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("restore error = %v, want ErrSnapshotSidecarCorrupt", rerr)
+	}
+	matches, _ := filepath.Glob(dbPath + ".pre-restore.*")
+	if len(matches) != 0 {
+		t.Errorf("restore moved the live DB aside before failing closed: %v", matches)
+	}
+
+	// Status must report the point as present-but-corrupt (invalid), not a clean
+	// pre-v5 present.
+	st, serr := Status(dbPath)
+	if serr != nil {
+		t.Fatalf("Status: %v", serr)
+	}
+	if !st.Present {
+		t.Fatal("Status reported not-present for a present (schema-mismatched) snapshot")
+	}
+	if st.Problem == "" {
+		t.Fatal("Status reported a clean 'present' for a schema-mismatched snapshot; " +
+			"want present-but-corrupt")
+	}
+	if !strings.Contains(st.Problem, "schema") {
+		t.Errorf("Status problem = %q, want it to mention the schema mismatch", st.Problem)
+	}
+}

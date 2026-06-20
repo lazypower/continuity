@@ -574,20 +574,23 @@ func verifySnapshotHash(snapPath string, m *Manifest) error {
 // durable across a power loss (Finding 5). An atomic rename updates a directory
 // entry; without fsyncing the directory, a crash can lose that entry even though
 // the file's own data was synced — leaving, e.g., a published snapshot.db with
-// no manifest, or a moved-aside original that silently reverts. Best-effort by
-// contract: a platform/filesystem that cannot fsync a directory handle (some
-// network FS) returns an error the caller logs but does not treat as fatal, so
-// durability hardening never breaks an otherwise-successful operation.
+// no manifest, or a moved-aside original that silently reverts.
+//
+// PLATFORM-AWARE (Round 13, Finding 1): directory fsync is delegated to the
+// per-OS platformFsyncDir hook. On unix it opens the directory and Sync()s the
+// handle (real durability) — and several callers (restore-point publication, the
+// restore move-aside/publish, recovery scrub) treat its failure as FATAL, so a
+// genuine durability failure aborts the operation rather than reporting a
+// non-durable success. On WINDOWS, File.Sync on a DIRECTORY handle returns an
+// error (Windows does not support fsync of a directory handle), so platformFsyncDir
+// is a NO-OP (returns nil): a fatal-on-failure caller would otherwise spuriously
+// ABORT every restore-point publication and every restore/recovery on Windows.
+// NTFS metadata durability is handled differently (the OS/filesystem orders
+// metadata writes), and FILE fsync (fsyncFile) still runs on BOTH platforms so the
+// snapshot/manifest BYTES are durable everywhere; only the directory-handle fsync
+// is platform-specific.
 func fsyncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	if serr := d.Sync(); serr != nil {
-		d.Close()
-		return serr
-	}
-	return d.Close()
+	return platformFsyncDir(dir)
 }
 
 // fsyncFile fsyncs a single regular file's contents to disk (Round 9, Finding 1A).

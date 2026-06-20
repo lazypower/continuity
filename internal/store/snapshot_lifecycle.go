@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -197,18 +198,53 @@ func Status(dbPath string) (*SnapshotStatus, error) {
 			ErrSnapshotSidecarCorrupt, err).Error()
 		return st, nil
 	}
+
+	// SNAPSHOT-SCHEMA VERIFICATION ON STATUS (Round 13, Finding 3): a snapshot.db that
+	// passes integrity_check (a valid SQLite DB) but is at a DIFFERENT schema version
+	// than the manifest's pre_schema_version is a corrupt/tampered restore point that
+	// `restore --confirm` now fails closed on. Without checking it here, `status` would
+	// report a clean "present" for a point restore would refuse — the same false-"safe"
+	// signal Finding 5 closed for integrity. The image is already opened read-only above,
+	// so this is cheap; report present-but-corrupt (the CLI exits non-zero), touch nothing.
+	if sv, svErr := snapshotSchemaVersion(snapshotDBPathIn(sidecar)); svErr != nil {
+		st.Problem = fmt.Errorf(
+			"%w: snapshot present but its schema version could not be read (%v); "+
+				"`continuity snapshot restore --confirm` would refuse it — run "+
+				"`continuity snapshot prune --confirm` to remove it",
+			ErrSnapshotSidecarCorrupt, svErr).Error()
+		return st, nil
+	} else if sv != m.PreSchemaVersion {
+		st.Problem = fmt.Errorf(
+			"%w: snapshot is schema v%d but its manifest records pre-v%d; "+
+				"`continuity snapshot restore --confirm` would refuse it — run "+
+				"`continuity snapshot prune --confirm` to remove it",
+			ErrSnapshotSidecarCorrupt, sv, m.PreSchemaVersion).Error()
+		return st, nil
+	}
 	return st, nil
 }
 
 // Prune removes a restore point's snapshot.db + manifest.json. A VALID point is
 // removed via expireRestorePoint (re-validated immediately before deletion). A
 // PARTIAL/CORRUPT sidecar (e.g. snapshot.db present but manifest deleted, or vice
-// versa) is ALSO removable here (Round 12, Finding 1) — by its canonical file
-// names, regular-file/no-symlink-gated, via pruneKnownSidecarFiles — but ONLY when
-// NO restore marker is pending (that refusal is preserved). This is the explicit
-// `--confirm` escape hatch so a torn sidecar can always be cleaned via the CLI and
-// never wedges the operator. Never opens the DB; only ever touches the two known
-// canonical sidecar files and the sidecar dir (rmdir'd only if left empty).
+// versa) is ALSO removable here (Round 12, Finding 1) — but ONLY when NO restore
+// marker is pending (that refusal is preserved). This is the explicit `--confirm`
+// escape hatch so a torn sidecar can always be cleaned via the CLI and never wedges
+// the operator. Never opens the DB.
+//
+// DECISIVE + HONEST (Round 13, Finding 2): the partial-sidecar prune now removes ALL
+// of continuity's OWN sidecar contents via pruneKnownSidecarFiles — the canonical
+// files snapshot.db / manifest.json / restore.in-progress.json (the marker only when
+// no live restore is pending, already guaranteed by the marker refusal above) AND the
+// owned temp patterns snapshot.tmp.* / manifest.tmp.* / restore.marker.tmp.* /
+// .restore.staged.* — each through the regular-file/no-symlink gate. If the sidecar is
+// then EMPTY it is rmdir'd and prune reports success. If FOREIGN/unrecognized entries
+// remain, prune leaves them and returns a clear error NAMING the residuals (no false
+// "pruned"), so the operator knows manual cleanup is needed. Net: prune fully unwedges
+// any sidecar of our OWN making, never deletes a foreign file, never falsely reports
+// success. (Deleting our own corrupt/partial canonical files on explicit --confirm is
+// zero data loss: the live DB is untouched and a corrupt snapshot is an unrestorable
+// backup copy — see .notes/restore-recovery-model.md.)
 //
 // LOCKED AGAINST MIGRATION/RESTORE (Finding 2, Round 6): Prune now acquires the
 // EXCLUSIVE DB lock for the deletion. A risky migration holds EXCLUSIVE across
@@ -285,78 +321,135 @@ func Prune(dbPath string) error {
 		if errors.Is(err, ErrNoRestorePoint) {
 			return ErrNoRestorePoint
 		}
-		// PARTIAL/CORRUPT SIDECAR IS PRUNABLE (Round 12, Finding 1). Previously a
-		// corrupt or partial sidecar (e.g. snapshot.db present but manifest deleted,
-		// or vice versa — the exact torn state expireRestorePoint can leave if one of
-		// its two unlinks fails) made Prune REFUSE, so loadValidManifest failed forever
-		// and the operator was WEDGED with no CLI path to clean it. Since we are here
-		// under the EXCLUSIVE lock with NO restore marker pending (re-checked above),
-		// there is provably no in-flight migration/restore whose recovery material this
-		// is — so an explicit `prune --confirm` may remove the KNOWN sidecar files by
-		// their canonical names. pruneKnownSidecarFiles removes ONLY snapshot.db and
-		// manifest.json, and ONLY when each is a regular NON-SYMLINK file (it never
-		// unlinks through a symlink, never touches any other/foreign file), then rmdir's
-		// the sidecar if it is left empty. This makes any partial sidecar cleanable via
-		// the CLI; no wedge.
+		// PARTIAL/CORRUPT SIDECAR IS PRUNABLE (Round 12, Finding 1; made DECISIVE in
+		// Round 13, Finding 2). Previously a corrupt or partial sidecar (e.g. snapshot.db
+		// present but manifest deleted, or vice versa, or a leftover snapshot.tmp.* from an
+		// aborted creation) made Prune REFUSE, so loadValidManifest failed forever and the
+		// operator was WEDGED with no CLI path to clean it. Since we are here under the
+		// EXCLUSIVE lock with NO restore marker pending (re-checked above), there is provably
+		// no in-flight migration/restore whose recovery material this is — so an explicit
+		// `prune --confirm` may remove ALL of continuity's OWN sidecar contents.
+		// pruneKnownSidecarFiles removes the canonical files AND the owned temp patterns,
+		// each only when a regular NON-SYMLINK file, then rmdir's the sidecar if empty —
+		// or returns a clear error NAMING any foreign residual it refused to touch (no
+		// false "pruned"). This makes any sidecar of our own making cleanable via the CLI;
+		// no wedge, and no foreign deletion.
 		return pruneKnownSidecarFiles(sidecar)
 	}
 	return expireRestorePoint(sidecar, m)
 }
 
-// pruneKnownSidecarFiles removes the two KNOWN sidecar files (snapshot.db,
-// manifest.json) by their canonical names, for the partial/corrupt-sidecar prune
-// path (Round 12, Finding 1). The caller (Prune) holds the EXCLUSIVE DB lock and
-// has re-checked that NO restore marker is pending, so this only runs when there is
-// provably no in-flight migration/restore that owns this material.
+// ownedSidecarTempPrefixes are the fixed prefixes of the temp/staging files
+// continuity itself creates (always O_EXCL-created with a random token, see
+// createOwnedTemp). An entry whose name begins with one of these is OURS — an
+// aborted creation/restore can leave one behind, and an explicit `prune --confirm`
+// (under the lock, no marker pending) may remove it. snapshot.tmp.* and
+// manifest.tmp.* are created in the sidecar by restore-point creation;
+// restore.marker.tmp.* by the marker writer; .restore.staged.* is normally created
+// in the DB dir but is listed so a stray one inside the sidecar is still recognized
+// as ours rather than reported foreign. The trailing '.' is part of each prefix so a
+// foreign file merely STARTING with e.g. "snapshot" (but not "snapshot.tmp.") is not
+// mistaken for ours.
+var ownedSidecarTempPrefixes = []string{
+	"snapshot.tmp.",
+	"manifest.tmp.",
+	"restore.marker.tmp.",
+	".restore.staged.",
+}
+
+// isOwnedSidecarTempName reports whether name is one of continuity's own
+// temp/staging files (an O_EXCL-created leftover from an aborted operation).
+func isOwnedSidecarTempName(name string) bool {
+	for _, p := range ownedSidecarTempPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isOwnedSidecarName reports whether name (a sidecar directory entry's basename) is
+// one continuity OWNS: a canonical file (snapshot.db / manifest.json /
+// restore.in-progress.json) or one of our owned temp patterns. Anything else is
+// FOREIGN — prune must never delete it.
+func isOwnedSidecarName(name string) bool {
+	switch name {
+	case snapshotFileName, manifestFileName, restoreMarkerName:
+		return true
+	}
+	return isOwnedSidecarTempName(name)
+}
+
+// pruneKnownSidecarFiles makes the partial/corrupt-sidecar prune DECISIVE and HONEST
+// (Round 12, Finding 1; Round 13, Finding 2). The caller (Prune) holds the EXCLUSIVE
+// DB lock and has re-checked that NO restore marker is pending, so this only runs when
+// there is provably no in-flight migration/restore that owns this material.
+//
+// It removes ALL of continuity's OWN sidecar contents — the canonical files
+// (snapshot.db, manifest.json, restore.in-progress.json) AND the owned temp patterns
+// (snapshot.tmp.* / manifest.tmp.* / restore.marker.tmp.* / .restore.staged.*) — so a
+// sidecar wedged by an aborted creation (a leftover snapshot.tmp.*, a partial
+// manifest-only/snapshot-only state) is fully cleaned. Then:
+//   - if the sidecar is EMPTY, rmdir it and return success;
+//   - if FOREIGN/unrecognized entries remain (not our canonical names or owned temp
+//     patterns), LEAVE them and return a clear error NAMING the residuals — prune does
+//     NOT claim success while a foreign file keeps the dir wedged, so the operator knows
+//     manual cleanup is needed.
 //
 // SAFETY BARS (match the global no-symlink / prove-it-is-ours discipline):
-//   - Each file is removed ONLY when lstat shows a REGULAR, non-symlink file. A
-//     symlink at snapshot.db / manifest.json is SKIPPED (never unlinked through —
-//     unlinking the link itself is fine, but to stay consistent with the managed-file
-//     gate we treat a symlink at a canonical name as foreign and leave it, surfacing
-//     it via the residual-content path below). A FIFO/device/dir is likewise skipped.
-//   - We touch ONLY these two canonical names — never a stray/foreign file.
-//   - The sidecar dir is rmdir'd ONLY if it is left empty afterward (anything we did
-//     not remove — a stray operator file, or a skipped symlink — keeps the dir).
-//
-// A residual non-removable entry is reported as an error so the operator knows the
-// sidecar was not fully cleaned, but the removable known files ARE removed first.
+//   - Each OWNED entry is removed ONLY when lstat shows a REGULAR, non-symlink file. A
+//     symlink / FIFO / device / dir at an owned name is NOT unlinked through; it is left
+//     and surfaced as a residual, matching the managed-file gate.
+//   - A FOREIGN entry is NEVER touched — we only ever remove names we recognize as ours.
+//   - The sidecar dir is rmdir'd ONLY if it is left empty afterward.
 func pruneKnownSidecarFiles(sidecar string) error {
-	var firstErr error
-	for _, p := range []string{snapshotDBPathIn(sidecar), manifestPathIn(sidecar)} {
+	entries, rerr := os.ReadDir(sidecar)
+	if rerr != nil {
+		return fmt.Errorf("prune: read sidecar dir: %w", rerr)
+	}
+
+	var residual []string // entries left in place (foreign, or owned-but-not-regular)
+	for _, ent := range entries {
+		name := ent.Name()
+		p := filepath.Join(sidecar, name)
+
+		if !isOwnedSidecarName(name) {
+			// FOREIGN: never delete it. Record it so we can fail honestly below.
+			residual = append(residual, name)
+			continue
+		}
+
 		info, lerr := os.Lstat(p)
 		if lerr != nil {
 			if os.IsNotExist(lerr) {
-				continue // already absent — nothing to remove
+				continue // raced away — nothing to remove
 			}
-			if firstErr == nil {
-				firstErr = fmt.Errorf("prune: lstat %s: %w", filepath.Base(p), lerr)
-			}
+			residual = append(residual, name)
 			continue
 		}
-		// Only remove a REGULAR, non-symlink file at the canonical name. A symlink /
-		// FIFO / device / dir at this position is foreign-shaped — leave it (and keep
-		// the sidecar dir), matching the no-unlink-through-a-symlink discipline.
+		// Only remove a REGULAR, non-symlink file at an owned name. A symlink / FIFO /
+		// device / dir there is foreign-shaped — leave it (never unlink through it) and
+		// surface it as a residual, keeping the dir.
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			if firstErr == nil {
-				firstErr = fmt.Errorf(
-					"%w: %s is not a regular file; left in place — remove it by hand",
-					ErrSnapshotSidecarCorrupt, filepath.Base(p))
-			}
+			residual = append(residual, name)
 			continue
 		}
 		if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("prune: remove %s: %w", filepath.Base(p), rmErr)
-			}
+			residual = append(residual, name)
 		}
 	}
-	// Remove the sidecar dir only if empty — leave anything we did not remove.
-	if entries, err := os.ReadDir(sidecar); err == nil && len(entries) == 0 {
-		_ = os.Remove(sidecar)
+
+	if len(residual) > 0 {
+		// HONEST: foreign/non-removable entries remain — do NOT rmdir, do NOT claim
+		// success. Name them so the operator can clean up by hand.
+		return fmt.Errorf(
+			"%w: sidecar %s has entries continuity does not own and did not remove: %v; remove them by hand",
+			ErrSnapshotSidecarCorrupt, sidecar, residual)
 	}
-	if firstErr != nil {
-		return firstErr
+
+	// DECISIVE: every entry was ours and removed; the sidecar is now empty — rmdir it.
+	if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("prune: remove empty sidecar dir %s: %w", sidecar, err)
 	}
 	fmt.Fprintf(os.Stderr, "  pruned partial restore point → removed %s\n", sidecar)
 	return nil
@@ -532,6 +625,24 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	// Integrity-check the snapshot image before trusting it.
 	if err := integrityCheck(snapPath); err != nil {
 		return "", err
+	}
+
+	// VERIFY THE SNAPSHOT IS ACTUALLY AT pre_schema_version (Round 13, Finding 3).
+	// Creation and reuse both prove snapshot.db's schema == manifest.PreSchemaVersion,
+	// but Restore previously trusted only manifest shape + hash + integrity_check — so
+	// a snapshot.db swapped to a DIFFERENT schema version (with the manifest's hash/size
+	// updated to match) would pass every gate and be published as the live DB at the
+	// WRONG schema, defeating the "restore returns you to pre-vN" contract. The image is
+	// already opened read-only for integrity_check just above, so this is cheap
+	// defense-in-depth. FAIL CLOSED before any destructive swap on mismatch.
+	if sv, svErr := snapshotSchemaVersion(snapPath); svErr != nil {
+		return "", fmt.Errorf(
+			"%w: could not read restore point snapshot schema version (%v)",
+			ErrSnapshotSidecarCorrupt, svErr)
+	} else if sv != m.PreSchemaVersion {
+		return "", fmt.Errorf(
+			"%w: restore point snapshot is schema v%d but its manifest records pre-v%d",
+			ErrSnapshotSidecarCorrupt, sv, m.PreSchemaVersion)
 	}
 
 	// Resolve the CANONICAL DB path once and use it for every staging,

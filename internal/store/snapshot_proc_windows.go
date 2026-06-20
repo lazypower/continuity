@@ -186,3 +186,17 @@ func openNoFollow(path string) (*os.File, error) {
 func openControlFileNoFollow(path string) (*os.File, error) {
 	return openNoFollow(path)
 }
+
+// platformFsyncDir is a NO-OP on Windows (Round 13, Finding 1). Calling File.Sync
+// on a DIRECTORY handle errors on Windows (CreateFile + FlushFileBuffers on a
+// directory is unsupported), so the unix-style open+Sync would make every
+// fatal-on-failure caller — restore-point publication (fsyncSnapshotDir), the
+// restore move-aside/publish dir-fsyncs, and the recovery scrub — spuriously ABORT
+// on Windows. NTFS metadata durability is handled by the OS/filesystem rather than
+// an explicit directory-handle flush, and FILE fsync (fsyncFile) still runs on
+// Windows for the snapshot/manifest BYTES, so returning nil here keeps directory
+// fsync from being a false durability failure while file-level durability is
+// preserved. Mirrors the unix platformFsyncDir which performs the real Sync.
+func platformFsyncDir(dir string) error {
+	return nil
+}

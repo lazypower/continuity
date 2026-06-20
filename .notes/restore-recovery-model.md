@@ -1,9 +1,92 @@
 # Restore Recovery Model — fail-closed pivot (Round 3)
 
+> **Round 13 update (cross-model):** HARDENING pass — three non-critical edges (no
+> P1) plus one doc note, each code fix paired with a regression test that fails
+> pre-fix. No new threat classes; these close a Windows-durability abort, an
+> indecisive prune, and a missing snapshot-schema check on restore/status. See
+> **"Round 13 — Windows dir-fsync, decisive prune, restore/status schema check"**
+> immediately below; the bar is unchanged.
+
 > **Round 12 update (Codex):** CORRECTNESS-EDGE pass — six non-critical edges (no
 > P1), each with a regression test that fails pre-fix. No new threat classes; these
 > close lifecycle/coordination gaps. See **"Round 12 — correctness edges"**
 > immediately below; the bar is unchanged.
+
+## Round 13 — Windows dir-fsync, decisive prune, restore/status schema check
+
+Three edges fixed + pinned by a regression test that is RED pre-fix, plus one doc
+note (F4 below).
+
+### F1. Directory fsync is PLATFORM-AWARE (no spurious Windows abort)
+
+`fsyncDir` opened the directory and `File.Sync()`'d the handle on every platform.
+Several callers treat a dir-fsync failure as FATAL — restore-point publication
+(`fsyncSnapshotDir`), the restore move-aside/publish dir-fsyncs, and the recovery
+scrub. But `File.Sync` on a DIRECTORY handle ERRORS on Windows (directory-handle
+fsync is unsupported), so a risky migration's restore-point publication and every
+restore/recovery would ABORT on Windows. Fix: `fsyncDir` now delegates to a per-OS
+`platformFsyncDir` hook — on unix it opens the dir and `Sync()`s as before (REAL
+durability, so a genuine failure still fails the fatal callers closed); on Windows
+it is a NO-OP returning nil (NTFS metadata durability is handled by the
+OS/filesystem, not an explicit directory flush). FILE fsync (`fsyncFile`) still runs
+on BOTH platforms, so snapshot/manifest BYTES stay durable everywhere; only the
+directory-handle fsync is platform-specific. Pinned by
+`TestFsyncDir_RealDirectorySucceeds` (unix: a real dir fsync SUCCEEDS — the hook
+stays real, not a no-op) plus `GOOS=windows go build` compiling the no-op path (no
+Windows runner needed).
+
+### F2. PRUNE is DECISIVE and HONEST (unwedges our own partials, never lies)
+
+`pruneKnownSidecarFiles` removed ONLY the two canonical files (`snapshot.db`,
+`manifest.json`). A sidecar wedged by an aborted CREATION — a leftover
+`snapshot.tmp.*` and no manifest — therefore survived prune (the temp and the dir
+remained), and prune still reported "pruned" while the dir stayed wedged. Fix: under
+the EXCLUSIVE lock with NO restore marker pending (refusal preserved, re-checked
+under the lock), prune now removes ALL of continuity's OWN sidecar contents — the
+canonical files (`snapshot.db`, `manifest.json`, `restore.in-progress.json`) AND the
+owned temp patterns (`snapshot.tmp.*` / `manifest.tmp.*` / `restore.marker.tmp.*` /
+`.restore.staged.*`) — each through the regular-file/no-symlink gate. Then: if the
+sidecar is EMPTY it is `rmdir`'d and prune returns success; if FOREIGN/unrecognized
+entries remain, prune LEAVES them and returns a clear error NAMING the residuals (no
+false "pruned"). `isOwnedSidecarName` is the single ownership predicate (canonical
+names + owned temp prefixes); a foreign file is NEVER deleted. Net: prune fully
+unwedges any sidecar of our own making, never deletes a foreign file, never falsely
+reports success. Pinned by `TestPrune_RemovesOwnedTempLeftover` (lone
+`snapshot.tmp.*`, no manifest ⇒ prune removes it and the dir, success; pre-fix the
+temp + dir survive) and `TestPrune_LeavesForeignFileAndErrors` (foreign `notes.txt`
++ an owned `manifest.tmp.*` ⇒ prune removes the owned temp, LEAVES the foreign file
+and the dir, returns an error naming `notes.txt`; pre-fix it false-reported success).
+
+### F3. RESTORE/STATUS verify the snapshot is actually at pre_schema_version
+
+Creation and reuse both prove `snapshotSchemaVersion(snapshot.db) ==
+manifest.PreSchemaVersion`, but Restore and Status trusted only manifest shape +
+hash + size + `integrity_check`. So a `snapshot.db` SWAPPED to a different schema
+version (with the manifest's hash/size updated to match) passed every gate: Restore
+would publish a DB at the WRONG schema, and Status would report a clean "present".
+Fix: after the existing `integrity_check` (the image is already opened read-only),
+both Restore (BEFORE the destructive swap → fail closed, `ErrSnapshotSidecarCorrupt`)
+and Status (report present-but-corrupt) now verify the snapshot's schema version ==
+`manifest.PreSchemaVersion`. Cheap defense-in-depth. Pinned by
+`TestRestoreStatus_SnapshotSchemaMismatchFailsClosed` (valid pre-v5 point, swap
+`snapshot.db` for a real v6 SQLite DB with hash/size re-recorded so
+`loadValidManifest` + `integrity_check` still pass ⇒ Restore fails closed with NO
+moved-aside backup, Status reports the schema mismatch; fails pre-fix).
+
+### F4. Explicit `prune --confirm` of our OWN corrupt/partial canonical sidecar is INTENTIONAL + zero-data-loss
+
+The "NEVER delete a corrupt sidecar" invariant applies to RESTORE and to AUTO-EXPIRY
+(`expireRestorePoint` / boot retention) — paths that must never auto-destroy
+recovery material off an unprovable state. It does NOT apply to an EXPLICIT operator
+`snapshot prune --confirm` of continuity's OWN canonical sidecar files. Removing a
+corrupt/partial `snapshot.db` / `manifest.json` / `restore.in-progress.json` (or an
+aborted-creation `snapshot.tmp.*` etc.) on explicit `--confirm` is ZERO DATA LOSS: the
+live DB is never opened or touched by prune, and a corrupt snapshot is an
+UNRESTORABLE backup copy — keeping it only wedges the operator (every later
+`Open`/`Status` fails closed and the old prune refused to clean it). This is exactly
+why prune can unwedge a partial sidecar (F2). Prune still NEVER deletes a FOREIGN file
+and still refuses entirely while a restore marker is pending (a crashed restore's only
+recovery material). No code beyond F2.
 
 > **Round 10 update (Codex):** the symlinked-leaf refusal had a SIBLING plus a
 > too-strict recovery case and a risk-detection gap. Four fixes, each with a

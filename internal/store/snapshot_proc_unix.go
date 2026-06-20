@@ -101,3 +101,22 @@ func openNoFollow(path string) (*os.File, error) {
 func openControlFileNoFollow(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 }
+
+// platformFsyncDir fsyncs a directory handle on unix — REAL durability (Round 13,
+// Finding 1). It opens the directory and Sync()s the handle so a rename/creation
+// inside it survives power loss. On unix this is supported and meaningful, so its
+// failure is propagated and the fatal-on-failure callers (restore-point publication,
+// restore move-aside/publish, recovery scrub) abort rather than report a non-durable
+// success. The windows build supplies a NO-OP instead (directory-handle fsync is
+// unsupported there).
+func platformFsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if serr := d.Sync(); serr != nil {
+		d.Close()
+		return serr
+	}
+	return d.Close()
+}
