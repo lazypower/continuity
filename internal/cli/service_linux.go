@@ -36,13 +36,19 @@ func generateUnit() (string, error) {
 
 	// Bake a usable PATH into the unit so the service can find the LLM provider
 	// binaries (`claude`, `ollama`); systemd does not inherit the login PATH.
+	//
+	// The Environment= assignment is QUOTED. systemd's Environment= parser splits
+	// on whitespace into KEY=VALUE pairs, so an unquoted value containing a space
+	// (legitimately: /opt/My Tools/bin) would be truncated, and a crafted entry
+	// could smuggle a second assignment. Quoting per systemd syntax keeps the value
+	// intact and inert. (The control-char drop in buildServicePATH still applies.)
 	return fmt.Sprintf(`[Unit]
 Description=Continuity - Persistent memory for AI coding agents
 After=network.target
 
 [Service]
 Type=simple
-Environment=PATH=%s
+Environment="PATH=%s"
 ExecStart=%s serve
 Restart=on-failure
 RestartSec=5
@@ -51,7 +57,23 @@ StandardError=append:%s
 
 [Install]
 WantedBy=default.target
-`, servicePATH(), self, logPath, logPath), nil
+`, escapeSystemdEnvValue(servicePATH()), self, logPath, logPath), nil
+}
+
+// escapeSystemdEnvValue escapes a value for inclusion inside a double-quoted
+// systemd Environment= assignment (Environment="KEY=VALUE"). Within double
+// quotes systemd requires backslash and double-quote to be escaped; we also
+// escape '%' as '%%' to defeat systemd specifier expansion (e.g. %h, %i). A
+// space is intentionally NOT escaped — it is the whole point of quoting that a
+// value with spaces survives intact. Control chars are already dropped upstream
+// in buildServicePATH.
+func escapeSystemdEnvValue(v string) string {
+	r := strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		`%`, `%%`,
+	)
+	return r.Replace(v)
 }
 
 func platformServiceStatus() (installed bool, status string) {

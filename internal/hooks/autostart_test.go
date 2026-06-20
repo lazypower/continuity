@@ -33,29 +33,28 @@ func TestAutostartEnabledTrueWithMarker(t *testing.T) {
 	}
 }
 
-// TestReapedChildReportsNotAlive is the unit-level guard for Fix 1: a child we
-// started and then crashes must NOT linger as a zombie that signal-0 reports as
-// ALIVE. SpawnDetachedServe reaps its child via a background cmd.Wait(); this test
-// reproduces that pattern with a process that exits immediately and asserts
-// ProcessAlive(pid) eventually reports false.
+// TestStartAndReapCollectsCrashedChild pins the PRODUCTION reap: it calls the
+// real startAndReap helper (the same start+background-Wait() path SpawnDetachedServe
+// uses) with a short-lived command and asserts ProcessAlive(pid) reports false
+// once the process exits. A crashed child must NOT linger as a zombie that
+// signal-0 reports ALIVE — that would mask a crash-on-boot as a soft timeout in
+// `continuity restart`.
 //
-// Without the reap, the crashed child stays a zombie owned by this (parent)
-// process and proc.Signal(0) returns nil (ALIVE), which is exactly what masks a
-// crash-on-boot as a soft timeout in `continuity restart`. The companion test in
+// This fails if the production `go cmd.Wait()` reap inside startAndReap is
+// removed: the exited child would remain a zombie we parent and ProcessAlive
+// would keep returning true until the deadline trips. The companion
 // TestZombieChildReportsAliveWithoutReap documents that failing baseline.
-func TestReapedChildReportsNotAlive(t *testing.T) {
-	cmd := exec.Command("sh", "-c", "exit 1")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start child: %v", err)
+func TestStartAndReapCollectsCrashedChild(t *testing.T) {
+	// Short-lived command standing in for a crash-on-boot.
+	pid, err := startAndReap(exec.Command("sh", "-c", "exit 1"))
+	if err != nil {
+		t.Fatalf("startAndReap: %v", err)
 	}
-	pid := cmd.Process.Pid
-	// This is the SpawnDetachedServe reap behavior under test.
-	go func() { _ = cmd.Wait() }()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for ProcessAlive(pid) {
 		if time.Now().After(deadline) {
-			t.Fatalf("reaped child pid %d still reported alive; reap did not collect the zombie", pid)
+			t.Fatalf("reaped child pid %d still reported alive; production reap did not collect the zombie", pid)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
