@@ -367,7 +367,7 @@ func removeRestoreMarker(sidecar string) error {
 // marker. resolveCanonicalRestore validates the marker's path fields against
 // this canonical set and refuses if any field implies a path outside it.
 type canonicalRestore struct {
-	resolvedDB string   // canonical live DB path (survives a dangling symlink)
+	resolvedDB string   // canonical live DB path (parent-dir symlinks resolved, leaf kept)
 	sidecar    string   // <resolvedDB>.snapshot (already asserted not a symlink)
 	staged     string   // canonical staged snapshot path inside the DB dir
 	backup     string   // canonical pre-restore backup prefix
@@ -385,25 +385,6 @@ type canonicalRestore struct {
 	snapshotSHA256 string
 }
 
-// resolveDBPathSurvivingDangling returns the canonical DB path surviving a
-// dangling/missing target. It delegates to canonicalDBPath so recovery resolves
-// the SAME real DB (and therefore the same sidecar, lock, and backup names) that
-// sidecarPath/dbLockPath use — there is exactly one resolution rule now
-// (Finding 3). The name is kept where recovery reads clearer for the intent.
-func resolveDBPathSurvivingDangling(dbPath string) (string, error) {
-	return canonicalDBPath(dbPath)
-}
-
-// resolveViaParentDir canonicalizes path by EvalSymlinks'ing its parent
-// directory (which exists even when the file itself is missing) and rejoining
-// the basename. Falls back to a plain Clean when the parent cannot be resolved.
-func resolveViaParentDir(path string) string {
-	if rp, perr := filepath.EvalSymlinks(filepath.Dir(path)); perr == nil {
-		return filepath.Join(rp, filepath.Base(path))
-	}
-	return filepath.Clean(path)
-}
-
 // resolveCanonicalRestore derives the trusted canonical view for dbPath and
 // validates the marker against it. It RECOMPUTES the sidecar (asserting it is
 // not a symlink) and constrains every path the marker names to the canonical
@@ -412,7 +393,7 @@ func resolveViaParentDir(path string) string {
 // fails closed (ErrSnapshotSidecarCorrupt) so a planted/corrupt marker can
 // never drive resume to delete or rename a file outside this DB's own set.
 func resolveCanonicalRestore(dbPath string, sidecar string, mk *restoreMarker) (*canonicalRestore, error) {
-	resolvedDB, err := resolveDBPathSurvivingDangling(dbPath)
+	resolvedDB, err := canonicalDBPath(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("restore resume: resolve db path: %w", err)
 	}
@@ -598,7 +579,8 @@ func detectRestoreInterrupted(dbPath string) error {
 // DB (Round 8, Finding 2) — recovery is never a side effect of a routine open, and
 // no live serve can re-open and auto-migrate the DB underneath recovery.
 //
-// dbPath is the (possibly symlinked, possibly dangling) path the operator knows.
+// dbPath is the path the operator knows (possibly reached through a symlinked
+// parent DIRECTORY; the canonical derivation resolves the dir and keeps the leaf).
 // The canonical resolved path + sidecar are RECOMPUTED here and are the sole
 // authority for every path recovery acts on; the marker's path fields are only
 // validated against that canonical set (resolveCanonicalRestore) AFTER the

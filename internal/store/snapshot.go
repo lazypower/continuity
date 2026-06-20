@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -84,6 +85,24 @@ func SetSnapshotCreatedByVersion(v string) {
 	}
 }
 
+// warnedSymlinkedLeaf de-dups the "snapshots unsupported for a symlinked DB file"
+// warning to ONE emission per distinct DB path per process, so a process that
+// opens the same symlinked DB repeatedly does not spam stderr.
+var warnedSymlinkedLeaf sync.Map // map[string]struct{}
+
+// warnSnapshotSymlinkedLeaf emits the one-time stderr warning that the snapshot /
+// restore feature is unsupported for a symlinked DB FILE. The risky migration
+// still PROCEEDS; this only tells the operator how to enable restore points
+// (point CONTINUITY_DB at the real file). Keyed per path so it fires once.
+func warnSnapshotSymlinkedLeaf(dbPath string) {
+	if _, loaded := warnedSymlinkedLeaf.LoadOrStore(dbPath, struct{}{}); loaded {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"warning: migration safety snapshots are not supported for a symlinked database file %s; "+
+			"point CONTINUITY_DB at the real file to enable them\n", dbPath)
+}
+
 // Manifest is the format_version 1 sidecar manifest. All fields are persisted
 // to manifest.json; no field holds an absolute path.
 type Manifest struct {
@@ -129,9 +148,16 @@ var (
 	ErrNoRestorePoint = errors.New("snapshot: no restore point")
 )
 
-// snapshotEligiblePath reports whether path can host a path-owned sidecar.
-// Rejects in-memory DBs and SQLite URI/DSN spellings (file:..., ?... ) whose
-// real on-disk location is ambiguous to derive a sidecar from.
+// snapshotEligiblePath reports whether path can host a path-owned sidecar /
+// lock. Rejects in-memory DBs and SQLite URI/DSN spellings (file:..., ?... )
+// whose real on-disk location is ambiguous to derive a sidecar from.
+//
+// NOTE: this is a PATH-SHAPE check only. It deliberately does NOT reject a
+// symlinked DB FILE (leaf): SQLite follows such a symlink, so Open / migrations /
+// the per-DB lock must still WORK for it — the lock keys to the canonical
+// (dir-resolved, leaf-kept) path. Only the SNAPSHOT/RESTORE feature is disabled
+// for a symlinked leaf, and that is decided separately by snapshotLeafIsSymlink /
+// the eligibility gate in ensureUpgradeRestorePoint, NOT here.
 func snapshotEligiblePath(path string) bool {
 	p := strings.TrimSpace(path)
 	if p == "" || p == ":memory:" {
@@ -156,57 +182,70 @@ func snapshotEligiblePath(path string) bool {
 	return true
 }
 
+// snapshotLeafIsSymlink reports whether the DB FILE itself (the final path
+// component) is a symlink. A symlinked DB file is INELIGIBLE for the snapshot /
+// restore feature: we drop support for resolving a symlinked leaf (the recurring
+// complexity source) and instead disable snapshots for it (see
+// ensureUpgradeRestorePoint, Status/Restore/Prune). SQLite still follows the
+// symlink for ordinary Open / migrations / locking — only snapshots are off.
+//
+// The check is on the ABS path's leaf, NOT the canonical path (canonicalDBPath
+// resolves only the PARENT dir and keeps the leaf, so a symlinked leaf survives
+// into the canonical path and an lstat there would still see the link). A
+// non-existent leaf, or any lstat error other than "is a symlink", reports false
+// — eligibility is decided by the other gates in that case.
+func snapshotLeafIsSymlink(dbPath string) bool {
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return false
+	}
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeSymlink != 0
+}
+
 // canonicalDBPath resolves a DB path to its single real on-disk target, the
-// ONE derivation every sidecar/lock/backup name is keyed to. It must return the
-// same answer for every spelling of the same real DB AND survive the two states
-// a mid-restore DB can be in:
+// ONE derivation every sidecar/lock/backup name is keyed to. It resolves the
+// DIRECTORY's symlinks but KEEPS the real leaf:
 //
-//	abs           = Abs(path)
-//	(a) DB present:        EvalSymlinks(abs)               — follows symlinks
-//	(b) DB missing, abs is
-//	    a dangling symlink: Readlink(abs) then resolve via parent dir
-//	(c) DB missing, plain:  resolve via parent dir (e.g. /var → /private/var)
+//	canonical = filepath.Join(EvalSymlinks(filepath.Dir(abs)), filepath.Base(abs))
 //
-// (b) and (c) are why lock and sidecar resolution can no longer diverge
-// (Finding 3): when a restore through a symlinked CONTINUITY_DB has moved the
-// real DB aside, EvalSymlinks(abs) fails, and a naive fallback to abs would key
-// the lock to the LINK while the sidecar was written under the REAL DB. Both
-// dbLockPath and sidecarPath now route through this one helper, so the lock
-// and the sidecar are always keyed to the same real DB.
+// Parent-dir symlinks are STABLE — continuity never moves directories — so this
+// derivation never dangles and returns the same answer whether or not the leaf
+// exists. (It also no longer needs to follow a leaf symlink: a symlinked DB FILE
+// is excluded from the snapshot feature entirely, so there is no symlinked-leaf
+// resolution to do here. The leaf is kept verbatim.)
+//
+// Both dbLockPath and sidecarPath route through this one helper, so the lock and
+// the sidecar are always keyed to the same real DB directory + leaf name.
 func canonicalDBPath(dbPath string) (string, error) {
 	abs, err := filepath.Abs(dbPath)
 	if err != nil {
 		return "", fmt.Errorf("snapshot: abs db path: %w", err)
 	}
-	// (a) Existing, resolvable path: follow symlinks to the real file.
-	if _, statErr := os.Stat(abs); statErr == nil {
-		if r, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
-			return r, nil
-		}
+	// Resolve only the PARENT directory's symlinks (stable; never moved) and
+	// rejoin the leaf. EvalSymlinks of the parent canonicalizes platform symlinks
+	// (e.g. macOS /var → /private/var) so the recomputed sidecar/lock/backup names
+	// match across spellings. If the parent cannot be resolved (e.g. it does not
+	// exist yet), fall back to a plain Clean of the absolute path.
+	if rp, perr := filepath.EvalSymlinks(filepath.Dir(abs)); perr == nil {
+		return filepath.Join(rp, filepath.Base(abs)), nil
 	}
-	// (b) abs is itself a (possibly dangling) symlink: follow it via Readlink so
-	// a crashed restore through a symlink still resolves to the REAL DB.
-	if li, lerr := os.Lstat(abs); lerr == nil && li.Mode()&os.ModeSymlink != 0 {
-		if target, rlErr := os.Readlink(abs); rlErr == nil {
-			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(abs), target)
-			}
-			return resolveViaParentDir(target), nil
-		}
-	}
-	// (c) The DB itself is gone (or never existed) and abs is not a symlink.
-	// Resolving the PARENT dir still canonicalizes platform symlinks so the
-	// recomputed sidecar/lock/backup names match what production wrote.
-	return resolveViaParentDir(abs), nil
+	return filepath.Clean(abs), nil
 }
 
 // sidecarPath derives the canonical sidecar directory for a DB path:
 //
 //	sidecar = canonicalDBPath(path) + ".snapshot"
 //
-// Relative and absolute spellings of the same real DB resolve identically, and
-// the derivation survives a dangling/missing target (see canonicalDBPath).
-// Returns ErrSnapshotUnsupportedPath for ineligible paths.
+// Relative and absolute spellings of the same real DB resolve identically
+// (parent-dir symlinks resolved, leaf kept; see canonicalDBPath), and the
+// derivation never dangles. Returns ErrSnapshotUnsupportedPath for ineligible
+// paths. NOTE: a symlinked DB leaf still yields a sidecar path here (the leaf is
+// kept) — the snapshot FEATURE is disabled for it upstream (ensureUpgradeRestorePoint),
+// not by refusing to derive a path.
 func sidecarPath(dbPath string) (string, error) {
 	if !snapshotEligiblePath(dbPath) {
 		return "", ErrSnapshotUnsupportedPath
@@ -276,22 +315,35 @@ func validateSnapshotFileName(name string) error {
 	return nil
 }
 
-// readControlFileNoFollow reads a sidecar CONTROL FILE (manifest.json /
-// restore.in-progress.json) WITHOUT following a final-component symlink, and only
-// after fstat-proving the opened descriptor is a regular file (Round 9, Finding 6).
-// A symlink, FIFO, device, socket, or directory at the control-file path FAILS
-// CLOSED as ErrSnapshotSidecarCorrupt rather than being followed (which could read
-// a file outside the sidecar) or blocked on (a FIFO read can hang forever). A
-// missing file propagates os.ErrNotExist so callers can distinguish absence.
+// =========================================================================
+// THE consolidated managed-file gate (one helper; no call site may bypass it).
 //
-// openNoFollow makes a final-component symlink fail at open(2) (ELOOP on unix);
-// the fstat regular-file check additionally rejects a FIFO/device/dir/socket and
-// closes a race that swapped the path to a non-regular file after the open.
-func readControlFileNoFollow(path string) ([]byte, error) {
+// EVERY open of a file continuity manages inside the sidecar / DB dir —
+// snapshot.db, manifest.json, restore.in-progress.json, the .pre-restore.*
+// backups, and the .restore.staged.* temps — goes through openManagedFileNoFollow.
+// It is the SINGLE place that enforces both halves of the no-symlink invariant:
+//
+//	(1) O_NOFOLLOW  — a final-component symlink fails the open (ELOOP on unix; an
+//	    open-reparse-point on windows) so a planted symlink is never traversed;
+//	(2) fstat regular-file — the opened descriptor is proven a regular file, so a
+//	    FIFO / device / socket / directory (or a race that swapped the path to one
+//	    after the open) fails closed too.
+//
+// A symlink/FIFO/device/dir at a managed-file path => ErrSnapshotSidecarCorrupt
+// (fail closed), regardless of the leaf-symlink rule for the DB FILE itself: a
+// planted symlink in OUR OWN sidecar must ALWAYS be refused. Routing every reader
+// (readControlFileNoFollow, hashFileNoFollow) through this one primitive means a
+// future managed-file position cannot be added without the gate.
+//
+// openControlFileNoFollow (the per-OS primitive this builds on) additionally adds
+// O_NONBLOCK on unix so a FIFO open returns immediately instead of hanging before
+// the fstat can reject it. Callers own Close()ing the returned file.
+// =========================================================================
+func openManagedFileNoFollow(path string) (*os.File, error) {
 	f, err := openControlFileNoFollow(path)
 	if err != nil {
 		// A MISSING file must stay os.IsNotExist so callers can distinguish absence
-		// from corruption. Any OTHER open failure on a control file is fail-closed
+		// from corruption. Any OTHER open failure on a managed file is fail-closed
 		// corruption: O_NOFOLLOW makes a final-component symlink fail with ELOOP, and
 		// we report that (and any other non-NotExist open error) as a corrupt sidecar
 		// rather than leaking a raw "too many levels of symbolic links" error or
@@ -299,16 +351,33 @@ func readControlFileNoFollow(path string) ([]byte, error) {
 		if os.IsNotExist(err) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("%w: control file %s could not be opened (%v)", ErrSnapshotSidecarCorrupt, filepath.Base(path), err)
+		return nil, fmt.Errorf("%w: managed file %s could not be opened (%v)", ErrSnapshotSidecarCorrupt, filepath.Base(path), err)
 	}
-	defer f.Close()
 	info, serr := f.Stat()
 	if serr != nil {
+		_ = f.Close()
 		return nil, serr
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%w: control file %s is not a regular file", ErrSnapshotSidecarCorrupt, filepath.Base(path))
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: managed file %s is not a regular file", ErrSnapshotSidecarCorrupt, filepath.Base(path))
 	}
+	return f, nil
+}
+
+// readControlFileNoFollow reads a sidecar CONTROL FILE (manifest.json /
+// restore.in-progress.json) through the consolidated managed-file gate
+// (openManagedFileNoFollow): O_NOFOLLOW + fstat regular-file, so a symlink, FIFO,
+// device, socket, or directory at the control-file path FAILS CLOSED as
+// ErrSnapshotSidecarCorrupt rather than being followed (which could read a file
+// outside the sidecar) or blocked on (a FIFO read can hang forever). A missing
+// file propagates os.ErrNotExist so callers can distinguish absence.
+func readControlFileNoFollow(path string) ([]byte, error) {
+	f, err := openManagedFileNoFollow(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
 	data, rerr := io.ReadAll(f)
 	if rerr != nil {
 		return nil, rerr
@@ -499,29 +568,22 @@ func hashFile(path string) (string, int64, error) {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
-// hashFileNoFollow returns ("sha256:<hex>", size, nil) for a REGULAR file at
-// path, opened WITHOUT following a final-component symlink (O_NOFOLLOW). It is
-// the hash the destructive recovery paths MUST use instead of the
-// symlink-following hashFile (Round 7, Findings 1 & 2): a forged/corrupt marker
-// must never make recovery hash (and then trust) a file reached through a
-// symlink the marker pointed at — that is how a backup_prefix symlinked to
-// another directory's DB could be pulled over the live DB. A symlink at path
-// makes openNoFollow fail (ELOOP on unix); we additionally fstat the opened
-// descriptor and reject anything that is not a regular file, so even a race that
-// swapped the path after the open cannot smuggle a non-regular file through.
+// hashFileNoFollow returns ("sha256:<hex>", size, nil) for a REGULAR managed file
+// at path, opened through the consolidated managed-file gate
+// (openManagedFileNoFollow): O_NOFOLLOW + fstat regular-file. It is the hash the
+// destructive recovery paths MUST use instead of the symlink-following hashFile
+// (Round 7, Findings 1 & 2): a forged/corrupt marker must never make recovery hash
+// (and then trust) a file reached through a symlink the marker pointed at — that is
+// how a backup_prefix symlinked to another directory's DB could be pulled over the
+// live DB. The gate makes a symlink fail the open (ELOOP on unix) and rejects any
+// non-regular file (FIFO/device/dir/socket), so even a race that swapped the path
+// after the open cannot smuggle a non-regular file through.
 func hashFileNoFollow(path string) (string, int64, error) {
-	f, err := openNoFollow(path)
+	f, err := openManagedFileNoFollow(path)
 	if err != nil {
 		return "", 0, err
 	}
 	defer f.Close()
-	info, serr := f.Stat()
-	if serr != nil {
-		return "", 0, serr
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return "", 0, fmt.Errorf("%w: %s is not a regular file", ErrSnapshotSidecarCorrupt, filepath.Base(path))
-	}
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {
@@ -683,6 +745,15 @@ func (db *DB) ensureUpgradeRestorePoint(preVersion int) error {
 		return nil
 	}
 
+	// SYMLINKED DB FILE (leaf) => snapshots UNSUPPORTED. Skip the restore point
+	// with a one-time warning and let the risky migration PROCEED — same shape as
+	// the :memory:/URI/opt-out skip path; we never FAIL the migration for it. The
+	// per-DB lock and SQLite's symlink-following Open still work for it.
+	if snapshotLeafIsSymlink(db.Path) {
+		warnSnapshotSymlinkedLeaf(db.Path)
+		return nil
+	}
+
 	optOut := os.Getenv(envDisableSnapshot) == "1"
 
 	if !snapshotEligiblePath(db.Path) {
@@ -722,6 +793,15 @@ func (db *DB) ensureUpgradeRestorePointLocked(preVersion int) error {
 	}
 	firstRisky, hasRisky := firstPendingRiskyVersion(preVersion)
 	if !hasRisky {
+		return nil
+	}
+	// SYMLINKED DB FILE (leaf) => snapshots UNSUPPORTED: skip with a one-time
+	// warning and let the (already-locked) risky migration PROCEED. migrate() still
+	// took the EXCLUSIVE lock around this call + the DDL (the lock keys to the
+	// canonical dir-resolved path), so serialization is preserved; we simply decline
+	// to create a restore point. We never FAIL the migration for a symlinked leaf.
+	if snapshotLeafIsSymlink(db.Path) {
+		warnSnapshotSymlinkedLeaf(db.Path)
 		return nil
 	}
 	// Eligibility was already checked by migrate() before taking the lock (this

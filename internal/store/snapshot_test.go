@@ -149,29 +149,39 @@ func TestSidecarPath_RelativeAbsoluteSame(t *testing.T) {
 	}
 }
 
-func TestSidecarPath_SymlinkedDBResolves(t *testing.T) {
+// TestSidecarPath_ParentDirSymlinkResolves pins the NEW canonical-path contract:
+// the DIRECTORY's symlinks are resolved but the LEAF is kept. A DB reached through
+// a symlinked PARENT DIRECTORY (real leaf) derives the SAME sidecar as the DB
+// reached through the real directory — parent-dir symlinks are stable, so the
+// sidecar/lock derivation never diverges. (The dropped behavior — resolving a
+// symlinked LEAF — is covered by TestSnapshot_SymlinkedDBLeaf_Unsupported.)
+func TestSidecarPath_ParentDirSymlinkResolves(t *testing.T) {
 	realDir := t.TempDir()
 	realDB := filepath.Join(realDir, "real.db")
 	buildDBAtVersionStandalone(t, realDB, 5)
 
-	linkDir := t.TempDir()
-	link := filepath.Join(linkDir, "link.db")
-	if err := os.Symlink(realDB, link); err != nil {
-		t.Fatalf("symlink: %v", err)
+	// A symlinked DIRECTORY that points at realDir; the DB leaf is real underneath.
+	linkParent := t.TempDir()
+	linkDir := filepath.Join(linkParent, "linkdir")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatalf("symlink dir: %v", err)
 	}
+	viaLinkDir := filepath.Join(linkDir, "real.db")
 
-	viaLink, err := sidecarPath(link)
+	got, err := sidecarPath(viaLinkDir)
 	if err != nil {
-		t.Fatalf("via link: %v", err)
+		t.Fatalf("via link dir: %v", err)
 	}
-	viaReal, err := sidecarPath(realDB)
+	want, err := sidecarPath(realDB)
 	if err != nil {
 		t.Fatalf("via real: %v", err)
 	}
-	// EvalSymlinks should make the symlinked DB resolve to the real path's
-	// sidecar.
-	if viaLink != viaReal {
-		t.Errorf("symlinked DB sidecar differs from real:\n link=%s\n real=%s", viaLink, viaReal)
+	if got != want {
+		t.Errorf("parent-dir-symlinked DB sidecar differs from real:\n linkdir=%s\n real=%s", got, want)
+	}
+	// And the leaf is NOT a symlink, so snapshots remain SUPPORTED for it.
+	if snapshotLeafIsSymlink(viaLinkDir) {
+		t.Errorf("snapshotLeafIsSymlink reported a parent-dir-symlinked path's real leaf as a symlink")
 	}
 }
 
@@ -1052,18 +1062,24 @@ func TestDBLock_SharedAllowsManyExclusiveExcludes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 3: restore operates on the canonical (resolved) DB, not a symlink
+// Symlinked DB FILE (leaf): snapshots UNSUPPORTED, migration still proceeds.
+// The leaf-symlink resolution + dangling machinery were DROPPED; a symlinked DB
+// file disables only the snapshot/restore feature, never Open/migrations/lock.
 // ---------------------------------------------------------------------------
 
-// TestRestore_SymlinkedDBHitsRealFile points CONTINUITY_DB at a SYMLINK to the
-// real DB and restores. The real file must be replaced (and moved aside), and
-// the symlink must still point at a valid restored DB — never renamed itself.
-func TestRestore_SymlinkedDBHitsRealFile(t *testing.T) {
+// TestSnapshot_SymlinkedDBLeaf_Unsupported drives the REAL Open/migrate path
+// THROUGH a symlinked DB file across a RISKY upgrade (v5 → head). Snapshots are
+// unsupported for a symlinked leaf, so:
+//   - no restore point is created (no sidecar beside the real DB),
+//   - the risky migration nonetheless COMPLETES (Open succeeds, schema advances),
+//     SQLite following the symlink,
+//   - Status / Restore / Prune via the link report no restore point cleanly.
+func TestSnapshot_SymlinkedDBLeaf_Unsupported(t *testing.T) {
 	realDir := t.TempDir()
 	realDB := filepath.Join(realDir, "real.db")
 	buildDBAtVersionStandalone(t, realDB, 5)
 
-	// Seed a v5 marker so we can prove the real file was restored.
+	// Seed a pre-upgrade row so we can prove the migration ran on the real file.
 	{
 		raw, err := sql.Open("sqlite", realDB)
 		if err != nil {
@@ -1077,60 +1093,62 @@ func TestRestore_SymlinkedDBHitsRealFile(t *testing.T) {
 		raw.Close()
 	}
 
-	// Migrate the REAL DB to head via its real path (creates the sidecar at the
-	// resolved path), then mutate post-migration.
-	db, err := Open(realDB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`
-		INSERT INTO mem_nodes (uri, node_type, category, l0_abstract, created_at, updated_at)
-		VALUES ('mem://user/feedback/sym-post', 'leaf', 'feedback', 'vanish', 1, 1)`); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	// Now restore THROUGH a symlink in a different directory.
+	// Point a SYMLINK at the real DB file and open THROUGH it. The risky upgrade
+	// must proceed (snapshots are merely skipped), advancing the schema to head.
 	linkDir := t.TempDir()
 	link := filepath.Join(linkDir, "link.db")
 	if err := os.Symlink(realDB, link); err != nil {
 		t.Fatal(err)
 	}
-
-	movedAside, err := Restore(link)
-	if err != nil {
-		t.Fatalf("restore via symlink: %v", err)
-	}
-	// The moved-aside backup must be next to the REAL (resolved) DB, not the
-	// link. Resolve realDB too — on macOS /var is itself a symlink, so compare
-	// against the canonical directory.
-	resolvedRealDB, _ := resolveDBPath(realDB)
-	if filepath.Dir(movedAside) != filepath.Dir(resolvedRealDB) {
-		t.Errorf("moved-aside backup not beside real DB: %s (real dir %s)", movedAside, filepath.Dir(resolvedRealDB))
-	}
-	// The link itself must still BE a symlink pointing at the real DB.
-	fi, err := os.Lstat(link)
-	if err != nil {
-		t.Fatalf("lstat link: %v", err)
-	}
-	if fi.Mode()&os.ModeSymlink == 0 {
-		t.Errorf("symlink was renamed/replaced instead of the real file")
+	if !snapshotLeafIsSymlink(link) {
+		t.Fatal("test setup: link leaf not detected as a symlink")
 	}
 
-	// The real file is now the restored v5 image: marker present, post-row gone.
-	rdb, err := OpenNoMigrate(realDB)
+	db, err := Open(link)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Open through symlinked leaf failed (migration must proceed): %v", err)
 	}
-	defer rdb.Close()
-	if v, _ := rdb.SchemaVersion(); v != 5 {
-		t.Errorf("real DB schema after restore = v%d, want v5", v)
+	v, _ := db.SchemaVersion()
+	db.Close()
+	if v != headVersion() {
+		t.Errorf("schema after risky upgrade through symlinked leaf = v%d, want head v%d", v, headVersion())
 	}
-	var n int
-	rdb.QueryRow(`SELECT COUNT(*) FROM mem_nodes WHERE uri='mem://user/feedback/sym-post'`).Scan(&n)
-	if n != 0 {
-		t.Errorf("post-upgrade row survived restore through symlink")
+
+	// NO sidecar was created beside the real DB — snapshots are unsupported for a
+	// symlinked leaf, so the feature took NO action.
+	realSidecar := realDB + snapshotSidecarSuffix
+	if _, serr := os.Lstat(realSidecar); !os.IsNotExist(serr) {
+		t.Errorf("a sidecar was created beside a symlinked-leaf DB: %v", serr)
 	}
+
+	// Status via the link reports "not present" cleanly (never touches a sidecar).
+	st, serr := Status(link)
+	if serr != nil {
+		t.Fatalf("Status via symlinked leaf: %v", serr)
+	}
+	if st.Present {
+		t.Errorf("Status reported a restore point for a symlinked-leaf DB: %+v", st)
+	}
+
+	// Restore / Prune via the link report ErrNoRestorePoint cleanly (no lock, no
+	// side effects), exactly like an ineligible :memory:/URI path.
+	if _, rerr := Restore(link); !errors.Is(rerr, ErrNoRestorePoint) {
+		t.Errorf("Restore via symlinked leaf: err = %v, want ErrNoRestorePoint", rerr)
+	}
+	if perr := Prune(link); !errors.Is(perr, ErrNoRestorePoint) {
+		t.Errorf("Prune via symlinked leaf: err = %v, want ErrNoRestorePoint", perr)
+	}
+
+	// The link must STILL be a symlink to the real DB (never renamed/replaced),
+	// and the real DB still opens.
+	if fi, lerr := os.Lstat(link); lerr != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("link is no longer a symlink to the real DB (lerr=%v)", lerr)
+	}
+	rdb, oerr := OpenNoMigrate(realDB)
+	if oerr != nil {
+		t.Fatalf("real DB no longer opens after symlinked-leaf upgrade: %v", oerr)
+	}
+	rdb.Close()
 }
 
 // ---------------------------------------------------------------------------
@@ -1546,95 +1564,13 @@ func TestOpen_FailsClosedOnTornPrePublishState(t *testing.T) {
 	rdb.Close()
 }
 
-// ---------------------------------------------------------------------------
-// ROUND 2 Finding 8: resume through a DANGLING DB symlink still finds the
-// sidecar under the REAL DB and recovers (rolls back) — it must not fall back to
-// "<link>.snapshot" and skip recovery, which would let a fresh DB be fabricated.
-// ---------------------------------------------------------------------------
-
-// TestRestoreMarker_ResumeThroughDanglingSymlinkRecovers simulates a restore
-// that crashed (before publish) THROUGH a symlinked CONTINUITY_DB after the real
-// DB was moved aside: the link now dangles. Opening via the dangling link must
-// resolve the real DB's sidecar (via os.Readlink), find the marker there, and
-// roll the originals back.
-func TestRestoreMarker_ResumeThroughDanglingSymlinkRecovers(t *testing.T) {
-	realDir := t.TempDir()
-	realDB := filepath.Join(realDir, "real.db")
-	buildDBAtVersionStandalone(t, realDB, 5)
-	db, err := Open(realDB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-	sidecar, _ := sidecarPath(realDB)
-	resolvedReal, _ := resolveDBPath(realDB)
-
-	// Stage a copy and move the real DB triplet aside (the not-yet-published torn
-	// state), writing the marker under the REAL DB's sidecar.
-	staged := filepath.Join(filepath.Dir(resolvedReal), ".restore.staged.dangle.db")
-	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
-		t.Fatal(err)
-	}
-	origSum, _, err := hashFile(resolvedReal)
-	if err != nil {
-		t.Fatal(err)
-	}
-	backupPrefix := resolvedReal + ".pre-restore.dangle"
-	var moved []string
-	var movedEntries []movedEntry
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		src := resolvedReal + suffix
-		if _, statErr := os.Lstat(src); statErr != nil {
-			continue
-		}
-		sum, _, hErr := hashFile(src)
-		if hErr != nil {
-			t.Fatal(hErr)
-		}
-		if err := os.Rename(src, backupPrefix+suffix); err != nil {
-			t.Fatal(err)
-		}
-		moved = append(moved, suffix)
-		movedEntries = append(movedEntries, movedEntry{Suffix: suffix, SHA256: sum})
-	}
-	mk := &restoreMarker{
-		Version: 1, RestoredDBPath: resolvedReal, StagedPath: staged,
-		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
-		OriginalDBSHA256: origSum,
-		MovedEntries:     movedEntries,
-	}
-	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
-		t.Fatal(err)
-	}
-
-	// Now the real DB is gone → a symlink pointing at it DANGLES. Resume through
-	// the dangling link must still find the marker under the real sidecar.
-	linkDir := t.TempDir()
-	link := filepath.Join(linkDir, "link.db")
-	if err := os.Symlink(realDB, link); err != nil {
-		t.Fatal(err)
-	}
-	if _, serr := os.Stat(link); serr == nil {
-		t.Fatal("link unexpectedly resolves; real DB should be moved aside (dangling)")
-	}
-
-	if err := recoverPendingRestore(link); err != nil {
-		t.Fatalf("recover through dangling symlink: %v", err)
-	}
-	// The real DB is back (rollback moved the originals back).
-	rdb, err := OpenNoMigrate(realDB)
-	if err != nil {
-		t.Fatalf("dangling-symlink resume did not recover the real DB: %v", err)
-	}
-	rdb.Close()
-	// Marker and staged file cleared under the real sidecar.
-	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(err) {
-		t.Errorf("marker survived dangling-symlink resume")
-	}
-	if _, err := os.Stat(staged); !os.IsNotExist(err) {
-		t.Errorf("staged file survived dangling-symlink resume")
-	}
-}
+// NOTE: the former TestRestoreMarker_ResumeThroughDanglingSymlinkRecovers was
+// DELETED with the dangling-symlink machinery (resolveDBPathSurvivingDangling /
+// resolveViaParentDir / Readlink fallbacks). A symlinked DB FILE no longer
+// supports snapshots/restore at all (see TestSnapshot_SymlinkedDBLeaf_Unsupported),
+// so there is no "resume through a dangling leaf symlink" path to recover. Recovery
+// through a symlinked PARENT DIR (real leaf) is exercised by the normal recovery
+// tests via canonicalDBPath, which resolves the dir and keeps the leaf.
 
 // ---------------------------------------------------------------------------
 // Finding 5: a pre-restore backup is never overwritten
@@ -2188,30 +2124,33 @@ func TestOpen_CorruptEmptyMarker_FailsClosedPreservesMarker(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 3: lock & sidecar keyed to the SAME real DB through a symlink whose
-// target appears later. serve and a second serve/restore must contend on ONE
-// lock (the real DB's), never on divergent link-vs-real lock paths.
+// Lock & sidecar keyed to the SAME real DB through a symlinked PARENT DIRECTORY
+// (the canonical-path contract after dropping leaf-symlink resolution): the dir's
+// symlinks are resolved, the leaf is kept, so a process reaching the DB through a
+// symlinked dir and one reaching it directly contend on ONE lock and share ONE
+// sidecar — never divergent link-vs-real paths.
 // ---------------------------------------------------------------------------
 
-// TestDBLock_SymlinkLockUnifiedWithRealTarget builds the real DB, points a
-// symlink at it, and asserts the DB lock path resolved via the LINK equals the
-// one resolved via the REAL DB — and that a foreign EXCLUSIVE holder taken via
-// the link makes a SHARED acquire via the real path wait/fail-block (same single
-// on-disk lock file). Before Finding 3 the lock used Abs (link path) while the
-// sidecar used the resolved real path, so a serve-via-link and a
-// restore-via-real-path contended on DIFFERENT locks and could both touch the DB.
-func TestDBLock_SymlinkLockUnifiedWithRealTarget(t *testing.T) {
+// TestDBLock_ParentDirSymlinkUnifiedWithReal reaches the real DB through a
+// symlinked PARENT DIRECTORY (real leaf) and asserts the DB lock path resolved
+// that way equals the one resolved via the real directory — and that a foreign
+// EXCLUSIVE holder taken via the symlinked-dir path makes an EXCLUSIVE acquire via
+// the real path fail closed (same single on-disk lock file). This replaces the old
+// leaf-symlink unification test: a symlinked DB FILE is no longer resolved (it is
+// snapshot-unsupported); a symlinked DIRECTORY is, and is fully supported.
+func TestDBLock_ParentDirSymlinkUnifiedWithReal(t *testing.T) {
 	realDir := t.TempDir()
 	realDB := filepath.Join(realDir, "real.db")
 	buildDBAtVersionStandalone(t, realDB, 5)
 
-	linkDir := t.TempDir()
-	link := filepath.Join(linkDir, "link.db")
-	if err := os.Symlink(realDB, link); err != nil {
+	linkParent := t.TempDir()
+	linkDir := filepath.Join(linkParent, "linkdir")
+	if err := os.Symlink(realDir, linkDir); err != nil {
 		t.Fatal(err)
 	}
+	viaLinkDir := filepath.Join(linkDir, "real.db")
 
-	viaLink, err := dbLockPath(link)
+	viaLink, err := dbLockPath(viaLinkDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2220,48 +2159,50 @@ func TestDBLock_SymlinkLockUnifiedWithRealTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	if viaLink != viaReal {
-		t.Fatalf("db lock keyed differently via link vs real:\n link=%s\n real=%s", viaLink, viaReal)
+		t.Fatalf("db lock keyed differently via symlinked dir vs real:\n linkdir=%s\n real=%s", viaLink, viaReal)
 	}
 
-	// A foreign EXCLUSIVE holder taken via the LINK path must make an EXCLUSIVE
-	// acquire via the REAL path fail closed — proving they contend on ONE lock.
-	relLink := foreignFlock(t, link, true)
+	// A foreign EXCLUSIVE holder taken via the symlinked-dir path must make an
+	// EXCLUSIVE acquire via the REAL path fail closed — proving they contend on ONE
+	// lock.
+	relLink := foreignFlock(t, viaLinkDir, true)
 	defer relLink()
 	stand := &DB{Path: realDB}
 	if _, aerr := acquireExclusiveLockForOwner(stand); !errors.Is(aerr, ErrDBLocked) {
-		t.Errorf("exclusive via real path while link holds exclusive: err=%v, want ErrDBLocked", aerr)
+		t.Errorf("exclusive via real path while symlinked-dir path holds exclusive: err=%v, want ErrDBLocked", aerr)
 	}
 }
 
-// TestCanonicalDBPath_SurvivesLaterCreatedSymlinkTarget pins that the lock and
-// sidecar derivations agree even when the symlink target does not exist YET
-// (it is created later): both route through canonicalDBPath, so they cannot
-// diverge between the missing-target and present-target states.
-func TestCanonicalDBPath_SurvivesLaterCreatedSymlinkTarget(t *testing.T) {
+// TestCanonicalDBPath_ParentDirSymlinkAgreesLockAndSidecar pins that the lock and
+// sidecar derivations agree for a DB reached through a symlinked PARENT DIRECTORY,
+// both before and after the DB leaf exists. Parent-dir symlinks are stable, so
+// canonicalDBPath never dangles and both derivations are keyed to the SAME real
+// file as resolving the real path directly — with NO Readlink/dangling machinery.
+func TestCanonicalDBPath_ParentDirSymlinkAgreesLockAndSidecar(t *testing.T) {
 	realDir := t.TempDir()
 	realDB := filepath.Join(realDir, "real.db")
 
-	linkDir := t.TempDir()
-	link := filepath.Join(linkDir, "link.db")
-	if err := os.Symlink(realDB, link); err != nil {
+	linkParent := t.TempDir()
+	linkDir := filepath.Join(linkParent, "linkdir")
+	if err := os.Symlink(realDir, linkDir); err != nil {
 		t.Fatal(err)
 	}
+	viaLinkDir := filepath.Join(linkDir, "real.db")
 
-	// Target does not exist yet: resolution must follow the link via Readlink and
-	// agree for both lock and sidecar.
-	lockBefore, _ := dbLockPath(link)
-	sidecarBefore, _ := sidecarPath(link)
+	// DB leaf does not exist yet: parent-dir resolution still agrees for lock+sidecar.
+	lockBefore, _ := dbLockPath(viaLinkDir)
+	sidecarBefore, _ := sidecarPath(viaLinkDir)
 	if filepath.Dir(lockBefore) != filepath.Dir(sidecarBefore) {
-		t.Errorf("lock/sidecar dirs diverge with missing target:\n lock=%s\n sidecar=%s", lockBefore, sidecarBefore)
+		t.Errorf("lock/sidecar dirs diverge before leaf exists:\n lock=%s\n sidecar=%s", lockBefore, sidecarBefore)
 	}
 
-	// Now create the target; resolution must still agree, and the lock/sidecar
-	// must be keyed to the SAME real file as resolving the real path directly.
+	// Now create the DB; resolution must still agree, and the lock/sidecar must be
+	// keyed to the SAME real file as resolving the real path directly.
 	buildDBAtVersionStandalone(t, realDB, 5)
-	lockAfter, _ := dbLockPath(link)
+	lockAfter, _ := dbLockPath(viaLinkDir)
 	realLock, _ := dbLockPath(realDB)
 	if lockAfter != realLock {
-		t.Errorf("post-create lock via link != via real:\n link=%s\n real=%s", lockAfter, realLock)
+		t.Errorf("post-create lock via symlinked dir != via real:\n linkdir=%s\n real=%s", lockAfter, realLock)
 	}
 }
 
@@ -4733,6 +4674,104 @@ func TestControlFiles_SymlinkOrFIFO_RejectedAsCorrupt(t *testing.T) {
 			}
 		case <-time.After(5 * time.Second):
 			t.Fatal("readRestoreMarker BLOCKED on a FIFO marker")
+		}
+	})
+}
+
+// TestManagedFileGate_SymlinkOrFIFORejected pins the CONSOLIDATED managed-file
+// gate (openManagedFileNoFollow): EVERY managed-file position — snapshot.db, a
+// .pre-restore.* backup, a .restore.staged.* temp, and a control file — fails
+// closed (ErrSnapshotSidecarCorrupt) when a symlink (or FIFO) is planted at it,
+// regardless of the leaf-symlink rule for the DB file itself. A planted symlink in
+// our OWN sidecar must always be refused — that is the "keep half" of the scoping
+// cut. The hash path (hashFileNoFollow, used for backups + staged) and the
+// control-file path (readManifest, via loadValidManifest) both route through the
+// one gate, so testing both flavors proves no call site bypasses it.
+func TestManagedFileGate_SymlinkOrFIFORejected(t *testing.T) {
+	// (a) snapshot.db replaced by a SYMLINK ⇒ loadValidManifest fails closed.
+	t.Run("snapshot_db_symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "continuity.db")
+		buildDBAtVersionStandalone(t, dbPath, 5)
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		sidecar, _ := sidecarPath(dbPath)
+		snap := snapshotDBPathIn(sidecar)
+
+		// A real, valid SQLite file OUTSIDE the sidecar the symlink would point at.
+		outside := filepath.Join(dir, "snap-elsewhere.db")
+		buildDBAtVersionStandalone(t, outside, 5)
+		if err := os.Remove(snap); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, snap); err != nil {
+			t.Fatal(err)
+		}
+		// loadValidManifest hashes snapshot.db through the gate (assertRegularFile +
+		// verifySnapshotHash→hashFile? no: it lstat-gates via assertRegularFile first).
+		// Either way a symlinked snapshot.db must be refused as corrupt.
+		if _, lerr := loadValidManifest(sidecar); !errors.Is(lerr, ErrSnapshotSidecarCorrupt) {
+			t.Errorf("loadValidManifest with a symlinked snapshot.db: err = %v, want ErrSnapshotSidecarCorrupt", lerr)
+		}
+	})
+
+	// (b) a .pre-restore.* backup is a SYMLINK ⇒ hashFileNoFollow (the consolidated
+	// gate the recovery provenance check uses) fails closed.
+	t.Run("backup_symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		victim := filepath.Join(dir, "victim.bin")
+		if err := os.WriteFile(victim, []byte("victim bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		backup := filepath.Join(dir, "continuity.db.pre-restore.x")
+		if err := os.Symlink(victim, backup); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, herr := hashFileNoFollow(backup); !errors.Is(herr, ErrSnapshotSidecarCorrupt) {
+			t.Errorf("hashFileNoFollow on a symlinked backup: err = %v, want ErrSnapshotSidecarCorrupt", herr)
+		}
+	})
+
+	// (c) a .restore.staged.* temp is a SYMLINK ⇒ hashFileNoFollow fails closed.
+	t.Run("staged_symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		victim := filepath.Join(dir, "victim.db")
+		buildDBAtVersionStandalone(t, victim, 5)
+		staged := filepath.Join(dir, ".restore.staged.x.db")
+		if err := os.Symlink(victim, staged); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, herr := hashFileNoFollow(staged); !errors.Is(herr, ErrSnapshotSidecarCorrupt) {
+			t.Errorf("hashFileNoFollow on a symlinked staged temp: err = %v, want ErrSnapshotSidecarCorrupt", herr)
+		}
+	})
+
+	// (d) a control file is a FIFO ⇒ the gate's O_NONBLOCK + regular-file check
+	// rejects it without blocking (openManagedFileNoFollow directly).
+	t.Run("control_fifo_direct", func(t *testing.T) {
+		dir := t.TempDir()
+		fifo := filepath.Join(dir, "snapshot.db")
+		if err := mkfifoForTest(fifo); err != nil {
+			t.Skipf("mkfifo unsupported here: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			f, oerr := openManagedFileNoFollow(fifo)
+			if f != nil {
+				f.Close()
+			}
+			done <- oerr
+		}()
+		select {
+		case oerr := <-done:
+			if !errors.Is(oerr, ErrSnapshotSidecarCorrupt) {
+				t.Errorf("openManagedFileNoFollow on a FIFO: err = %v, want ErrSnapshotSidecarCorrupt", oerr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("openManagedFileNoFollow BLOCKED on a FIFO (no O_NONBLOCK/regular-file gate)")
 		}
 	})
 }

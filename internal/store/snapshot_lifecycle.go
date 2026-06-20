@@ -134,6 +134,12 @@ type SnapshotStatus struct {
 // Status derives the sidecar from dbPath and reports the restore point state
 // WITHOUT opening the DB. Ineligible paths report "not present".
 func Status(dbPath string) (*SnapshotStatus, error) {
+	// A symlinked DB FILE (leaf) does not support snapshots: report "not present"
+	// cleanly rather than inspect a sidecar derived beside it (snapshots are never
+	// created for it, so any sidecar there would be foreign).
+	if snapshotLeafIsSymlink(dbPath) {
+		return &SnapshotStatus{Present: false}, nil
+	}
 	sidecar, err := sidecarPath(dbPath)
 	if err != nil {
 		if errors.Is(err, ErrSnapshotUnsupportedPath) {
@@ -262,6 +268,13 @@ func Prune(dbPath string) error {
 //
 // Ineligible paths (:memory:/URI) have no sidecar → ErrNoRestorePoint.
 func probeRestorePointAbsent(dbPath string) error {
+	// A symlinked DB FILE (leaf) does not support snapshots: there is provably no
+	// restore point continuity would have created for it, so restore/prune report
+	// ErrNoRestorePoint cleanly (no lock taken, no side effects) — same as an
+	// ineligible :memory:/URI path.
+	if snapshotLeafIsSymlink(dbPath) {
+		return ErrNoRestorePoint
+	}
 	sidecar, err := sidecarPath(dbPath)
 	if err != nil {
 		if errors.Is(err, ErrSnapshotUnsupportedPath) {

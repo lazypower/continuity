@@ -384,8 +384,8 @@ root flaw: **a forgeable marker drove destructive action on an innocent open.**
 
 1. **`Open()` and `OpenNoMigrate()` NEVER recover.** Before any `sql.Open` or file
    creation they call `detectRestoreInterrupted(path)`:
-   - Derive the canonical sidecar from the path (surviving dangling symlinks — see
-     `canonicalDBPath`).
+   - Derive the canonical sidecar from the path (parent-dir symlinks resolved,
+     leaf kept — see `canonicalDBPath`).
    - If a restore marker is **present**, return the sentinel `ErrRestoreInterrupted`.
      Do not `sql.Open`, do not create a DB, do not touch any file.
    - A **corrupt / unparseable / partial** marker (`{}`, bad JSON, missing version
@@ -505,18 +505,68 @@ a permanent live lock — closing the wedge where a crash between "create file" 
 "write PID" left a PID-less lock that blocked serve/restore/migrations forever. A
 well-formed live-PID lock still blocks.
 
-## One path resolution rule (Finding 3)
+## One path resolution rule — DIRECTORY symlinks resolved, LEAF kept
+
+> **Scoping cut (operator-approved):** support for a symlinked DB **FILE** (leaf)
+> was DROPPED. It was a recurring complexity/bug source across nine review rounds
+> (leaf-symlink resolution, dangling-leaf recovery, lock/sidecar divergence). The
+> retained, simpler rule below resolves only **parent-directory** symlinks — which
+> are stable, since continuity never moves directories — and keeps the leaf
+> verbatim, so the derivation can never dangle.
 
 `canonicalDBPath` is the single derivation for the real DB path. Both
-`sidecarPath` and `serveLockPath` route through it, so the lock and the sidecar
-are always keyed to the **same** real DB. It survives:
-- a symlinked DB (`EvalSymlinks` when present),
-- a **dangling** symlink (`os.Readlink` of the link target), and
-- a **missing** target (resolve the parent dir, e.g. macOS `/var → /private/var`).
+`sidecarPath` and `dbLockPath` route through it, so the lock and the sidecar are
+always keyed to the **same** real DB. The rule is exactly:
 
-This closes the hole where serve acquired `<link>.serve.lock` while the
-sidecar/marker lived under `<real>.snapshot`, letting a serve-via-link and a
-restore-via-real-path contend on different locks for one database.
+```
+canonical = filepath.Join(EvalSymlinks(filepath.Dir(abs)), filepath.Base(abs))
+```
+
+It resolves the **directory's** symlinks (e.g. macOS `/var → /private/var`) and
+**keeps the real leaf**. Because the parent dir is stable, this returns the same
+answer whether or not the DB file exists yet, with **no** `EvalSymlinks` on the
+full path and **no** `os.Readlink` — the dangling-leaf machinery
+(`resolveDBPathSurvivingDangling`, `resolveViaParentDir`, the Readlink fallbacks,
+and all "survives dangling symlink" logic) is **deleted**.
+
+This still closes the original hole (a serve-via-symlinked-dir and a
+restore-via-real-path contend on **one** lock and share **one** sidecar) without
+any leaf-symlink resolution.
+
+### A symlinked DB FILE (leaf) = snapshots UNSUPPORTED (skipped + warned)
+
+A symlinked DB **file** is detected by `snapshotLeafIsSymlink` (lstat the abs path,
+`ModeSymlink` set). For such a DB the snapshot/restore feature is **disabled**:
+
+- `ensureUpgradeRestorePoint*` **SKIPS** restore-point creation with a one-time
+  WARNING ("migration safety snapshots are not supported for a symlinked database
+  file `<path>`; point CONTINUITY_DB at the real file to enable them") and the
+  risky migration **PROCEEDS** — same shape as the `:memory:`/URI/opt-out skip. We
+  **never FAIL** the migration for a symlinked leaf.
+- `Status` / `Restore` / `Prune` report **no restore point** cleanly (no lock, no
+  side effects) — `probeRestorePointAbsent` short-circuits to `ErrNoRestorePoint`.
+- **Open / migrations / the lock still WORK** on a symlinked-leaf DB (SQLite
+  follows the symlink). The per-DB lock keys to the canonical (dir-resolved,
+  leaf-kept) path. Only the snapshot/restore feature is off.
+
+`snapshotEligiblePath` is unchanged (it stays a path-SHAPE check: `:memory:`/URI/
+reserved-char), so the lock/sidecar derivation still works for a symlinked leaf —
+the feature gate is decided separately in `ensureUpgradeRestorePoint`.
+
+### Managed files are NEVER opened through a symlink (the "keep half")
+
+Independently of the leaf rule, **every** open of a file continuity manages inside
+the sidecar / DB dir — `snapshot.db`, `manifest.json`, `restore.in-progress.json`,
+the `.pre-restore.*` backups, the `.restore.staged.*` temps — goes through ONE
+shared gate, `openManagedFileNoFollow` (built on `openControlFileNoFollow`):
+`O_NOFOLLOW` + an `fstat` regular-file check. A symlink / FIFO / device / socket /
+directory at a managed-file path fails closed as `ErrSnapshotSidecarCorrupt`. Both
+the control-file reader (`readControlFileNoFollow` → `readManifest` /
+`readRestoreMarker`) and the hash path (`hashFileNoFollow`, used for the backup /
+staged / live provenance checks) route through this one primitive, so a planted
+symlink in our **own** sidecar is **always** refused — regardless of the
+leaf-symlink rule above. Pinned by `TestManagedFileGate_SymlinkOrFIFORejected` and
+`TestControlFiles_SymlinkOrFIFO_RejectedAsCorrupt`.
 
 ## Durability (Finding 5)
 
