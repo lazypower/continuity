@@ -193,6 +193,17 @@ func Prune(dbPath string) error {
 		return err
 	}
 
+	// ABSENCE PROBE BEFORE THE LOCK (Round 8, Finding 4): if there is provably no
+	// restore point, return ErrNoRestorePoint cleanly WITHOUT creating <db>.lock or
+	// contending for it. Previously prune O_CREATE'd the lock file and could return
+	// "in use" / a lock error on a fresh install, missing dir, or running serve —
+	// before ever checking whether there was anything to prune. A present-but-corrupt
+	// sidecar is NOT absent: the probe returns nil and we still take the lock and fail
+	// closed under it below.
+	if perr := probeRestorePointAbsent(dbPath); perr != nil {
+		return perr
+	}
+
 	// Fast pre-lock refusal: a marker that already exists blocks prune before we
 	// even contend for the lock. We re-check under the lock below.
 	if err := refuseIfRestoreMarkerPending(dbPath); err != nil {
@@ -230,6 +241,43 @@ func Prune(dbPath string) error {
 		return err // corrupt → refuse
 	}
 	return expireRestorePoint(sidecar, m)
+}
+
+// probeRestorePointAbsent returns ErrNoRestorePoint when there is provably NO
+// restore point for dbPath, WITHOUT opening the DB or creating the lock file
+// (Round 8, Finding 4). It is the status-style absence probe that restore/prune
+// run FIRST so a fresh install / missing dir / running serve reports
+// ErrNoRestorePoint cleanly instead of "in use" or a lock-file error from
+// O_CREATE-ing <db>.lock before they ever check whether there is anything to do.
+//
+// It derives the sidecar purely from the path (sidecarPath creates nothing) and
+// calls loadValidManifest:
+//   - ErrNoRestorePoint (no sidecar, no manifest, or no snapshot) → return it: the
+//     caller short-circuits with NO lock file and no side effects.
+//   - a VALID restore point → return nil: the caller proceeds to acquire the lock
+//     and re-check under it.
+//   - a present-but-CORRUPT sidecar → return nil too, so the caller takes the lock
+//     and fails closed under it exactly as before (we never delete/refuse off an
+//     unprovable sidecar without the lock, and corrupt is NOT "absent").
+//
+// Ineligible paths (:memory:/URI) have no sidecar → ErrNoRestorePoint.
+func probeRestorePointAbsent(dbPath string) error {
+	sidecar, err := sidecarPath(dbPath)
+	if err != nil {
+		if errors.Is(err, ErrSnapshotUnsupportedPath) {
+			return ErrNoRestorePoint
+		}
+		return err
+	}
+	if _, lerr := loadValidManifest(sidecar); lerr != nil {
+		if errors.Is(lerr, ErrNoRestorePoint) {
+			return ErrNoRestorePoint
+		}
+		// Present-but-corrupt: NOT absent. Let the caller take the lock and fail
+		// closed under it (unchanged refusal semantics).
+		return nil
+	}
+	return nil
 }
 
 // refuseIfRestoreMarkerPending returns an ErrRestoreInterrupted error when a
@@ -274,6 +322,18 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		return "", err
 	}
 
+	// ABSENCE PROBE BEFORE ANY LOCK (Round 8, Finding 4): if there is provably no
+	// restore point, return ErrNoRestorePoint cleanly WITHOUT creating <db>.lock /
+	// <db>.serve.lock or contending for them. Previously Restore O_CREATE'd the lock
+	// file and could report "in use" / a lock error on a fresh install, missing dir,
+	// or running serve — before ever checking whether there was anything to restore.
+	// A VALID restore point (or a present-but-corrupt sidecar, or a pending recovery
+	// marker beside a corrupt manifest) is NOT absent: the probe returns nil and we
+	// proceed to take the lock + run recovery / fail closed under it exactly as before.
+	if perr := probeRestorePointAbsent(dbPath); perr != nil {
+		return "", perr
+	}
+
 	// ACQUIRE the EXCLUSIVE DB lock and hold it for the ENTIRE restore — through
 	// marker write, the moves, publish, cleanup, and marker removal (Findings 1 &
 	// 5, Round 5). This is the SAME unified flock-based lock every writable open
@@ -297,6 +357,26 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		return "", fmt.Errorf("restore: acquire exclusive db lock: %w", lockErr)
 	}
 	defer lockHandle.release()
+
+	// ACQUIRE THE DEDICATED SERVE LOCK for the whole restore (Round 8, Finding 2).
+	// The DB exclusive lock above excludes ordinary writable opens, a risky
+	// migration, and another restore — but it is SEPARATE from the dedicated serve
+	// lock (<resolvedDB>.serve.lock) that `serve` takes BEFORE it opens the DB.
+	// Without taking the serve lock here, a live `serve` could hold the serve lock,
+	// briefly drop its DB SHARED lock (it never holds SHARED across the whole
+	// session — only per-open), let this restore swap the pre-version DB into place,
+	// then re-open and AUTO-MIGRATE the restored DB out from under the operator. We
+	// FAIL CLOSED (ErrServeLockHeld) if a serve already holds it: restore is mutually
+	// exclusive with serve. Released on return; the kernel also auto-releases it on
+	// process death so a crashed serve never wedges restore.
+	serveLock, slErr := AcquireServeLock(dbPath)
+	if slErr != nil {
+		if errors.Is(slErr, ErrServeLockHeld) {
+			return "", errors.New("restore: a continuity serve is running for this database; stop `continuity serve` and retry")
+		}
+		return "", fmt.Errorf("restore: acquire serve lock: %w", slErr)
+	}
+	defer serveLock.Release()
 
 	// Drive any torn restore from a previous crash to a clean terminal state
 	// FIRST, under FULL validation: a fresh restore must never start on top of an
@@ -419,12 +499,35 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	}
 
 	// Determine which of the triplet are actually present so the marker records
-	// exactly what we move (recovery moves back exactly these).
+	// exactly what we move (recovery moves back exactly these), and record a
+	// per-suffix provenance hash for EACH so rollback can prove every moved-aside
+	// backup is ours before renaming it back — not just the main DB (Round 8,
+	// Finding 3). Each present suffix is symlink/regular-gated here: we refuse to
+	// move (and later publish over) a triplet member that is a symlink someone
+	// swapped in, matching the no-symlink recovery bar.
 	var movedSuffixes []string
+	var movedEntries []movedEntry
+	movedHashes := map[string]string{}
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if _, statErr := os.Lstat(resolvedDB + suffix); statErr == nil {
-			movedSuffixes = append(movedSuffixes, suffix)
+		live := resolvedDB + suffix
+		if !lstatExists(live) {
+			continue
 		}
+		// No-symlink / regular-file gate on every moved triplet member (Round 8,
+		// Finding 3): a symlinked -wal/-shm must never be moved aside (and thus never
+		// published back over a live name on rollback).
+		if err := assertRecoverableFile(live); err != nil {
+			_ = os.Remove(staged)
+			return "", fmt.Errorf("restore: live %s is not a regular file: %w", live, err)
+		}
+		sum, _, hErr := hashFileNoFollow(live)
+		if hErr != nil {
+			_ = os.Remove(staged)
+			return "", fmt.Errorf("restore: hash live %s before move-aside: %w", live, hErr)
+		}
+		movedSuffixes = append(movedSuffixes, suffix)
+		movedEntries = append(movedEntries, movedEntry{Suffix: suffix, SHA256: sum})
+		movedHashes[suffix] = sum
 	}
 
 	// Write the restore marker BEFORE the first destructive rename. From here a
@@ -437,6 +540,7 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		MovedSuffixes:    movedSuffixes,
 		DBPublished:      false,
 		OriginalDBSHA256: originalDBSHA256,
+		MovedEntries:     movedEntries,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		_ = os.Remove(staged)
@@ -455,6 +559,7 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		moved:            movedSuffixes,
 		published:        false,
 		originalDBSHA256: originalDBSHA256,
+		movedHashes:      movedHashes,
 		// The validated restore point's snapshot.db hash, so removeProvenStaged can
 		// PROVE the staged temp is ours before deleting it on a rollback (Round 7).
 		snapshotSHA256: m.SnapshotSHA256,
@@ -535,7 +640,16 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	// rather than pretend the restore is clean.
 	for _, suffix := range []string{"-wal", "-shm"} {
 		live := resolvedDB + suffix
-		if _, statErr := os.Lstat(live); statErr == nil {
+		if lstatExists(live) {
+			// SYMLINK/REGULAR GATE (Round 8, Finding 3): match the recovery scrub paths
+			// (completeReconciled / finishPendingRestore) — never os.Remove a symlink at
+			// the live -wal/-shm position. A symlink here means something outside the
+			// canonical set sits at that name; fail closed rather than unlink through it.
+			if err := assertRecoverableFile(live); err != nil {
+				return "", fmt.Errorf(
+					"restore: the database was restored to %s but the stale %s is not a regular file (%v); "+
+						"remove it by hand before opening the database", resolvedDB, live, err)
+			}
 			if rmErr := os.Remove(live); rmErr != nil && !os.IsNotExist(rmErr) {
 				return "", fmt.Errorf(
 					"restore: the database was restored to %s but a stale %s could not be removed (%v); "+

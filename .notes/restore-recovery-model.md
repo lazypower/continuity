@@ -1,5 +1,11 @@
 # Restore Recovery Model — fail-closed pivot (Round 3)
 
+> **Round 8 update (Codex):** COVERAGE-COMPLETION pass. The eighth review found the
+> Round-7 structural invariants were applied to the FORWARD restore path but not
+> fully to the RECOVERY paths, and the serve-lock pairing was incomplete. No new
+> classes — four coverage-completion fixes. See **"Recovery coverage completion
+> (Round 8)"** immediately below.
+
 > **Round 7 update (Codex):** STRUCTURAL recovery-safety pass that closes the
 > marker-trust class (no-symlink + content-verify + canonical-token), plus a
 > Windows lock-downgrade fix, a dedicated serve lock, marker-durability-before-
@@ -9,6 +15,73 @@
 > **Round 6 update (Codex):** lock-LIFECYCLE hardening. The flock primitive itself
 > was sound; the bugs were in WHEN locks are acquired/released relative to SQLite
 > open/close and prune. See **"Lock-lifecycle invariants (Round 6)"** at the top.
+
+## Recovery coverage completion (Round 8)
+
+The eighth review confirmed the Round-7 bar but found its invariants under-applied
+on the RECOVERY side. These four fixes complete the coverage; the bar is unchanged:
+recovery only touches canonical, content-verified, non-symlink files; a durable
+marker precedes any irreversible step; restore is mutually exclusive with serve.
+
+### 1. RECOVERY DURABILITY ORDERING — fsync(dbDir) BEFORE marker removal (Finding 1)
+
+The forward `Restore` path already treats the DB-dir fsyncs as mandatory (after
+move-aside and after publish, `snapshot_lifecycle.go`). The RECOVERY terminal paths
+(`rollbackReconciled`, `completeReconciled`, and the in-process `finishPendingRestore`
+in `snapshot_restore_marker.go`) previously removed the marker with NO `fsyncDir(dbDir)`
+first. The marker must NEVER be removed before the file moves it describes are durable:
+a power loss after marker-removal-durability but before rename/scrub-durability would
+leave NO marker and a torn/absent live DB, and the next `Open` would FABRICATE a fresh
+DB over it — destroying the data the restore point existed to protect. Each recovery
+terminal path now `fsyncRecoveryDBDir(dbDir)` (the rolled-back renames / the -wal/-shm
+scrub) BEFORE `removeMarkerDurably` (remove marker → `fsyncDir(sidecar)`), mirroring the
+forward path's `clearPublishedRestoreMarker`. A DB-dir fsync failure is FAIL-CLOSED: the
+marker is NOT removed, so recovery can re-run. A test seam (`hookRecoveryDBDirFsync`)
+forces that fsync to fail. Pinned by `TestRecover_RollbackDBDirFsyncFailure_KeepsMarker`
+and `TestRecover_CompleteDBDirFsyncFailure_KeepsMarker` (marker survives a forced
+failure ⇒ the fsync provably precedes marker removal).
+
+### 2. RESTORE HOLDS THE DEDICATED SERVE LOCK (Finding 2)
+
+`store.Restore` took only the DB EXCLUSIVE lock. `serve` takes the DEDICATED serve
+lock (`AcquireServeLock`, `<resolvedDB>.serve.lock`) BEFORE opening the DB but does
+NOT hold the DB SHARED lock across its whole session (only per-open). That left a
+window: a serve holds the serve lock, a restore swaps the pre-version DB into place,
+and the serve then re-opens and AUTO-MIGRATES the restored DB. `Restore` now ALSO
+acquires `AcquireServeLock` for the whole operation and FAILS CLOSED ("stop
+`continuity serve` and retry") if a serve already holds it — restore is mutually
+exclusive with serve. The stale comment in `recoverPendingRestore` (which falsely
+claimed the caller already held the serve lock) is corrected: the caller now holds
+BOTH the DB EXCLUSIVE lock AND the serve lock. Pinned by
+`TestRestore_FailsClosedWhileServeLockHeld`.
+
+### 3. ALL-SUFFIX MOVED-BACKUP PROVENANCE (Finding 3)
+
+Recovery provenance-checked only the main-DB backup (`original_db_sha256`) and gated
+`-wal`/`-shm` backups with only a regular-file/symlink check before renaming them
+back. The marker now records a hash PER moved suffix (`moved_entries: [{suffix,
+sha256}]`, recorded at restore START before the move, generalizing
+`original_db_sha256` to the whole triplet). On rollback, `verifyMovedBackupProvenance`
+requires each moved-aside backup to be a regular, non-symlink file whose hash matches
+its recorded value — a mismatch/symlink FAILS CLOSED, touching nothing. Rollback now
+VERIFIES ALL suffixes BEFORE renaming ANY of them, so a bogus `-wal` aborts the whole
+rollback with no partial revert of the main DB. The forward move-aside and the
+post-publish `-wal`/`-shm` scrub also apply the symlink/regular gate. The schema gate
+(`validateMarkerSchema`) requires a non-empty provenance hash for every moved suffix.
+Pinned by `TestRecover_BogusWALBackup_FailsClosedNoRename`.
+
+### 4. NO-RESTORE-POINT PROBE BEFORE ANY LOCK (Finding 4)
+
+`Restore`/`Prune` opened (`O_CREATE`) the `<db>.lock` file before checking whether a
+restore point existed, so a fresh install / missing dir / running serve reported "in
+use" or a lock-file error instead of `ErrNoRestorePoint`. Both now run
+`probeRestorePointAbsent` FIRST — a status-style probe (`sidecarPath` +
+`loadValidManifest`, which creates nothing and never opens the DB). If there is
+provably no restore point it returns `ErrNoRestorePoint` cleanly with NO lock file
+created and no side effects (a missing parent dir → `ErrNoRestorePoint`, not a lock
+error). A present-but-CORRUPT sidecar is NOT "absent": the probe returns nil and the
+caller takes the lock and fails closed under it exactly as before. Pinned by
+`TestRestorePrune_NoRestorePoint_BeforeLock`.
 
 ## Recovery safety invariants (Round 7)
 

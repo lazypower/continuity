@@ -139,7 +139,29 @@ type restoreMarker struct {
 	// stale, or corrupt `<db>.pre-restore.*` file can never be pulled over the DB.
 	// Empty only when the original DB was absent at restore start (no "" suffix in
 	// MovedSuffixes), in which case there is no DB backup to provenance-check.
+	//
+	// RETAINED for the "" suffix as the canonical provenance value; MovedEntries
+	// below now carries the same hash for "" PLUS a hash for every other moved
+	// suffix (-wal/-shm), generalizing provenance to the WHOLE moved triplet
+	// (Round 8, Finding 3).
 	OriginalDBSHA256 string `json:"original_db_sha256"`
+
+	// MovedEntries records, for EACH suffix that was moved aside at restore start,
+	// the sha256 of the original file's bytes BEFORE the move (Round 8, Finding 3).
+	// On rollback, recovery verifies that each moved-aside backup is a regular,
+	// non-symlink file whose hash matches the recorded value BEFORE renaming it back
+	// over the live name — so a planted/stale/corrupt `<db>.pre-restore.*-wal` (or
+	// -shm) can never be pulled over the live -wal/-shm. The "" entry's hash equals
+	// OriginalDBSHA256 (kept for compatibility and as the DB's canonical check).
+	MovedEntries []movedEntry `json:"moved_entries,omitempty"`
+}
+
+// movedEntry pairs a moved triplet suffix ("", "-wal", "-shm") with the sha256 of
+// the original file recorded at restore START, so rollback can provenance-check
+// every moved-aside backup, not just the main DB (Round 8, Finding 3).
+type movedEntry struct {
+	Suffix string `json:"suffix"`
+	SHA256 string `json:"sha256"`
 }
 
 func restoreMarkerPathIn(sidecar string) string {
@@ -209,6 +231,45 @@ func writeRestoreMarkerAtomic(sidecar string, mk *restoreMarker) error {
 // move-aside (Round 7, Finding 6).
 var hookMarkerDirFsync func(sidecar string) error
 
+// hookRecoveryDBDirFsync is a TEST-ONLY seam (nil in production). When set, it
+// REPLACES the DB-dir fsync the RECOVERY terminal paths (rollbackReconciled /
+// completeReconciled / finishPendingRestore) run to make their rename/scrub
+// durable BEFORE the marker is removed (Round 8, Finding 1). It lets a test force
+// that fsync to fail deterministically and assert recovery fails closed WITHOUT
+// removing the marker — so a power loss can never land in a window where the
+// marker is gone but the file moves it describes are not yet durable, leaving no
+// marker and no live DB for Open to fabricate over.
+var hookRecoveryDBDirFsync func(dbDir string) error
+
+// fsyncRecoveryDBDir makes the recovery path's renames/scrubs durable by fsyncing
+// the DB directory, routed through the hookRecoveryDBDirFsync test seam when set.
+// FAIL-CLOSED (Round 8, Finding 1): the caller MUST NOT remove the marker if this
+// returns an error — the marker is the only record of an in-progress restore, and
+// removing it before the moves it describes are durable could lose both the marker
+// and the live DB across a power loss.
+func fsyncRecoveryDBDir(dbDir string) error {
+	if hookRecoveryDBDirFsync != nil {
+		return hookRecoveryDBDirFsync(dbDir)
+	}
+	return fsyncDir(dbDir)
+}
+
+// removeMarkerDurably removes the restore marker AFTER the file moves it describes
+// have been made durable, then fsyncs the sidecar dir so the removal itself is
+// durable (Round 8, Finding 1). It mirrors the forward path's clearPublishedRestoreMarker
+// ordering: DB-dir fsync (done by the caller, FAIL-CLOSED) → remove marker → sidecar
+// fsync. The sidecar-dir fsync is best-effort (logged): the unlink was already
+// issued and a dir-fsync failure cannot resurrect the file on a sane FS.
+func removeMarkerDurably(sidecar string) error {
+	if err := removeRestoreMarker(sidecar); err != nil {
+		return err
+	}
+	if err := fsyncDir(sidecar); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: restore recover: fsync sidecar dir after marker removal: %v\n", err)
+	}
+	return nil
+}
+
 // restoreMarkerVersion is the only marker schema version this binary writes and
 // accepts. A marker with a different (or zero) version is rejected as a hard
 // gate by validateMarkerSchema — recovery never acts on a schema it cannot
@@ -258,6 +319,35 @@ func validateMarkerSchema(mk *restoreMarker) error {
 	if strings.TrimSpace(mk.BackupPrefix) != "" && len(mk.MovedSuffixes) == 0 {
 		return fmt.Errorf("%w: restore marker backup prefix without moved suffixes", ErrSnapshotSidecarCorrupt)
 	}
+	// MovedEntries provenance gate (Round 8, Finding 3): every moved suffix MUST
+	// carry a recorded hash so rollback can provenance-check it before renaming it
+	// back. A moved suffix without an entry (or an entry with an empty hash, or a
+	// duplicate/unknown suffix) is an incoherent partial we refuse rather than roll
+	// back an unprovable file. We require this only when there is something to roll
+	// back to (a backup prefix + moved suffixes); a published marker with no moved
+	// suffixes has nothing to provenance-check.
+	if len(mk.MovedSuffixes) > 0 {
+		byns := make(map[string]string, len(mk.MovedEntries))
+		for _, e := range mk.MovedEntries {
+			switch e.Suffix {
+			case "", "-wal", "-shm":
+			default:
+				return fmt.Errorf("%w: restore marker moved entry suffix %q outside triplet", ErrSnapshotSidecarCorrupt, e.Suffix)
+			}
+			if _, dup := byns[e.Suffix]; dup {
+				return fmt.Errorf("%w: restore marker duplicate moved entry for suffix %q", ErrSnapshotSidecarCorrupt, e.Suffix)
+			}
+			if strings.TrimSpace(e.SHA256) == "" {
+				return fmt.Errorf("%w: restore marker moved entry for suffix %q has no hash", ErrSnapshotSidecarCorrupt, e.Suffix)
+			}
+			byns[e.Suffix] = e.SHA256
+		}
+		for _, suffix := range mk.MovedSuffixes {
+			if _, ok := byns[suffix]; !ok {
+				return fmt.Errorf("%w: restore marker moved suffix %q has no recorded provenance hash", ErrSnapshotSidecarCorrupt, suffix)
+			}
+		}
+	}
 	return nil
 }
 
@@ -282,6 +372,10 @@ type canonicalRestore struct {
 	// originalDBSHA256 is the recorded hash of the pre-restore live DB, used to
 	// provenance-check the moved-aside backup before a rollback rename (Finding 1).
 	originalDBSHA256 string
+	// movedHashes maps each moved suffix ("", "-wal", "-shm") to the recorded sha256
+	// of the original file, so rollback provenance-checks EVERY moved-aside backup,
+	// not just the main DB (Round 8, Finding 3). The "" entry equals originalDBSHA256.
+	movedHashes map[string]string
 	// snapshotSHA256 is the validated restore point's snapshot.db hash, used to
 	// decide from DISK whether the live DB IS the restored image (Finding 1).
 	snapshotSHA256 string
@@ -390,6 +484,17 @@ func resolveCanonicalRestore(dbPath string, sidecar string, mk *restoreMarker) (
 		}
 	}
 
+	// Build the per-suffix provenance map (Round 8, Finding 3). validateMarkerSchema
+	// has already proven every moved suffix has a non-empty, triplet-valid entry; we
+	// simply index it here so rollback can check each moved-aside backup's hash.
+	var movedHashes map[string]string
+	if len(mk.MovedEntries) > 0 {
+		movedHashes = make(map[string]string, len(mk.MovedEntries))
+		for _, e := range mk.MovedEntries {
+			movedHashes[e.Suffix] = e.SHA256
+		}
+	}
+
 	return &canonicalRestore{
 		resolvedDB:       resolvedDB,
 		sidecar:          sidecar,
@@ -398,6 +503,7 @@ func resolveCanonicalRestore(dbPath string, sidecar string, mk *restoreMarker) (
 		moved:            moved,
 		published:        mk.DBPublished,
 		originalDBSHA256: mk.OriginalDBSHA256,
+		movedHashes:      movedHashes,
 	}, nil
 }
 
@@ -483,8 +589,10 @@ func detectRestoreInterrupted(dbPath string) error {
 
 // recoverPendingRestore drives a torn restore to a clean terminal state
 // (COMPLETE or ROLL BACK) under FULL validation. It runs ONLY from the explicit
-// `snapshot restore --confirm` path, and ONLY while the caller already holds the
-// serve lock for this DB — recovery is never a side effect of a routine open.
+// `snapshot restore --confirm` path, and ONLY while the caller (store.Restore)
+// already holds BOTH the DB EXCLUSIVE lock AND the dedicated serve lock for this
+// DB (Round 8, Finding 2) — recovery is never a side effect of a routine open, and
+// no live serve can re-open and auto-migrate the DB underneath recovery.
 //
 // dbPath is the (possibly symlinked, possibly dangling) path the operator knows.
 // The canonical resolved path + sidecar are RECOMPUTED here and are the sole
@@ -668,8 +776,17 @@ func completeReconciled(cr *canonicalRestore) error {
 	if derr := removeProvenStaged(cr); derr != nil {
 		return derr
 	}
+	// DURABILITY ORDERING (Round 8, Finding 1): make the -wal/-shm scrub (and the
+	// already-published live DB rename) durable BEFORE removing the marker. The
+	// marker must never be removed before the file moves it describes are durable —
+	// otherwise a power loss after marker-removal-durability but before
+	// scrub/rename-durability could leave no marker and a torn DB, and the next Open
+	// would fabricate a fresh DB. FAIL CLOSED on fsync failure: keep the marker.
+	if err := fsyncRecoveryDBDir(filepath.Dir(db)); err != nil {
+		return fmt.Errorf("restore recover: fsync db dir before clearing marker (moves must be durable first): %w", err)
+	}
 	fmt.Fprintf(os.Stderr, "  restore reconciled: live db is the restored snapshot; completed %s\n", db)
-	return removeRestoreMarker(cr.sidecar)
+	return removeMarkerDurably(cr.sidecar)
 }
 
 // rollbackReconciled moves the (provenance-verified) moved-aside originals back
@@ -680,17 +797,29 @@ func completeReconciled(cr *canonicalRestore) error {
 // publish a symlink (Round 7, Findings 1 & 2).
 func rollbackReconciled(cr *canonicalRestore) error {
 	db := cr.resolvedDB
+
+	// VERIFY-ALL-BEFORE-TOUCH (Round 8, Findings 1 & 3): provenance-check EVERY moved
+	// suffix's backup BEFORE renaming ANY of them. The moved-aside original we are
+	// about to rename back over a live name must be a regular, non-symlink file whose
+	// hash matches the value recorded at restore start — for the main DB AND -wal/-shm.
+	// Doing the full check first means a bogus -wal backup fails closed WITHOUT a
+	// partial rollback that already renamed the main DB back: a mismatch/symlink in
+	// any moved suffix aborts the whole rollback, touching nothing.
+	for _, suffix := range cr.moved {
+		backup := cr.backup + suffix
+		if !lstatExists(backup) {
+			continue // nothing to roll back for this suffix
+		}
+		if err := verifyMovedBackupProvenance(cr, suffix, backup); err != nil {
+			return err
+		}
+	}
+
 	for _, suffix := range cr.moved {
 		live := db + suffix
 		backup := cr.backup + suffix
 		if !lstatExists(backup) {
 			continue // nothing to roll back for this suffix
-		}
-		// The moved-aside original we are about to rename back over the live name
-		// must be a real regular file, never a symlink (the "" suffix was already
-		// provenance-hashed via hashIfPresent; -wal/-shm get their guard here).
-		if err := assertRecoverableFile(backup); err != nil {
-			return fmt.Errorf("restore rollback: backup %s: %w", backup, err)
 		}
 		if lstatExists(live) {
 			// Whatever currently sits at the live name must be a real file we may
@@ -713,8 +842,51 @@ func rollbackReconciled(cr *canonicalRestore) error {
 	if derr := removeProvenStaged(cr); derr != nil {
 		return derr
 	}
+	// DURABILITY ORDERING (Round 8, Finding 1): the rolled-back originals are now at
+	// the live names, but only as un-fsync'd directory entries. Make those renames
+	// durable BEFORE removing the marker — a power loss after marker-removal-durability
+	// but before rename-durability could revert the rename and leave no marker beside
+	// a missing live DB, which Open would fabricate over. FAIL CLOSED on fsync failure:
+	// keep the marker so recovery can re-run.
+	if err := fsyncRecoveryDBDir(filepath.Dir(db)); err != nil {
+		return fmt.Errorf("restore rollback: fsync db dir before clearing marker (rolled-back renames must be durable first): %w", err)
+	}
 	fmt.Fprintf(os.Stderr, "  restore rolled back: interrupted restore of %s reverted to pre-restore state\n", db)
-	return removeRestoreMarker(cr.sidecar)
+	return removeMarkerDurably(cr.sidecar)
+}
+
+// verifyMovedBackupProvenance fails closed unless the moved-aside backup for a
+// given suffix is a regular, non-symlink file whose sha256 matches the value
+// recorded in the marker at restore start (Round 8, Finding 3). It generalizes the
+// main-DB original_db_sha256 check to the WHOLE moved triplet so a planted, stale,
+// or corrupt `<db>.pre-restore.*` (including -wal/-shm) can never be renamed back
+// over a live name. hashIfPresent does the lstat/regular/no-symlink gate AND hashes
+// O_NOFOLLOW, so a symlink at the backup position is rejected before any hash is
+// trusted. The caller has already confirmed the backup exists.
+func verifyMovedBackupProvenance(cr *canonicalRestore, suffix, backup string) error {
+	want := ""
+	if cr.movedHashes != nil {
+		want = cr.movedHashes[suffix]
+	}
+	if want == "" && suffix == "" {
+		// Backward/defence: the "" suffix's canonical hash also lives in
+		// originalDBSHA256. validateMarkerSchema requires a MovedEntries hash for every
+		// moved suffix, so this is belt-and-braces for the main DB.
+		want = cr.originalDBSHA256
+	}
+	if want == "" {
+		return fmt.Errorf("%w: rollback requested but marker recorded no provenance hash for moved suffix %q; refusing to roll it back",
+			ErrSnapshotSidecarCorrupt, suffix)
+	}
+	sum, _, herr := hashIfPresent(backup)
+	if herr != nil {
+		return fmt.Errorf("restore rollback: hash backup %s: %w", backup, herr)
+	}
+	if sum != want {
+		return fmt.Errorf("%w: pre-restore backup %s hash does not match the recorded original; refusing to roll it back over the live name",
+			ErrSnapshotSidecarCorrupt, filepath.Base(backup))
+	}
+	return nil
 }
 
 // removeProvenStaged deletes the staged file ONLY if we can prove it is our
@@ -858,8 +1030,14 @@ func finishPendingRestore(cr *canonicalRestore) error {
 		if derr := removeProvenStaged(cr); derr != nil {
 			return derr
 		}
+		// DURABILITY ORDERING (Round 8, Finding 1): make the scrub durable BEFORE
+		// removing the marker, matching the forward Restore path's DB-dir fsyncs.
+		// FAIL CLOSED on fsync failure: keep the marker.
+		if err := fsyncRecoveryDBDir(filepath.Dir(db)); err != nil {
+			return fmt.Errorf("restore resume: fsync db dir before clearing marker (scrub must be durable first): %w", err)
+		}
 		fmt.Fprintf(os.Stderr, "  restore resumed: completed interrupted restore of %s\n", db)
-		return removeRestoreMarker(cr.sidecar)
+		return removeMarkerDurably(cr.sidecar)
 	}
 
 	// Not yet published: roll back to the moved-aside originals so the operator
@@ -868,6 +1046,21 @@ func finishPendingRestore(cr *canonicalRestore) error {
 	// Anything currently at the live names (a partial/foreign file from the
 	// crash) is removed first, then each moved-aside original is moved back. Every
 	// position is symlink-gated before remove/rename (Round 7, Findings 1 & 2).
+	//
+	// VERIFY-ALL-BEFORE-TOUCH (Round 8, Findings 1 & 3): provenance-check every moved
+	// suffix's backup BEFORE renaming any of them, so a bogus -wal/-shm aborts the
+	// whole rollback without a partial revert that already moved the main DB back.
+	if cr.backup != "" {
+		for _, suffix := range cr.moved {
+			backup := cr.backup + suffix
+			if !lstatExists(backup) {
+				continue
+			}
+			if err := verifyMovedBackupProvenance(cr, suffix, backup); err != nil {
+				return err
+			}
+		}
+	}
 	for _, suffix := range cr.moved {
 		live := db + suffix
 		backup := cr.backup + suffix
@@ -877,9 +1070,6 @@ func finishPendingRestore(cr *canonicalRestore) error {
 		if !lstatExists(backup) {
 			// Backup not present — nothing to roll back for this suffix.
 			continue
-		}
-		if err := assertRecoverableFile(backup); err != nil {
-			return fmt.Errorf("restore rollback: backup %s: %w", backup, err)
 		}
 		// Clear whatever currently occupies the live name (best-effort): if the
 		// rename below would fail because a partial file sits there, remove it —
@@ -903,6 +1093,11 @@ func finishPendingRestore(cr *canonicalRestore) error {
 	if derr := removeProvenStaged(cr); derr != nil {
 		return derr
 	}
+	// DURABILITY ORDERING (Round 8, Finding 1): make the rolled-back renames durable
+	// BEFORE removing the marker. FAIL CLOSED on fsync failure: keep the marker.
+	if err := fsyncRecoveryDBDir(filepath.Dir(db)); err != nil {
+		return fmt.Errorf("restore rollback: fsync db dir before clearing marker (rolled-back renames must be durable first): %w", err)
+	}
 	fmt.Fprintf(os.Stderr, "  restore rolled back: interrupted restore of %s reverted to pre-restore state\n", db)
-	return removeRestoreMarker(cr.sidecar)
+	return removeMarkerDurably(cr.sidecar)
 }

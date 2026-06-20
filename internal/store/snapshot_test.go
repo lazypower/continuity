@@ -1163,15 +1163,23 @@ func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	var moved []string
+	var movedEntries []movedEntry
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		src := resolved + suffix
 		if _, statErr := os.Lstat(src); statErr != nil {
 			continue
 		}
+		// Record the per-suffix provenance hash BEFORE the move, as production
+		// Restore now does (Round 8, Finding 3).
+		sum, _, hErr := hashFile(src)
+		if hErr != nil {
+			t.Fatal(hErr)
+		}
 		if err := os.Rename(src, backupPrefix+suffix); err != nil {
 			t.Fatal(err)
 		}
 		moved = append(moved, suffix)
+		movedEntries = append(movedEntries, movedEntry{Suffix: suffix, SHA256: sum})
 	}
 	// Plant a stale -wal at the live name to prove rollback scrubs/handles it.
 	if err := os.WriteFile(resolved+"-wal", []byte("stale"), 0o600); err != nil {
@@ -1181,6 +1189,7 @@ func TestRestoreMarker_RollbackAfterCrashBeforePublish(t *testing.T) {
 		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
 		OriginalDBSHA256: origSum,
+		MovedEntries:     movedEntries,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -1240,10 +1249,18 @@ func TestRestoreMarker_CompleteAfterCrashAfterPublish(t *testing.T) {
 	if err := os.WriteFile(dbPath+"-shm", []byte("stale-shm"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The marker records a provenance hash per moved suffix (Round 8, Finding 3).
+	// This recovery COMPLETES (live == snapshot), so the rollback-only hashes are
+	// never consumed — but the schema gate requires them present and non-empty.
 	mk := &restoreMarker{
 		Version: 1, RestoredDBPath: resolved, StagedPath: "",
 		BackupPrefix: resolved + ".pre-restore.x", MovedSuffixes: []string{"", "-wal", "-shm"},
 		DBPublished: false,
+		MovedEntries: []movedEntry{
+			{Suffix: "", SHA256: "sha256:deadbeef"},
+			{Suffix: "-wal", SHA256: "sha256:deadbeef"},
+			{Suffix: "-shm", SHA256: "sha256:deadbeef"},
+		},
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -1301,10 +1318,13 @@ func TestRestoreMarker_HostileBackupPrefixRefusedAndUntouched(t *testing.T) {
 	}
 
 	// Plant a not-yet-published marker whose backup prefix is the victim path —
-	// rollback would naively os.Rename(victim, liveDB). Resume must refuse.
+	// rollback would naively os.Rename(victim, liveDB). Resume must refuse. The
+	// MovedEntries hash is present only to pass the schema gate; the backup-prefix
+	// canonical-set gate (resolveCanonicalRestore) is what must reject this marker.
 	mk := &restoreMarker{
 		Version: 1, RestoredDBPath: resolved, StagedPath: "",
 		BackupPrefix: victim, MovedSuffixes: []string{""}, DBPublished: false,
+		MovedEntries: []movedEntry{{Suffix: "", SHA256: "sha256:deadbeef"}},
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -1442,20 +1462,27 @@ func TestOpen_FailsClosedOnTornPrePublishState(t *testing.T) {
 	}
 	backupPrefix := resolved + ".pre-restore.excl"
 	var moved []string
+	var movedEntries []movedEntry
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		src := resolved + suffix
 		if _, statErr := os.Lstat(src); statErr != nil {
 			continue
 		}
+		sum, _, hErr := hashFile(src)
+		if hErr != nil {
+			t.Fatal(hErr)
+		}
 		if err := os.Rename(src, backupPrefix+suffix); err != nil {
 			t.Fatal(err)
 		}
 		moved = append(moved, suffix)
+		movedEntries = append(movedEntries, movedEntry{Suffix: suffix, SHA256: sum})
 	}
 	mk := &restoreMarker{
 		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
 		OriginalDBSHA256: origSum,
+		MovedEntries:     movedEntries,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -1546,20 +1573,27 @@ func TestRestoreMarker_ResumeThroughDanglingSymlinkRecovers(t *testing.T) {
 	}
 	backupPrefix := resolvedReal + ".pre-restore.dangle"
 	var moved []string
+	var movedEntries []movedEntry
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		src := resolvedReal + suffix
 		if _, statErr := os.Lstat(src); statErr != nil {
 			continue
 		}
+		sum, _, hErr := hashFile(src)
+		if hErr != nil {
+			t.Fatal(hErr)
+		}
 		if err := os.Rename(src, backupPrefix+suffix); err != nil {
 			t.Fatal(err)
 		}
 		moved = append(moved, suffix)
+		movedEntries = append(movedEntries, movedEntry{Suffix: suffix, SHA256: sum})
 	}
 	mk := &restoreMarker{
 		Version: 1, RestoredDBPath: resolvedReal, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
 		OriginalDBSHA256: origSum,
+		MovedEntries:     movedEntries,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -2659,15 +2693,21 @@ func TestRecover_RollbackBackupHashMismatch_FailsClosed(t *testing.T) {
 	}
 	backupPrefix := resolved + ".pre-restore.mismatch"
 	var moved []string
+	var movedEntries []movedEntry
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		src := resolved + suffix
 		if _, statErr := os.Lstat(src); statErr != nil {
 			continue
 		}
+		sum, _, hErr := hashFile(src)
+		if hErr != nil {
+			t.Fatal(hErr)
+		}
 		if err := os.Rename(src, backupPrefix+suffix); err != nil {
 			t.Fatal(err)
 		}
 		moved = append(moved, suffix)
+		movedEntries = append(movedEntries, movedEntry{Suffix: suffix, SHA256: sum})
 	}
 	// Tamper: overwrite the moved-aside DB backup with attacker bytes so its hash
 	// will NOT match origSum recorded in the marker.
@@ -2679,6 +2719,7 @@ func TestRecover_RollbackBackupHashMismatch_FailsClosed(t *testing.T) {
 		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
 		OriginalDBSHA256: origSum, // recorded original hash — backup no longer matches
+		MovedEntries:     movedEntries,
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -2760,6 +2801,7 @@ func TestRecover_StalePrePublishMarkerCompletes(t *testing.T) {
 		Version: 1, RestoredDBPath: resolved, StagedPath: "",
 		BackupPrefix: backupPrefix, MovedSuffixes: []string{""}, DBPublished: false,
 		OriginalDBSHA256: origSum,
+		MovedEntries:     []movedEntry{{Suffix: "", SHA256: origSum}},
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -3069,6 +3111,7 @@ func TestRestoreMarker_SafePreRenameAbortClearsMarker(t *testing.T) {
 		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: []string{""}, DBPublished: false,
 		OriginalDBSHA256: origSum,
+		MovedEntries:     []movedEntry{{Suffix: "", SHA256: origSum}},
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -3775,6 +3818,7 @@ func TestRecover_ForgedBackupSymlinkToForeignDB_FailsClosed(t *testing.T) {
 		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
 		BackupPrefix: backupPrefix, MovedSuffixes: []string{""}, DBPublished: false,
 		OriginalDBSHA256: foreignSum,
+		MovedEntries:     []movedEntry{{Suffix: "", SHA256: foreignSum}},
 	}
 	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
 		t.Fatal(err)
@@ -4014,6 +4058,311 @@ func TestOpenNoMigrate_ReservedCharPathOpensIntendedFileReadOnly(t *testing.T) {
 	}
 	if !contains(uri, "mode=ro") {
 		t.Errorf("roFileURI dropped mode=ro: %s", uri)
+	}
+}
+
+// ===========================================================================
+// ROUND 8 (Codex) regression tests — recovery-path coverage completion.
+//   1. recovery clears the marker only AFTER its renames are durable (fail closed
+//      on the DB-dir fsync; ordering: fsync precedes marker removal).
+//   2. Restore holds the dedicated serve lock and fails closed if a serve has it.
+//   3. all-suffix provenance: a torn pre-publish marker with a bogus -wal backup
+//      fails closed and never renames it over the live -wal.
+//   4. restore/prune return ErrNoRestorePoint WITHOUT creating <db>.lock when no
+//      restore point exists (and on a missing parent dir).
+// ===========================================================================
+
+// TestRecover_RollbackDBDirFsyncFailure_KeepsMarker is the Finding 1 regression.
+// During a recovery ROLLBACK the DB-dir fsync (which makes the rolled-back renames
+// durable) is forced to fail via a test seam. Recovery must FAIL CLOSED and must
+// NOT remove the marker — the marker is the only record of an in-progress restore,
+// and removing it before the moves it describes are durable could leave no marker
+// and no live DB across a power loss, which Open would fabricate over. The seam
+// fires AFTER the rename but the assertion proves the marker survived, so the
+// fsync provably precedes marker removal (ordering).
+func TestRecover_RollbackDBDirFsyncFailure_KeepsMarker(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // VALID restore point at pre-v6
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Manufacture a genuine torn PRE-PUBLISH state: stage a copy, move the triplet
+	// aside (recording per-suffix provenance hashes), leave the live DB MISSING.
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.fsyncfail.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+	origSum, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupPrefix := resolved + ".pre-restore.fsyncfail"
+	var moved []string
+	var movedEntries []movedEntry
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := resolved + suffix
+		if _, statErr := os.Lstat(src); statErr != nil {
+			continue
+		}
+		sum, _, hErr := hashFile(src)
+		if hErr != nil {
+			t.Fatal(hErr)
+		}
+		if err := os.Rename(src, backupPrefix+suffix); err != nil {
+			t.Fatal(err)
+		}
+		moved = append(moved, suffix)
+		movedEntries = append(movedEntries, movedEntry{Suffix: suffix, SHA256: sum})
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
+		OriginalDBSHA256: origSum,
+		MovedEntries:     movedEntries,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force the recovery DB-dir fsync to fail. Recovery must fail closed.
+	hookRecoveryDBDirFsync = func(string) error { return fmt.Errorf("forced recovery db-dir fsync failure") }
+	defer func() { hookRecoveryDBDirFsync = nil }()
+
+	rerr := recoverPendingRestore(dbPath)
+	if rerr == nil {
+		t.Fatal("recovery returned success despite a DB-dir fsync failure (renames not durable)")
+	}
+	if !contains(rerr.Error(), "durable") && !contains(rerr.Error(), "fsync") {
+		t.Errorf("recovery err = %v, want a durability/fsync error", rerr)
+	}
+	// ORDERING: the marker MUST still be present — the fsync (which failed) runs
+	// BEFORE the marker removal, so a fsync failure leaves the marker intact for a
+	// retry. Pre-fix the marker was removed without any DB-dir fsync.
+	if _, serr := os.Stat(restoreMarkerPathIn(sidecar)); serr != nil {
+		t.Errorf("recovery removed the marker despite a non-durable rollback (fsync must precede marker removal): %v", serr)
+	}
+}
+
+// TestRecover_CompleteDBDirFsyncFailure_KeepsMarker is the Finding 1 regression on
+// the COMPLETE path: the live DB already equals the snapshot (publish succeeded,
+// marker-clear crashed). The DB-dir fsync that makes the -wal/-shm scrub durable is
+// forced to fail; recovery must FAIL CLOSED and keep the marker.
+func TestRecover_CompleteDBDirFsyncFailure_KeepsMarker(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Publish the snapshot image at the live path so reconcile COMPLETES (live ==
+	// snapshot). A stale -wal at the live name gives the scrub something to do.
+	if err := copyFile(snapshotDBPathIn(sidecar), resolved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resolved+"-wal", []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: "",
+		BackupPrefix: "", MovedSuffixes: nil, DBPublished: true,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	hookRecoveryDBDirFsync = func(string) error { return fmt.Errorf("forced recovery db-dir fsync failure") }
+	defer func() { hookRecoveryDBDirFsync = nil }()
+
+	rerr := recoverPendingRestore(dbPath)
+	if rerr == nil {
+		t.Fatal("complete-reconcile returned success despite a DB-dir fsync failure")
+	}
+	if _, serr := os.Stat(restoreMarkerPathIn(sidecar)); serr != nil {
+		t.Errorf("complete-reconcile removed the marker despite a non-durable scrub: %v", serr)
+	}
+}
+
+// TestRestore_FailsClosedWhileServeLockHeld is the Finding 2 regression. A `serve`
+// holds the dedicated serve lock (AcquireServeLock) WITHOUT opening the DB. A
+// concurrent store.Restore must FAIL CLOSED ("stop continuity serve and retry")
+// rather than swap the pre-version DB into place under the live serve (which would
+// then re-open and auto-migrate it). Once the serve lock is released, the restore
+// succeeds. Pre-fix Restore took only the DB exclusive lock and ignored the serve
+// lock entirely, so it proceeded.
+func TestRestore_FailsClosedWhileServeLockHeld(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // VALID restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	resolved, _ := resolveDBPath(dbPath)
+	liveBefore, err := os.ReadFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A live serve holds the dedicated serve lock (it does NOT hold the DB lock
+	// across its whole session — only the serve lock excludes a restore).
+	serveLock, slErr := AcquireServeLock(dbPath)
+	if slErr != nil {
+		t.Fatalf("acquire serve lock: %v", slErr)
+	}
+
+	_, rerr := Restore(dbPath)
+	if rerr == nil {
+		serveLock.Release()
+		t.Fatal("Restore proceeded while a serve held the serve lock; it must fail closed")
+	}
+	if !contains(rerr.Error(), "serve") {
+		serveLock.Release()
+		t.Errorf("Restore err = %v, want a 'stop continuity serve and retry' error", rerr)
+	}
+	// The live DB must be byte-intact — never swapped under the held serve lock.
+	liveAfter, ferr := os.ReadFile(resolved)
+	if ferr != nil {
+		serveLock.Release()
+		t.Fatalf("live DB missing after a serve-locked Restore: %v", ferr)
+	}
+	if string(liveAfter) != string(liveBefore) {
+		serveLock.Release()
+		t.Error("Restore swapped the DB despite the serve lock being held")
+	}
+
+	// Once the serve lock is released, the restore succeeds (no wedge).
+	serveLock.Release()
+	if _, rerr := Restore(dbPath); rerr != nil {
+		t.Errorf("Restore refused after the serve lock was released: %v", rerr)
+	}
+}
+
+// TestRecover_BogusWALBackup_FailsClosedNoRename is the Finding 3 regression. A
+// torn pre-publish marker records MovedSuffixes ["","-wal"] with a VALID main-DB
+// backup hash but ARBITRARY bytes at <db>.pre-restore.<token>-wal (the recorded
+// provenance hash for -wal does NOT match). Recovery must FAIL CLOSED and must NOT
+// rename the bogus WAL over <db>-wal. Pre-fix only the main DB backup was
+// provenance-checked; the -wal backup got only a regular-file gate, so a
+// planted/corrupt -wal could be renamed over the live -wal.
+func TestRecover_BogusWALBackup_FailsClosedNoRename(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // VALID restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Stage a copy of the snapshot (present staged → genuine torn pre-publish CASE B).
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.boguswal.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+
+	// Move the real DB aside as the "" backup and record its TRUE hash (valid main-DB
+	// provenance), then remove the live DB so CASE B (rollback) is taken.
+	origSum, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupPrefix := resolved + ".pre-restore.boguswal"
+	if err := os.Rename(resolved, backupPrefix); err != nil {
+		t.Fatal(err)
+	}
+
+	// A -wal backup that is a real regular file (passes the symlink/regular gate) but
+	// whose bytes do NOT match the recorded provenance hash for -wal.
+	const bogusWAL = "BOGUS WAL BYTES — must not be renamed over the live -wal"
+	if err := os.WriteFile(backupPrefix+"-wal", []byte(bogusWAL), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Record a DELIBERATELY-WRONG hash for the -wal entry (a planted/corrupt backup).
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: []string{"", "-wal"}, DBPublished: false,
+		OriginalDBSHA256: origSum,
+		MovedEntries: []movedEntry{
+			{Suffix: "", SHA256: origSum},
+			{Suffix: "-wal", SHA256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+		},
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	rerr := recoverPendingRestore(dbPath)
+	if rerr == nil {
+		t.Fatal("recovery did not fail closed on a -wal backup whose hash != recorded provenance")
+	}
+	if !errors.Is(rerr, ErrSnapshotSidecarCorrupt) {
+		t.Errorf("err = %v, want ErrSnapshotSidecarCorrupt", rerr)
+	}
+	// The bogus WAL must NOT have been renamed over the live -wal path.
+	if data, _ := os.ReadFile(resolved + "-wal"); string(data) == bogusWAL {
+		t.Error("recovery renamed the bogus -wal backup over the live -wal path")
+	}
+	// The bogus WAL backup is still where it was (untouched).
+	if data, _ := os.ReadFile(backupPrefix + "-wal"); string(data) != bogusWAL {
+		t.Error("recovery disturbed the bogus -wal backup file")
+	}
+}
+
+// TestRestorePrune_NoRestorePoint_BeforeLock is the Finding 4 regression. On an
+// existing DB dir with NO sidecar, both `snapshot restore` and `snapshot prune`
+// must return ErrNoRestorePoint AND must NOT create the <db>.lock file (no
+// O_CREATE side effect). A MISSING parent dir must likewise return ErrNoRestorePoint,
+// not a lock-file error. Pre-fix both opened/created <db>.lock before checking for a
+// restore point, so a fresh install / missing dir / running serve reported "in use"
+// or a lock-file error instead of ErrNoRestorePoint.
+func TestRestorePrune_NoRestorePoint_BeforeLock(t *testing.T) {
+	// (a) existing DB dir, no sidecar.
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5) // a real DB but NO restore point
+
+	lockPath, lpErr := dbLockPath(dbPath)
+	if lpErr != nil {
+		t.Fatalf("dbLockPath: %v", lpErr)
+	}
+
+	if _, rerr := Restore(dbPath); !errors.Is(rerr, ErrNoRestorePoint) {
+		t.Errorf("Restore with no restore point: err = %v, want ErrNoRestorePoint", rerr)
+	}
+	if _, serr := os.Stat(lockPath); serr == nil {
+		t.Error("Restore created the <db>.lock file before checking for a restore point")
+	}
+	if perr := Prune(dbPath); !errors.Is(perr, ErrNoRestorePoint) {
+		t.Errorf("Prune with no restore point: err = %v, want ErrNoRestorePoint", perr)
+	}
+	if _, serr := os.Stat(lockPath); serr == nil {
+		t.Error("Prune created the <db>.lock file before checking for a restore point")
+	}
+
+	// (b) MISSING parent dir: ErrNoRestorePoint, not a lock-file error.
+	missing := filepath.Join(t.TempDir(), "no-such-dir", "continuity.db")
+	if _, rerr := Restore(missing); !errors.Is(rerr, ErrNoRestorePoint) {
+		t.Errorf("Restore on a missing parent dir: err = %v, want ErrNoRestorePoint", rerr)
+	}
+	if perr := Prune(missing); !errors.Is(perr, ErrNoRestorePoint) {
+		t.Errorf("Prune on a missing parent dir: err = %v, want ErrNoRestorePoint", perr)
+	}
+	if _, serr := os.Stat(filepath.Dir(missing)); serr == nil {
+		t.Error("restore/prune created the missing parent dir as a side effect")
 	}
 }
 
