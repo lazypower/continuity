@@ -2,7 +2,11 @@ package cli
 
 import (
 	"errors"
+	"os/exec"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/lazypower/continuity/internal/hooks"
 )
@@ -212,6 +216,154 @@ func TestIsDecodeError(t *testing.T) {
 				t.Errorf("isDecodeError() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDecideVerify(t *testing.T) {
+	now := time.Unix(1000, 0)
+	before := now.Add(5 * time.Second)  // deadline in the future
+	passed := now.Add(-1 * time.Second) // deadline already passed
+
+	tests := []struct {
+		name           string
+		deadline       time.Time
+		healthyBounced bool
+		childPID       int
+		childAlive     bool
+		want           verifyState
+	}{
+		{
+			name:           "healthy and bounced confirms (highest priority even past deadline)",
+			deadline:       passed,
+			healthyBounced: true,
+			childPID:       4242,
+			childAlive:     false,
+			want:           verifyConfirmed,
+		},
+		{
+			name:           "bare child dead before healthy is a hard failure",
+			deadline:       before,
+			healthyBounced: false,
+			childPID:       4242,
+			childAlive:     false,
+			want:           verifyFailedDead,
+		},
+		{
+			name:           "bare child still alive within deadline keeps waiting",
+			deadline:       before,
+			healthyBounced: false,
+			childPID:       4242,
+			childAlive:     true,
+			want:           verifyKeepWaiting,
+		},
+		{
+			name:           "bare child alive but deadline passed times out soft",
+			deadline:       passed,
+			healthyBounced: false,
+			childPID:       4242,
+			childAlive:     true,
+			want:           verifyTimedOutSoft,
+		},
+		{
+			name:           "managed (no child) within deadline keeps waiting",
+			deadline:       before,
+			healthyBounced: false,
+			childPID:       0,
+			childAlive:     false,
+			want:           verifyKeepWaiting,
+		},
+		{
+			name:           "managed (no child) past deadline times out soft, never hard-fails",
+			deadline:       passed,
+			healthyBounced: false,
+			childPID:       0,
+			childAlive:     false,
+			want:           verifyTimedOutSoft,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := decideVerify(now, tt.deadline, tt.healthyBounced, tt.childPID, tt.childAlive)
+			if got != tt.want {
+				t.Errorf("decideVerify() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestVerifyBounceBareChildCrashOnBootHardFails is the integration-ish guard for
+// Fix 1: a bare restart whose respawned child EXITS before becoming healthy must
+// surface as the hard verifyFailedDead failure, NOT the soft (nil-returning)
+// timeout. It spawns a real short-lived process (exits immediately), reaps it the
+// same way SpawnDetachedServe now does, then drives the real verifyBounce against
+// an unreachable server with a deliberately generous timeout — so the only way it
+// can return the hard failure is dead-child detection via hooks.ProcessAlive, not
+// the deadline. Without the SpawnDetachedServe reap, the child would linger as a
+// zombie that signal-0 reports ALIVE, verifyBounce would fall through to the soft
+// timeout (nil error), and this test fails.
+func TestVerifyBounceBareChildCrashOnBootHardFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bare bounce / detached spawn is unsupported on Windows")
+	}
+
+	// Point the client at a dead port so the server never reports healthy — the
+	// verify outcome is then decided purely by the child's liveness.
+	t.Setenv("CONTINUITY_URL", "http://127.0.0.1:1")
+
+	// Spawn a process that exits immediately (crash-on-boot stand-in) and reap it
+	// exactly like the fixed SpawnDetachedServe, so ProcessAlive(pid) can report
+	// false once it's gone instead of seeing a zombie we still parent.
+	cmd := exec.Command("sh", "-c", "exit 1")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("spawn short-lived child: %v", err)
+	}
+	childPID := cmd.Process.Pid
+	reaped := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(reaped) }()
+
+	// Wait for the child to actually be gone (exited AND reaped) before verifying,
+	// so we exercise dead-child detection rather than racing a slow startup.
+	<-reaped
+	deadline := time.Now().Add(2 * time.Second)
+	for hooks.ProcessAlive(childPID) {
+		if time.Now().After(deadline) {
+			t.Fatalf("child pid %d still reported alive after reap; cannot exercise crash-on-boot path", childPID)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Generous timeout so a soft deadline-timeout cannot fire first: a hard
+	// failure here can ONLY come from the dead-child branch (verifyFailedDead).
+	orig := restartTimeout
+	t.Cleanup(func() { restartTimeout = orig })
+	restartTimeout = 30 * time.Second
+
+	client := hooks.NewClient()
+	err := verifyBounce(client, 4242 /*oldPID*/, childPID)
+	if err == nil {
+		t.Fatal("verifyBounce returned nil (soft timeout) for a dead bare child; expected the hard crash-on-boot failure")
+	}
+	if !strings.Contains(err.Error(), "exited before coming up") {
+		t.Errorf("expected hard crash-on-boot error, got: %v", err)
+	}
+}
+
+func TestRestartCmdSilencesUsage(t *testing.T) {
+	// A verify timeout / runtime failure must not make cobra dump the usage block,
+	// so restartCmd must declare SilenceUsage.
+	if !restartCmd.SilenceUsage {
+		t.Error("restartCmd.SilenceUsage must be true so runtime errors don't print the flags/usage block")
+	}
+}
+
+func TestRestartCmdHasTimeoutFlag(t *testing.T) {
+	f := restartCmd.Flags().Lookup("timeout")
+	if f == nil {
+		t.Fatal("restart command must expose a --timeout flag")
+	}
+	if f.DefValue != defaultRestartTimeout.String() {
+		t.Errorf("--timeout default = %q, want %q", f.DefValue, defaultRestartTimeout.String())
 	}
 }
 

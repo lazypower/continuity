@@ -3,12 +3,25 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+// xmlEscape escapes a value for safe interpolation into a plist <string> element.
+// launchd plists are XML, so a PATH (or binary path) containing &, <, >, or quote
+// characters would otherwise corrupt the file. Uses encoding/xml's escaper.
+func xmlEscape(s string) string {
+	var buf bytes.Buffer
+	if err := xml.EscapeText(&buf, []byte(s)); err != nil {
+		return s
+	}
+	return buf.String()
+}
 
 const (
 	launchAgentLabel = "com.continuity.server"
@@ -35,6 +48,8 @@ func generatePlist() (string, error) {
 	}
 	logPath := filepath.Join(home, ".continuity", "serve.log")
 
+	// Bake a usable PATH into the plist so the service can find the LLM provider
+	// binaries (`claude`, `ollama`); launchd does not inherit the login PATH.
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -46,6 +61,11 @@ func generatePlist() (string, error) {
         <string>%s</string>
         <string>serve</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>%s</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -56,7 +76,7 @@ func generatePlist() (string, error) {
     <string>%s</string>
 </dict>
 </plist>
-`, launchAgentLabel, self, logPath, logPath), nil
+`, xmlEscape(launchAgentLabel), xmlEscape(self), xmlEscape(servicePATH()), xmlEscape(logPath), xmlEscape(logPath)), nil
 }
 
 func platformServiceStatus() (installed bool, status string) {
@@ -132,7 +152,12 @@ func platformServiceInstall() (string, error) {
 	return fmt.Sprintf(`Installed. Continuity is now running as a system service.
   Status:  launchctl list | grep continuity
   Stop:    launchctl unload %s
-  Remove:  continuity uninstall-service`, path), nil
+  Remove:  continuity uninstall-service
+
+  note: the service PATH (so it can find the 'claude'/'ollama' provider) is
+        baked in at install time. If you ever move those binaries — or upgraded
+        from a build that lacked this — re-run 'continuity install-service' to
+        refresh it.`, path), nil
 }
 
 func platformUninstallPlan() (string, error) {

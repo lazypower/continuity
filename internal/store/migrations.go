@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"os"
 )
@@ -122,9 +124,13 @@ CREATE TABLE mem_vectors (
 		Version:     6,
 		Description: "mem_nodes: add moments category",
 		Risky:       true, // full-table rebuild via INSERT SELECT *; column-order parity is by developer discipline
+		// NOTE: This rebuild does DROP TABLE mem_nodes, which would cascade-
+		// delete mem_vectors (FK ON DELETE CASCADE, v4) if foreign keys were
+		// enforced. FK-off is enforced by the migration RUNNER on a pinned
+		// connection (see migrate()), NOT by an in-SQL `PRAGMA foreign_keys=OFF`
+		// — that pragma is a no-op inside a transaction and on the wrong pooled
+		// connection. Do NOT re-add it here; it is an inert trap.
 		SQL: `
-PRAGMA foreign_keys=OFF;
-
 CREATE TABLE mem_nodes_new (
     id             INTEGER PRIMARY KEY,
     uri            TEXT NOT NULL UNIQUE,
@@ -161,8 +167,6 @@ ALTER TABLE mem_nodes_new RENAME TO mem_nodes;
 CREATE INDEX idx_nodes_parent    ON mem_nodes(parent_uri);
 CREATE INDEX idx_nodes_category  ON mem_nodes(category);
 CREATE INDEX idx_nodes_relevance ON mem_nodes(relevance DESC);
-
-PRAGMA foreign_keys=ON;
 `,
 	},
 	{
@@ -183,9 +187,12 @@ ALTER TABLE mem_nodes ADD COLUMN superseded_by TEXT;
 		Version:     9,
 		Description: "mem_nodes: add feedback and reference categories (issue #24)",
 		Risky:       true, // full-table rebuild via INSERT SELECT *; column-order parity is by developer discipline
+		// NOTE: FK-off during this DROP-TABLE rebuild is enforced by the
+		// migration RUNNER on a pinned connection (see migrate()), NOT by an
+		// in-SQL `PRAGMA foreign_keys=OFF` — that pragma is inert inside a
+		// transaction and would otherwise let DROP TABLE mem_nodes cascade-
+		// delete mem_vectors. Do NOT re-add it here.
 		SQL: `
-PRAGMA foreign_keys=OFF;
-
 CREATE TABLE mem_nodes_new (
     id             INTEGER PRIMARY KEY,
     uri            TEXT NOT NULL UNIQUE,
@@ -227,8 +234,6 @@ ALTER TABLE mem_nodes_new RENAME TO mem_nodes;
 CREATE INDEX idx_nodes_parent    ON mem_nodes(parent_uri);
 CREATE INDEX idx_nodes_category  ON mem_nodes(category);
 CREATE INDEX idx_nodes_relevance ON mem_nodes(relevance DESC);
-
-PRAGMA foreign_keys=ON;
 `,
 	},
 }
@@ -340,38 +345,11 @@ func (db *DB) migrate() error {
 			)
 		}
 
-		tx, err := db.Begin()
-		if err != nil {
+		if err := db.applyMigration(m); err != nil {
 			if snapPath != "" {
-				_ = os.Remove(snapPath) // migration won't run; snapshot is dead weight
+				_ = os.Remove(snapPath) // migration failed/rolled back; snapshot is dead weight
 			}
-			return fmt.Errorf("begin migration %d: %w", m.Version, err)
-		}
-
-		if _, err := tx.Exec(m.SQL); err != nil {
-			tx.Rollback()
-			if snapPath != "" {
-				_ = os.Remove(snapPath)
-			}
-			return fmt.Errorf("migration %d (%s): %w", m.Version, m.Description, err)
-		}
-
-		if _, err := tx.Exec(
-			"INSERT INTO schema_versions (version, description) VALUES (?, ?)",
-			m.Version, m.Description,
-		); err != nil {
-			tx.Rollback()
-			if snapPath != "" {
-				_ = os.Remove(snapPath)
-			}
-			return fmt.Errorf("record migration %d: %w", m.Version, err)
-		}
-
-		if err := tx.Commit(); err != nil {
-			if snapPath != "" {
-				_ = os.Remove(snapPath)
-			}
-			return fmt.Errorf("commit migration %d: %w", m.Version, err)
+			return err
 		}
 
 		// Migration committed. Now enroll the snapshot in the tracking
@@ -388,6 +366,89 @@ func (db *DB) migrate() error {
 		}
 	}
 
+	return nil
+}
+
+// applyMigration runs a single migration's SQL plus its schema_versions stamp
+// inside one transaction, then commits.
+//
+// Risky (table-rebuild) migrations DROP TABLE mem_nodes, which would cascade-
+// delete mem_vectors (FK ON DELETE CASCADE, v4) if foreign keys were enforced.
+// SQLite's `PRAGMA foreign_keys` is a no-op inside a transaction, and the
+// connection pool may hand the tx a different connection than a pooled
+// db.Exec("PRAGMA ...") touched — so the only correct way to disable FK
+// enforcement for the rebuild is to pin a single *sql.Conn, toggle FK OFF on
+// it OUTSIDE any transaction, run the migration tx on that SAME conn, then
+// restore FK ON before releasing it. We always restore FK and close the conn,
+// even on error, so a mid-migration failure never leaves the pool with FK off.
+//
+// Non-risky migrations (ALTER TABLE ADD COLUMN, CREATE TABLE) don't depend on
+// FK state, so they keep the simpler pooled db.Begin() path.
+func (db *DB) applyMigration(m migration) error {
+	if !m.Risky {
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration %d: %w", m.Version, err)
+		}
+		if err := runMigrationTx(tx, m); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %d: %w", m.Version, err)
+		}
+		return nil
+	}
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire pinned conn for migration %d: %w", m.Version, err)
+	}
+	// Guarantee FK is restored and the pinned conn is returned, even if the
+	// migration fails partway. Restoring FK here (not just on the happy path)
+	// is what keeps a failed risky migration from poisoning the pool.
+	defer func() {
+		_, _ = conn.ExecContext(ctx, "PRAGMA foreign_keys=ON")
+		conn.Close()
+	}()
+
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("disable foreign_keys for migration %d: %w", m.Version, err)
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration %d: %w", m.Version, err)
+	}
+	if err := runMigrationTx(tx, m); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration %d: %w", m.Version, err)
+	}
+	return nil
+}
+
+// txExec is the subset of tx behavior runMigrationTx needs — satisfied by both
+// *sql.Tx (non-risky path) and the tx from a pinned conn's BeginTx (risky path).
+type txExec interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// runMigrationTx applies the migration body and records its schema_versions row.
+// Caller owns commit/rollback.
+func runMigrationTx(tx txExec, m migration) error {
+	if _, err := tx.Exec(m.SQL); err != nil {
+		return fmt.Errorf("migration %d (%s): %w", m.Version, m.Description, err)
+	}
+	if _, err := tx.Exec(
+		"INSERT INTO schema_versions (version, description) VALUES (?, ?)",
+		m.Version, m.Description,
+	); err != nil {
+		return fmt.Errorf("record migration %d: %w", m.Version, err)
+	}
 	return nil
 }
 

@@ -83,6 +83,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		eng.StartDecayTimer()
 		defer eng.Stop()
 		fmt.Fprintf(os.Stderr, "  llm: %s (%s)\n", cfg.LLM.Provider, cfg.LLM.Model)
+		if bin := llm.ProviderBinaryUnresolved(cfg.LLM); bin != "" {
+			fmt.Fprintf(os.Stderr,
+				"warning: LLM provider binary %q is not on this process's PATH — extraction will fail.\n"+
+					"  If running as a service, re-run `continuity install-service` to bake in a usable PATH.\n",
+				bin)
+		}
 	}
 
 	// Detect and configure embedder

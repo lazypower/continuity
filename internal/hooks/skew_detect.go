@@ -110,7 +110,7 @@ func surfaceServerSkewFromHealth(client *Client, hs *HealthStatus) {
 		// (TOCTOU) and best-effort exe-matches immediately before signalling, so
 		// the hook can never SIGTERM a process it hasn't strongly confirmed is
 		// continuity.
-		if err := ConfirmAndBounce(client, hs.PID); err != nil {
+		if _, err := ConfirmAndBounce(client, hs.PID); err != nil {
 			if IsRestartLockHeld(err) {
 				// Another restart/bounce is already handling it; skip silently-ish.
 				// Non-fatal by construction — the concurrent bounce does the work.

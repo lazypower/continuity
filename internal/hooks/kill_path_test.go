@@ -26,9 +26,9 @@ func withInjectedKillPath(t *testing.T, h *killPathHarness, fetch func(*Client) 
 		h.signals = append(h.signals, pid)
 		return nil
 	}
-	serverRespawner = func() error {
+	serverRespawner = func() (int, error) {
 		h.respawns++
-		return nil
+		return 12345, nil
 	}
 }
 
@@ -57,7 +57,7 @@ func TestConfirmAndBounce_SpoofedHealthRefusedNoSignal(t *testing.T) {
 		func(*Client) (*HealthStatus, error) { return spoof, nil },
 		indeterminateExe,
 	)
-	err := ConfirmAndBounce(&Client{}, 4242)
+	_, err := ConfirmAndBounce(&Client{}, 4242)
 	if err == nil {
 		t.Fatal("expected refusal for spoofed health, got nil")
 	}
@@ -76,7 +76,7 @@ func TestConfirmAndBounce_StrongIdentityIndeterminateExePasses(t *testing.T) {
 		func(*Client) (*HealthStatus, error) { return strongHealth(4242), nil },
 		indeterminateExe,
 	)
-	if err := ConfirmAndBounce(&Client{}, 4242); err != nil {
+	if _, err := ConfirmAndBounce(&Client{}, 4242); err != nil {
 		t.Fatalf("strong identity should pass, got %v", err)
 	}
 	if len(h.signals) != 1 || h.signals[0] != 4242 {
@@ -93,7 +93,7 @@ func TestConfirmAndBounce_ExeMatchPasses(t *testing.T) {
 		func(*Client) (*HealthStatus, error) { return strongHealth(99), nil },
 		matchingExe,
 	)
-	if err := ConfirmAndBounce(&Client{}, 99); err != nil {
+	if _, err := ConfirmAndBounce(&Client{}, 99); err != nil {
 		t.Fatalf("confirmed exe match should pass, got %v", err)
 	}
 	if len(h.signals) != 1 || h.signals[0] != 99 {
@@ -109,7 +109,7 @@ func TestConfirmAndBounce_ExeMismatchRefusedNoSignal(t *testing.T) {
 		func(*Client) (*HealthStatus, error) { return strongHealth(4242), nil },
 		mismatchExe,
 	)
-	err := ConfirmAndBounce(&Client{}, 4242)
+	_, err := ConfirmAndBounce(&Client{}, 4242)
 	if err == nil {
 		t.Fatal("expected refusal on exe mismatch, got nil")
 	}
@@ -126,7 +126,7 @@ func TestConfirmAndBounce_RevalidationPidMismatchAborts(t *testing.T) {
 		func(*Client) (*HealthStatus, error) { return strongHealth(5555), nil }, // live pid != expected
 		matchingExe,
 	)
-	err := ConfirmAndBounce(&Client{}, 4242) // we intended to kill 4242
+	_, err := ConfirmAndBounce(&Client{}, 4242) // we intended to kill 4242
 	if err == nil {
 		t.Fatal("expected abort on pid mismatch, got nil")
 	}
@@ -143,7 +143,7 @@ func TestConfirmAndBounce_RevalidationDisappearedAborts(t *testing.T) {
 		func(*Client) (*HealthStatus, error) { return nil, errors.New("connection refused") },
 		matchingExe,
 	)
-	err := ConfirmAndBounce(&Client{}, 4242)
+	_, err := ConfirmAndBounce(&Client{}, 4242)
 	if err == nil {
 		t.Fatal("expected abort when health disappears, got nil")
 	}
@@ -160,7 +160,7 @@ func TestConfirmAndBounce_RevalidationLostIdentityAborts(t *testing.T) {
 		func(*Client) (*HealthStatus, error) { return &HealthStatus{Status: "nginx"}, nil },
 		matchingExe,
 	)
-	err := ConfirmAndBounce(&Client{}, 4242)
+	_, err := ConfirmAndBounce(&Client{}, 4242)
 	if err == nil {
 		t.Fatal("expected abort when revalidated identity is lost, got nil")
 	}
@@ -175,7 +175,7 @@ func TestConfirmAndBounce_InvalidPidRefused(t *testing.T) {
 		func(*Client) (*HealthStatus, error) { return strongHealth(1), nil },
 		matchingExe,
 	)
-	if err := ConfirmAndBounce(&Client{}, 0); err == nil {
+	if _, err := ConfirmAndBounce(&Client{}, 0); err == nil {
 		t.Fatal("expected refusal for pid 0")
 	}
 	if len(h.signals) != 0 {
