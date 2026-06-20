@@ -280,7 +280,11 @@ const restoreMarkerVersion = 1
 // marker exists. A present-but-unparseable marker is an error (fail closed:
 // recovery cannot reason about it).
 func readRestoreMarker(sidecar string) (*restoreMarker, error) {
-	raw, err := os.ReadFile(restoreMarkerPathIn(sidecar))
+	// Read through the no-follow + regular-file gate so a symlink/FIFO planted at
+	// restore.in-progress.json fails closed (corrupt sidecar) instead of being
+	// followed outside the sidecar or BLOCKING a recovery read forever (Round 9,
+	// Finding 6). A missing marker is still os.IsNotExist → (nil, nil).
+	raw, err := readControlFileNoFollow(restoreMarkerPathIn(sidecar))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -708,6 +712,10 @@ func reconcilePendingRestore(cr *canonicalRestore) error {
 
 	dbBackupPresent := cr.backup != "" && lstatExists(cr.backup) // "" suffix backup
 	stagedPresent := cr.staged != "" && lstatExists(cr.staged)
+	// movedBackupsRemain reports whether ANY recorded moved-suffix backup (including
+	// -wal/-shm, not just the main DB) is still on disk. This is the load-bearing
+	// signal that a rollback is only HALF done (Round 9, Finding 1C).
+	movedBackupsRemain := anyMovedBackupPresent(cr)
 
 	// CASE A2 — SAFE PRE-RENAME ABORT (Finding 2, Round 5): the crash landed AFTER
 	// the marker was written but BEFORE the first move-aside rename. In that window
@@ -718,7 +726,25 @@ func reconcilePendingRestore(cr *canonicalRestore) error {
 	// ours, and leave the (original) DB intact. Without this case reconcile fell
 	// through to the generic fail-closed below and the DB stayed permanently
 	// ErrRestoreInterrupted with no recovery path — exactly the wedge this fixes.
+	//
+	// IDEMPOTENT-RESUME GUARD (Round 9, Finding 1C): A2 may clear the marker ONLY
+	// when NO recorded moved-suffix backup remains on disk. If the main DB at the
+	// live path equals the recorded original but a `-wal`/`-shm` backup the marker
+	// recorded is STILL present, this is NOT a pre-rename abort — it is a rollback
+	// that already renamed the main DB back but CRASHED before restoring the WAL/SHM
+	// triplet members. Clearing here would orphan those suffix backups and lose any
+	// WAL-only commits the restored main DB still needs. In that case we DRIVE THE
+	// ROLLBACK TO COMPLETION (rollbackReconciled is idempotent: it skips suffixes
+	// whose backup is already gone and restores the ones that remain) instead of
+	// aborting. Only when no moved-suffix backup remains is the rollback genuinely
+	// complete (or never started) and the marker may be cleared.
 	if livePresent && cr.originalDBSHA256 != "" && liveSum == cr.originalDBSHA256 && !dbBackupPresent {
+		if movedBackupsRemain {
+			// Half-finished rollback: finish restoring the remaining moved-aside
+			// backups, then clear the marker (rollbackReconciled does both durably).
+			fmt.Fprintf(os.Stderr, "  restore reconciled: resuming an interrupted rollback (main db restored, suffix backups remain) for %s\n", db)
+			return rollbackReconciled(cr)
+		}
 		if derr := removeProvenStaged(cr); derr != nil {
 			return derr
 		}
@@ -853,6 +879,25 @@ func rollbackReconciled(cr *canonicalRestore) error {
 	}
 	fmt.Fprintf(os.Stderr, "  restore rolled back: interrupted restore of %s reverted to pre-restore state\n", db)
 	return removeMarkerDurably(cr.sidecar)
+}
+
+// anyMovedBackupPresent reports whether ANY of the marker's recorded moved-suffix
+// backups (<backup><suffix> for each suffix in cr.moved) still exists on disk
+// (Round 9, Finding 1C). It is the signal reconcile uses to tell a genuine
+// pre-rename abort (no backups exist → safe to clear) apart from a rollback that
+// crashed half-done (some recorded suffix backup remains → must finish, never
+// orphan it). A nil/empty backup prefix or moved set means there is nothing to
+// roll back, so no backups remain.
+func anyMovedBackupPresent(cr *canonicalRestore) bool {
+	if cr.backup == "" {
+		return false
+	}
+	for _, suffix := range cr.moved {
+		if lstatExists(cr.backup + suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // verifyMovedBackupProvenance fails closed unless the moved-aside backup for a

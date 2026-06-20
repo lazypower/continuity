@@ -276,10 +276,53 @@ func validateSnapshotFileName(name string) error {
 	return nil
 }
 
+// readControlFileNoFollow reads a sidecar CONTROL FILE (manifest.json /
+// restore.in-progress.json) WITHOUT following a final-component symlink, and only
+// after fstat-proving the opened descriptor is a regular file (Round 9, Finding 6).
+// A symlink, FIFO, device, socket, or directory at the control-file path FAILS
+// CLOSED as ErrSnapshotSidecarCorrupt rather than being followed (which could read
+// a file outside the sidecar) or blocked on (a FIFO read can hang forever). A
+// missing file propagates os.ErrNotExist so callers can distinguish absence.
+//
+// openNoFollow makes a final-component symlink fail at open(2) (ELOOP on unix);
+// the fstat regular-file check additionally rejects a FIFO/device/dir/socket and
+// closes a race that swapped the path to a non-regular file after the open.
+func readControlFileNoFollow(path string) ([]byte, error) {
+	f, err := openControlFileNoFollow(path)
+	if err != nil {
+		// A MISSING file must stay os.IsNotExist so callers can distinguish absence
+		// from corruption. Any OTHER open failure on a control file is fail-closed
+		// corruption: O_NOFOLLOW makes a final-component symlink fail with ELOOP, and
+		// we report that (and any other non-NotExist open error) as a corrupt sidecar
+		// rather than leaking a raw "too many levels of symbolic links" error or
+		// following the redirection.
+		if os.IsNotExist(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: control file %s could not be opened (%v)", ErrSnapshotSidecarCorrupt, filepath.Base(path), err)
+	}
+	defer f.Close()
+	info, serr := f.Stat()
+	if serr != nil {
+		return nil, serr
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: control file %s is not a regular file", ErrSnapshotSidecarCorrupt, filepath.Base(path))
+	}
+	data, rerr := io.ReadAll(f)
+	if rerr != nil {
+		return nil, rerr
+	}
+	return data, nil
+}
+
 // readManifest loads + JSON-decodes the manifest from a sidecar. It does not
-// validate the snapshot file or DB lineage; callers layer that on.
+// validate the snapshot file or DB lineage; callers layer that on. The manifest
+// is read through readControlFileNoFollow so a symlink/FIFO planted at
+// manifest.json fails closed (corrupt sidecar) instead of being followed/blocked
+// (Round 9, Finding 6).
 func readManifest(sidecar string) (*Manifest, error) {
-	raw, err := os.ReadFile(manifestPathIn(sidecar))
+	raw, err := readControlFileNoFollow(manifestPathIn(sidecar))
 	if err != nil {
 		return nil, err
 	}
@@ -404,6 +447,41 @@ func fsyncDir(dir string) error {
 		return serr
 	}
 	return d.Close()
+}
+
+// fsyncFile fsyncs a single regular file's contents to disk (Round 9, Finding 1A).
+// Unlike fsyncDir (which makes a directory ENTRY durable) this makes the file's
+// BYTES durable, so a hash committed to a manifest cannot name data still sitting
+// in the page cache after a power loss. Opened read-write so Sync flushes file
+// data; the caller passes a path it owns.
+func fsyncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if serr := f.Sync(); serr != nil {
+		f.Close()
+		return serr
+	}
+	return f.Close()
+}
+
+// hookSnapshotDirFsync is a TEST-ONLY seam (nil in production). When set it
+// REPLACES the sidecar-dir fsyncs that publish snapshot.db and manifest.json so a
+// test can force the durability failure deterministically and assert that
+// restore-point CREATION fails closed (which aborts the risky migration) and never
+// leaves a published manifest naming non-durable snapshot bytes (Round 9, Finding 1A).
+var hookSnapshotDirFsync func(sidecar string) error
+
+// fsyncSnapshotDir makes the sidecar directory durable after a snapshot.db /
+// manifest.json publish, routed through the hookSnapshotDirFsync test seam when
+// set. FAIL-CLOSED by contract (Round 9, Finding 1A): the caller treats a non-nil
+// return as an error that aborts restore-point creation, never a warning.
+func fsyncSnapshotDir(sidecar string) error {
+	if hookSnapshotDirFsync != nil {
+		return hookSnapshotDirFsync(sidecar)
+	}
+	return fsyncDir(sidecar)
 }
 
 // hashFile returns ("sha256:<hex>", size, nil) for a file.
@@ -900,6 +978,18 @@ func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky i
 		return failClosed(tmpSnap, err)
 	}
 
+	// DURABILITY: fsync the snapshot BYTES before publishing the name (Round 9,
+	// Finding 1A). VACUUM INTO wrote tmpSnap through SQLite's own fd, which is
+	// already closed, so the page cache may still hold unflushed data; renaming it
+	// to snapshot.db and then publishing a manifest that records its hash would let
+	// a power loss leave a manifest naming a snapshot.db whose bytes never reached
+	// disk (a published restore point describing non-durable data). fsync the file
+	// first so the bytes the manifest commits to are durable. FAIL CLOSED: a sync
+	// failure aborts the restore-point creation (and thus the risky migration).
+	if err := fsyncFile(tmpSnap); err != nil {
+		return failClosed(tmpSnap, fmt.Errorf("snapshot: fsync snapshot image before publish: %w", err))
+	}
+
 	// Atomic publish of the snapshot image.
 	finalSnap := snapshotDBPathIn(sidecar)
 	if err := os.Rename(tmpSnap, finalSnap); err != nil {
@@ -907,10 +997,19 @@ func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky i
 	}
 	cleanupTmp() // tmpSnap consumed by the rename; nothing left to remove
 	_ = os.Chmod(finalSnap, 0o600)
-	// fsync the sidecar dir so the published snapshot.db entry survives power
-	// loss BEFORE the manifest names it (Finding 5).
-	if err := fsyncDir(sidecar); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: snapshot: fsync sidecar dir after publish: %v\n", err)
+	// fsync the sidecar dir so the published snapshot.db DIRECTORY ENTRY survives
+	// power loss BEFORE the manifest names it. FAIL CLOSED (Round 9, Finding 1A):
+	// this was previously a warning, so a published manifest could name a
+	// snapshot.db whose directory entry never reached disk. The snapshot-dir fsync
+	// is now an ERROR — it fails the restore-point creation, which aborts the risky
+	// migration — so a published manifest never describes a non-durable snapshot.db.
+	// We remove the just-published snapshot.db (provably ours: O_EXCL temp renamed
+	// under the lock this call) so no half-built restore point lingers.
+	if err := fsyncSnapshotDir(sidecar); err != nil {
+		if rmErr := os.Remove(finalSnap); rmErr != nil && !os.IsNotExist(rmErr) {
+			fmt.Fprintf(os.Stderr, "warning: snapshot: remove snapshot.db after fsync failure: %v\n", rmErr)
+		}
+		return failClosed("", fmt.Errorf("snapshot: fsync sidecar dir after publishing snapshot.db (must be durable before the manifest names it): %w", err))
 	}
 
 	// Build + write the manifest (temp → fsync → rename).
@@ -999,11 +1098,16 @@ func writeManifestAtomic(sidecar string, m *Manifest) error {
 		return fmt.Errorf("snapshot: publish manifest: %w", err)
 	}
 	_ = os.Chmod(manifestPathIn(sidecar), 0o600)
-	// fsync the sidecar dir so the manifest rename is durable across power loss
-	// (Finding 5): a synced manifest file with an unsynced directory entry could
-	// otherwise vanish on crash, leaving a snapshot.db with no manifest.
-	if err := fsyncDir(sidecar); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: snapshot: fsync sidecar dir after manifest: %v\n", err)
+	// fsync the sidecar dir so the manifest rename is durable across power loss.
+	// FAIL CLOSED (Round 9, Finding 1A): this was previously a warning, so a
+	// just-synced manifest file whose DIRECTORY ENTRY never reached disk could
+	// vanish on a crash and leave a snapshot.db with no manifest — a restore point
+	// that fails closed on every later run. The manifest-dir fsync is now an error
+	// so a creation that cannot durably publish the manifest fails the restore-point
+	// creation (and thus the risky migration) instead of reporting a non-durable
+	// success. writeRestorePoint's caller cleans up the partial snapshot.db.
+	if err := fsyncSnapshotDir(sidecar); err != nil {
+		return fmt.Errorf("snapshot: fsync sidecar dir after publishing the manifest (must be durable): %w", err)
 	}
 	return nil
 }

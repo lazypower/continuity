@@ -176,3 +176,13 @@ func openNoFollow(path string) (*os.File, error) {
 	}
 	return os.NewFile(uintptr(h), path), nil
 }
+
+// openControlFileNoFollow opens a sidecar control file without following a
+// reparse point (the Windows symlink analogue) so a planted symlink/junction at
+// manifest.json / restore.in-progress.json fails the caller's regular-file check
+// rather than redirecting the read (Round 9, Finding 6). Windows named pipes are
+// not created at arbitrary filesystem paths the way unix FIFOs are, so the unix
+// O_NONBLOCK concern does not apply; opening the reparse point itself is enough.
+func openControlFileNoFollow(path string) (*os.File, error) {
+	return openNoFollow(path)
+}

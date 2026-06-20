@@ -658,10 +658,16 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		}
 	}
 
-	// CRASH-SAFE POST-PUBLISH TRANSITION (Finding 2). The marker MUST be durably
-	// removed now; if it cannot be, FAIL LOUDLY rather than return success with a
-	// marker still on disk.
-	if err := clearPublishedRestoreMarker(sidecar, resolvedDB); err != nil {
+	// CRASH-SAFE POST-PUBLISH TRANSITION (Finding 2; durability ordering Round 9,
+	// Finding 1B). The stale-WAL/-SHM unlinks just above are still only un-fsync'd
+	// directory mutations; the marker MUST NOT be cleared until they are durable —
+	// otherwise a power loss after marker-removal-durability but before
+	// scrub-durability could resurrect a stale -wal beside the restored DB with NO
+	// marker left to drive recovery. clearPublishedRestoreMarker therefore fsyncs the
+	// DB dir (FAIL CLOSED) BEFORE removing the marker, then fsyncs the sidecar so the
+	// removal itself is durable. If it cannot, FAIL LOUDLY rather than return success
+	// with a marker still on disk.
+	if err := clearPublishedRestoreMarker(sidecar, resolvedDB, dbDir); err != nil {
 		return "", err
 	}
 
@@ -682,10 +688,25 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 // rollback hazard (reconcilePendingRestore completes against reality). The marker
 // must nonetheless be cleared before Restore returns success: a stale
 // recovery-implying marker left behind a "success" return is exactly the state
-// the bar forbids. On removal failure we FAIL LOUDLY — the operator is told the
-// restore SUCCEEDED but the marker must be cleared by hand — rather than return
-// success. fsync the sidecar dir so the removal is durable across power loss.
-func clearPublishedRestoreMarker(sidecar, resolvedDB string) error {
+// the bar forbids.
+//
+// DURABILITY ORDERING (Round 9, Finding 1B): the post-publish stale -wal/-shm
+// scrub renames/unlinks in the DB dir must be DURABLE before the marker is removed.
+// Previously this only fsync'd the SIDECAR (so the marker removal was durable) but
+// NOT the DB dir, so a power loss after the marker was durably gone but before the
+// scrub unlinks reached disk could resurrect a stale -wal beside the restored DB
+// with no marker to drive recovery. We now fsync the DB DIR first — FAIL CLOSED,
+// keeping the marker so recovery re-runs — and only then remove the marker and
+// fsync the sidecar. On removal failure we FAIL LOUDLY (the operator is told the
+// restore SUCCEEDED but must clear the marker by hand) rather than return success.
+func clearPublishedRestoreMarker(sidecar, resolvedDB, dbDir string) error {
+	// Make the stale-WAL/-SHM scrub (and the published DB rename) durable BEFORE the
+	// marker is cleared. FAIL CLOSED: keep the marker so a crash here re-runs recovery.
+	if err := fsyncRecoveryDBDir(dbDir); err != nil {
+		return fmt.Errorf(
+			"restore: the database was restored to %s but the db directory could not be made durable before clearing the restore marker (%v); "+
+				"the restore marker remains for recovery — re-run `continuity snapshot restore --confirm`", resolvedDB, err)
+	}
 	if err := removeRestoreMarker(sidecar); err != nil {
 		return fmt.Errorf(
 			"restore: the database was restored successfully to %s, but the restore marker could not be cleared (%v); "+

@@ -91,3 +91,13 @@ func flockRetryEINTR(f *os.File, how int) error {
 func openNoFollow(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 }
+
+// openControlFileNoFollow opens a sidecar control file for reading without
+// following a final-component symlink AND non-blocking (Round 9, Finding 6).
+// O_NOFOLLOW makes a symlink fail with ELOOP; O_NONBLOCK ensures a FIFO planted at
+// the path returns from open(2) immediately (a blocking O_RDONLY open of a FIFO
+// with no writer would HANG forever) so the caller's fstat regular-file check can
+// reject it as a corrupt sidecar. A regular file is unaffected by O_NONBLOCK.
+func openControlFileNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+}

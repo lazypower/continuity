@@ -1,5 +1,13 @@
 # Restore Recovery Model — fail-closed pivot (Round 3)
 
+> **Round 9 update (Codex):** DURABILITY-AUDIT pass + a control-file read gap and
+> a documented threat-model boundary. The ninth review found the durability
+> ordering was applied per-spot but not UNIFORMLY: some fsyncs that a later
+> irreversible step depends on were still warnings, one recovery abort-case could
+> orphan a half-restored triplet, and the two on-disk CONTROL FILES were read with
+> a symlink/FIFO-followable `os.ReadFile`. See **"Durability audit + control-file
+> gate (Round 9)"** immediately below; the bar is unchanged.
+
 > **Round 8 update (Codex):** COVERAGE-COMPLETION pass. The eighth review found the
 > Round-7 structural invariants were applied to the FORWARD restore path but not
 > fully to the RECOVERY paths, and the serve-lock pairing was incomplete. No new
@@ -15,6 +23,96 @@
 > **Round 6 update (Codex):** lock-LIFECYCLE hardening. The flock primitive itself
 > was sound; the bugs were in WHEN locks are acquired/released relative to SQLite
 > open/close and prune. See **"Lock-lifecycle invariants (Round 6)"** at the top.
+
+## Durability audit + control-file gate (Round 9)
+
+The ninth review treated durability as ONE invariant to enforce uniformly across
+create / forward-restore / recovery, rather than spot-patching. The bar:
+
+> **Durability ordering invariant.** A file whose durability a later IRREVERSIBLE
+> step depends on must have BOTH the file's bytes fsync'd AND its containing
+> directory fsync'd BEFORE that step runs. The restore marker is removed LAST —
+> only after every rename/removal it describes is durable. Any required fsync that
+> fails FAILS CLOSED: the dependent step does not proceed and the marker is not
+> cleared, so a re-run resumes.
+
+### 1A. CREATION fsyncs the snapshot bytes + dir as ERRORS, not warnings
+
+`writeRestorePoint` (`snapshot.go`) now (a) `fsyncFile`s the VACUUM-INTO snapshot
+image BEFORE it is renamed to `snapshot.db` and hashed into the manifest — so the
+manifest never commits to a hash over bytes still in the page cache — and (b) makes
+the sidecar-dir fsyncs after publishing `snapshot.db` and `manifest.json` HARD
+ERRORS (`fsyncSnapshotDir`, previously warnings). A dir-fsync failure now ABORTS
+restore-point creation, which aborts the risky migration (the DB stays at its
+pre-version), and the just-published `snapshot.db` is removed so no half-built
+point lingers. A published manifest therefore can never describe a non-durable
+`snapshot.db`. Test seam `hookSnapshotDirFsync`. Pinned by
+`TestCreate_SnapshotDirFsyncFailure_FailsClosedNoManifest` (forced dir-fsync
+failure ⇒ Open fails closed, no manifest, DB still at v5).
+
+### 1B. FORWARD RESTORE fsyncs the DB dir BEFORE clearing the marker
+
+After publishing the restored DB, the forward `Restore` scrubs stale live
+`-wal`/`-shm`. Those unlinks were not made durable before
+`clearPublishedRestoreMarker` removed the marker — and that function fsync'd ONLY
+the sidecar, not the DB dir. `clearPublishedRestoreMarker(sidecar, resolvedDB,
+dbDir)` now `fsyncRecoveryDBDir(dbDir)` FIRST (FAIL CLOSED — keep the marker so a
+crash re-runs recovery), then removes the marker, then fsyncs the sidecar. A power
+loss can no longer land with the marker durably gone but a stale `-wal` resurrected
+beside the restored DB. Pinned by
+`TestRestore_PostPublishScrubDBDirFsyncFailure_KeepsMarker` (forced DB-dir fsync
+failure during the scrub ⇒ Restore fails closed, marker survives).
+
+### 1C. RECONCILE drives a half-finished rollback to completion (idempotent)
+
+CASE A2 ("safe pre-rename abort") cleared the marker whenever the live DB equalled
+the recorded original AND no main-DB backup remained. But a rollback that renamed
+the MAIN DB back over the live path and then CRASHED before restoring `-wal`/`-shm`
+lands in exactly that shape — with the recorded suffix backups still on disk.
+Clearing there orphaned them (losing WAL-only commits). reconcile now computes
+`anyMovedBackupPresent(cr)`: A2 may clear the marker ONLY when NO recorded
+moved-suffix backup remains. If any remains, reconcile CONTINUES the rollback
+(`rollbackReconciled` is idempotent — it skips suffixes whose backup is already
+gone, provenance-checks and restores the ones that remain, then clears the marker
+durably). A re-run after a crash mid-reconcile resumes and finishes; it never
+abandons a half-restored triplet. Pinned by
+`TestReconcile_ResumesHalfFinishedRollback_DoesNotOrphanWAL` (main DB restored, a
+`-wal` backup remains ⇒ reconcile restores the `-wal`, THEN clears the marker).
+
+### 6. CONTROL FILES are read no-follow + regular-file-gated
+
+`manifest.json` and `restore.in-progress.json` were read with `os.ReadFile`, which
+FOLLOWS a symlink and BLOCKS on a FIFO. A symlink there could read outside the
+sidecar; a FIFO could hang status/restore/prune forever. Both are now read through
+`readControlFileNoFollow` → `openControlFileNoFollow` (O_NOFOLLOW + O_NONBLOCK on
+unix; reparse-point-open on Windows) plus an `fstat` regular-file check. A symlink
+fails open (ELOOP) and a FIFO/device/dir/socket fails the regular-file check; both
+map to `ErrSnapshotSidecarCorrupt` (fail closed) — never followed, never blocked. A
+missing file stays `os.IsNotExist`. All status / migration-validation / prune /
+restore reads route through `readManifest` / `readRestoreMarker`, so the gate
+applies everywhere. (The Open fail-closed probe `restoreMarkerPending` only
+`lstat`s the marker for PRESENCE and already reports a planted symlink/FIFO as
+"pending" ⇒ Open fails closed regardless.) Pinned by
+`TestControlFiles_SymlinkOrFIFO_RejectedAsCorrupt` (manifest + marker, each as a
+symlink AND a FIFO; the FIFO subtests use a 5s watchdog that fails if the read
+blocks).
+
+### Threat model (recovery trusts the LOCAL sidecar)
+
+Codex flagged that a FORGED marker plus an attacker-PLANTED backup file (with its
+hash recorded in the forged marker) could make recovery rename that file into the
+DB. This requires an actor with WRITE ACCESS to the DB/sidecar directory — who
+could equally corrupt the live DB directly. There is no local trust anchor that
+defeats directory-write tampering (the same boundary as the unencrypted DB file
+itself). Recovery therefore TRUSTS THE LOCAL SIDECAR: an actor who already owns the
+DB directory is OUT OF MODEL. The defenses in this document — content-verify
+(per-suffix provenance hashes), canonical-path reconstruction from a safe token,
+the no-symlink/no-FIFO gates, and the durability ordering above — defend the
+REALISTIC cases: a crash mid-restore, on-disk corruption, a stale/partial marker, a
+torn triplet, a power loss between any two steps. They are NOT claimed to stop a
+local attacker who already has write access to the directory. We do NOT add code
+for that boundary; it is unachievable without an external trust anchor and is
+documented here as the explicit edge of the model.
 
 ## Recovery coverage completion (Round 8)
 

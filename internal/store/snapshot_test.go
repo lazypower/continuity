@@ -13,11 +13,19 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// mkfifoForTest creates a FIFO (named pipe) at path. Used by the Finding 6
+// control-file gate tests to prove a FIFO planted at manifest.json /
+// restore.in-progress.json is rejected (and never blocks the reader).
+func mkfifoForTest(path string) error {
+	return syscall.Mkfifo(path, 0o600)
+}
 
 // buildDBAtVersionStandalone applies migrations [1..target] to a fresh DB at
 // the given path. Mirrors the e2e harness's buildDBAtVersion but takes an
@@ -2848,7 +2856,7 @@ func TestClearPublishedMarker_FailedClearIsLoudError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(sidecar, 0o700) }) // so TempDir cleanup can remove it
 
-	err := clearPublishedRestoreMarker(sidecar, resolved)
+	err := clearPublishedRestoreMarker(sidecar, resolved, filepath.Dir(resolved))
 	if err == nil {
 		t.Fatal("expected a loud error when the post-publish marker cannot be cleared")
 	}
@@ -4364,6 +4372,369 @@ func TestRestorePrune_NoRestorePoint_BeforeLock(t *testing.T) {
 	if _, serr := os.Stat(filepath.Dir(missing)); serr == nil {
 		t.Error("restore/prune created the missing parent dir as a side effect")
 	}
+}
+
+// ===========================================================================
+// ROUND 9 (Codex) regression tests — durability audit pass + control-file gate.
+//   1A. snapshot-dir fsync failure during restore-point CREATION fails closed
+//       (aborts the risky migration); no published manifest naming non-durable
+//       snapshot bytes is left behind.
+//   1B. forward restore: a DB-dir fsync failure during the post-publish scrub
+//       (before clearing the marker) fails closed and does NOT clear the marker.
+//   1C. reconcile resumes a half-finished rollback (main db restored, a -wal
+//       backup remains) instead of clearing the marker and orphaning the -wal.
+//   6.  manifest.json / restore.in-progress.json are read through a no-follow +
+//       regular-file gate; a symlink or FIFO at either is rejected as corrupt.
+// ===========================================================================
+
+// TestCreate_SnapshotDirFsyncFailure_FailsClosedNoManifest is the Finding 1A
+// regression. A v5 DB opened with Open() triggers a risky migration, which first
+// creates the restore point. The sidecar-dir fsync that publishes snapshot.db /
+// manifest.json is forced to fail via a test seam. Restore-point creation must
+// FAIL CLOSED — which aborts the risky migration (Open returns an error and the
+// DB stays at v5) — and must NOT leave a published manifest behind. Pre-fix the
+// snapshot/manifest dir fsyncs were warnings, so a power loss could leave a
+// published manifest naming a snapshot.db whose directory entry/bytes never
+// reached disk.
+func TestCreate_SnapshotDirFsyncFailure_FailsClosedNoManifest(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	hookSnapshotDirFsync = func(string) error { return fmt.Errorf("forced snapshot-dir fsync failure") }
+	defer func() { hookSnapshotDirFsync = nil }()
+
+	db, err := Open(dbPath)
+	if err == nil {
+		db.Close()
+		t.Fatal("Open(risky migration) succeeded despite a snapshot-dir fsync failure; it must fail closed")
+	}
+	if !contains(err.Error(), "durable") && !contains(err.Error(), "fsync") {
+		t.Errorf("Open err = %v, want a durability/fsync error", err)
+	}
+
+	// NO published manifest may remain — a published manifest would describe
+	// snapshot bytes whose durability we could not guarantee.
+	if _, serr := os.Stat(manifestPathIn(sidecar)); serr == nil {
+		t.Error("a manifest.json was published despite the fail-closed snapshot-dir fsync")
+	}
+	// Status must therefore report no (valid) restore point present.
+	st, serr := Status(dbPath)
+	if serr != nil {
+		t.Fatalf("Status: %v", serr)
+	}
+	if st.Present {
+		t.Errorf("Status reports a restore point present after a fail-closed creation: %+v", st)
+	}
+
+	// The DB stayed at its pre-version (the risky migration was aborted): re-open
+	// without the seam and confirm it is still openable and at v5 before migration.
+	v, verr := schemaVersionOnDisk(t, dbPath)
+	if verr != nil {
+		t.Fatalf("read on-disk schema after fail-closed migration: %v", verr)
+	}
+	if v != 5 {
+		t.Errorf("risky migration was not aborted: on-disk schema v%d, want 5", v)
+	}
+}
+
+// schemaVersionOnDisk reads MAX(schema_versions.version) from the DB at path
+// without migrating, for asserting a risky migration was (not) applied.
+func schemaVersionOnDisk(t *testing.T, path string) (int, error) {
+	t.Helper()
+	rdb, err := OpenNoMigrate(path)
+	if err != nil {
+		return 0, err
+	}
+	defer rdb.Close()
+	return rdb.SchemaVersion()
+}
+
+// TestRestore_PostPublishScrubDBDirFsyncFailure_KeepsMarker is the Finding 1B
+// regression. A forward Restore publishes the snapshot and then scrubs stale
+// -wal/-shm at the live names. The DB-dir fsync that makes that scrub durable
+// (inside clearPublishedRestoreMarker, BEFORE the marker is removed) is forced to
+// fail. Restore must FAIL CLOSED and must NOT clear the restore marker — so a
+// power loss can never land in a window where the marker is gone but the scrub
+// unlinks are not yet durable. Pre-fix clearPublishedRestoreMarker fsync'd only
+// the sidecar (marker removal), never the DB dir, so the scrub durability did not
+// gate the marker clear.
+func TestRestore_PostPublishScrubDBDirFsyncFailure_KeepsMarker(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // migrate to head + create a VALID restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Plant a stale -wal at the live name AFTER publish so the post-publish scrub has
+	// something to remove (and thus a DB-dir mutation to make durable). The seam fires
+	// AFTER publish + BEFORE the scrub; we use it only to create the stale -wal, and
+	// force the DB-dir fsync (in clearPublishedRestoreMarker) to fail separately.
+	hookAfterPublishBeforeWALScrub = func(rdb string) {
+		_ = os.WriteFile(rdb+"-wal", []byte("stale wal that the scrub removes"), 0o600)
+	}
+	defer func() { hookAfterPublishBeforeWALScrub = nil }()
+	// Force the recovery/clear DB-dir fsync to fail. The two earlier move-aside and
+	// publish fsyncs use the raw fsyncDir (not the seam), so only the post-scrub
+	// DB-dir fsync inside clearPublishedRestoreMarker trips here.
+	hookRecoveryDBDirFsync = func(string) error { return fmt.Errorf("forced post-scrub db-dir fsync failure") }
+	defer func() { hookRecoveryDBDirFsync = nil }()
+
+	_, rerr := Restore(dbPath)
+	if rerr == nil {
+		t.Fatal("Restore returned success despite a non-durable post-publish scrub; it must fail closed")
+	}
+	if !contains(rerr.Error(), "durable") && !contains(rerr.Error(), "recovery") {
+		t.Errorf("Restore err = %v, want a durability error", rerr)
+	}
+	// ORDERING: the marker MUST still be present — the DB-dir fsync (which failed)
+	// runs BEFORE the marker removal, so the marker survives for recovery to re-run.
+	if _, serr := os.Stat(restoreMarkerPathIn(sidecar)); serr != nil {
+		t.Errorf("Restore cleared the marker despite a non-durable scrub (fsync must precede marker removal): %v", serr)
+	}
+	_ = resolved
+}
+
+// TestReconcile_ResumesHalfFinishedRollback_DoesNotOrphanWAL is the Finding 1C
+// regression. A recovery ROLLBACK crashed after renaming the MAIN DB backup back
+// over the live path but BEFORE restoring the -wal backup. On a re-run reconcile
+// sees: live DB present and == the recorded original, the "" (main) backup gone,
+// but the recorded -wal backup STILL on disk. Pre-fix CASE A2 fired (live ==
+// original AND no DB backup) and CLEARED the marker, orphaning the -wal backup and
+// losing the WAL-only commits the restored main DB still needs. The fix drives the
+// rollback to completion: it restores the remaining -wal backup and only THEN
+// clears the marker.
+func TestReconcile_ResumesHalfFinishedRollback_DoesNotOrphanWAL(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // VALID restore point at pre-v6
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Record the live (original) main DB hash, then craft a half-finished rollback:
+	//   - the MAIN DB has ALREADY been rolled back: it sits at the live path == original.
+	//   - the "" backup is GONE (the rename-back consumed it).
+	//   - a -wal backup the marker recorded is STILL present (the crash hit here).
+	origSum, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The original -wal bytes (what must end up at <db>-wal after the resume).
+	const walBytes = "ORIGINAL WAL BYTES — must be rolled back to the live -wal"
+	backupPrefix := resolved + ".pre-restore.halfroll"
+	walBackup := backupPrefix + "-wal"
+	if err := os.WriteFile(walBackup, []byte(walBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	walSum, _, err := hashFile(walBackup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A staged copy (proven ours) so recovery's removeProvenStaged is exercised too.
+	// Build it under the RESOLVED db dir so it passes the canonical-path gate.
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.halfroll.db")
+	if err := copyFile(snapshotDBPathIn(sidecar), staged); err != nil {
+		t.Fatal(err)
+	}
+	// The marker records BOTH "" and "-wal" as moved (the rollback's recorded plan);
+	// the "" backup is already gone, the -wal backup remains.
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: []string{"", "-wal"}, DBPublished: false,
+		OriginalDBSHA256: origSum,
+		MovedEntries: []movedEntry{
+			{Suffix: "", SHA256: origSum},
+			{Suffix: "-wal", SHA256: walSum},
+		},
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	if rerr := recoverPendingRestore(dbPath); rerr != nil {
+		t.Fatalf("reconcile of a half-finished rollback failed: %v", rerr)
+	}
+
+	// The -wal backup must have been ROLLED BACK to the live -wal (not orphaned).
+	got, gerr := os.ReadFile(resolved + "-wal")
+	if gerr != nil {
+		t.Fatalf("live -wal missing after resume — the -wal backup was orphaned: %v", gerr)
+	}
+	if string(got) != walBytes {
+		t.Errorf("live -wal content = %q, want the rolled-back original %q", string(got), walBytes)
+	}
+	// The -wal backup file must be gone (consumed by the rename-back).
+	if _, serr := os.Stat(walBackup); !os.IsNotExist(serr) {
+		t.Errorf("the -wal backup still exists after a completed rollback (orphaned/not consumed): %v", serr)
+	}
+	// The marker is cleared ONLY now — after the rollback actually completed.
+	if _, serr := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(serr) {
+		t.Errorf("marker not cleared after the rollback completed: %v", serr)
+	}
+	// The main DB at the live path is still the original (untouched by the resume).
+	mainSum, _, herr := hashFile(resolved)
+	if herr != nil {
+		t.Fatalf("live db missing after resume: %v", herr)
+	}
+	if mainSum != origSum {
+		t.Error("the resumed rollback disturbed the already-restored main db")
+	}
+}
+
+// TestControlFiles_SymlinkOrFIFO_RejectedAsCorrupt is the Finding 6 regression.
+// Replacing manifest.json (and the restore marker) with a SYMLINK or a FIFO must
+// make the readers reject it as a corrupt sidecar rather than follow the link
+// (reading outside the sidecar) or BLOCK forever on a FIFO read. Status, Restore,
+// and Prune all route their reads through readManifest / readRestoreMarker, which
+// now open the control files O_NOFOLLOW + non-blocking and fstat-reject anything
+// that is not a regular file. Pre-fix both used os.ReadFile directly.
+func TestControlFiles_SymlinkOrFIFO_RejectedAsCorrupt(t *testing.T) {
+	// (a) manifest.json replaced by a SYMLINK to an out-of-sidecar file.
+	t.Run("manifest_symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "continuity.db")
+		buildDBAtVersionStandalone(t, dbPath, 5)
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		sidecar, _ := sidecarPath(dbPath)
+		manifest := manifestPathIn(sidecar)
+
+		// A real, valid-looking JSON file OUTSIDE the sidecar the symlink points at.
+		outside := filepath.Join(dir, "elsewhere.json")
+		if err := os.WriteFile(outside, []byte(`{"kind":"x"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(manifest); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, manifest); err != nil {
+			t.Fatal(err)
+		}
+
+		// readManifest must fail closed (corrupt), never follow the symlink.
+		if _, rerr := readManifest(sidecar); !errors.Is(rerr, ErrSnapshotSidecarCorrupt) {
+			t.Errorf("readManifest through a symlinked manifest: err = %v, want ErrSnapshotSidecarCorrupt", rerr)
+		}
+		// Status surfaces it as a present-but-corrupt problem (does not follow).
+		st, serr := Status(dbPath)
+		if serr != nil {
+			t.Fatalf("Status: %v", serr)
+		}
+		if !st.Present || st.Problem == "" {
+			t.Errorf("Status did not flag the symlinked manifest as corrupt: %+v", st)
+		}
+		// Prune must refuse (corrupt → not absent → fail closed under the lock).
+		if perr := Prune(dbPath); errors.Is(perr, ErrNoRestorePoint) || perr == nil {
+			t.Errorf("Prune did not fail closed on a symlinked manifest: %v", perr)
+		}
+	})
+
+	// (b) manifest.json replaced by a FIFO — a blocking read would hang forever.
+	t.Run("manifest_fifo", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "continuity.db")
+		buildDBAtVersionStandalone(t, dbPath, 5)
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		sidecar, _ := sidecarPath(dbPath)
+		manifest := manifestPathIn(sidecar)
+		if err := os.Remove(manifest); err != nil {
+			t.Fatal(err)
+		}
+		if err := mkfifoForTest(manifest); err != nil {
+			t.Skipf("mkfifo unsupported here: %v", err)
+		}
+
+		// A bounded watchdog: if the read blocks (pre-fix behaviour), fail loudly
+		// instead of hanging the whole test binary.
+		done := make(chan error, 1)
+		go func() {
+			_, rerr := readManifest(sidecar)
+			done <- rerr
+		}()
+		select {
+		case rerr := <-done:
+			if !errors.Is(rerr, ErrSnapshotSidecarCorrupt) && rerr == nil {
+				t.Errorf("readManifest through a FIFO manifest: err = %v, want corrupt/non-nil", rerr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("readManifest BLOCKED on a FIFO manifest (no O_NONBLOCK/regular-file gate)")
+		}
+	})
+
+	// (c) restore.in-progress.json replaced by a SYMLINK — recovery's marker read
+	// must fail closed rather than follow it.
+	t.Run("marker_symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "continuity.db")
+		buildDBAtVersionStandalone(t, dbPath, 5)
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		sidecar, _ := sidecarPath(dbPath)
+		markerPath := restoreMarkerPathIn(sidecar)
+
+		outside := filepath.Join(dir, "marker-elsewhere.json")
+		if err := os.WriteFile(outside, []byte(`{"version":1,"restored_db_path":"/x"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, markerPath); err != nil {
+			t.Fatal(err)
+		}
+		if _, rerr := readRestoreMarker(sidecar); !errors.Is(rerr, ErrSnapshotSidecarCorrupt) {
+			t.Errorf("readRestoreMarker through a symlinked marker: err = %v, want ErrSnapshotSidecarCorrupt", rerr)
+		}
+	})
+
+	// (d) restore.in-progress.json replaced by a FIFO — recovery's marker read must
+	// not block forever.
+	t.Run("marker_fifo", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "continuity.db")
+		buildDBAtVersionStandalone(t, dbPath, 5)
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		sidecar, _ := sidecarPath(dbPath)
+		markerPath := restoreMarkerPathIn(sidecar)
+		if err := mkfifoForTest(markerPath); err != nil {
+			t.Skipf("mkfifo unsupported here: %v", err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, rerr := readRestoreMarker(sidecar)
+			done <- rerr
+		}()
+		select {
+		case rerr := <-done:
+			if rerr == nil {
+				t.Error("readRestoreMarker through a FIFO marker returned nil; want corrupt/non-nil")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("readRestoreMarker BLOCKED on a FIFO marker")
+		}
+	})
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
