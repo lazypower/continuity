@@ -371,12 +371,29 @@ func OpenMemory() (*DB, error) {
 
 // hardenPermissions tightens file/directory permissions for existing installs.
 // MkdirAll/OpenFile only set permissions on creation — this fixes pre-existing files.
+//
+// SYMLINK GATE (Round 12, Finding 6): the DB triplet (<db>, <db>-wal, <db>-shm)
+// is LSTAT'd, never Stat'd, and a symlinked member is SKIPPED, never chmod'd.
+// os.Stat/os.Chmod FOLLOW symlinks, so a planted `continuity.db-wal -> /victim`
+// would otherwise chmod the VICTIM's mode to 0600. The DB leaf itself is already
+// refused up front (refuseSymlinkedDBLeaf) before we ever reach here, but the
+// -wal/-shm siblings are not on that path — so we must never chmod through a
+// symlink at any triplet position. We never chmod a symlink target.
 func hardenPermissions(dir, dbPath string) {
 	if info, err := os.Stat(dir); err == nil && info.Mode().Perm()&0077 != 0 {
 		_ = os.Chmod(dir, 0700)
 	}
 	for _, f := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
-		if info, err := os.Stat(f); err == nil && info.Mode().Perm()&0077 != 0 {
+		// Lstat (not Stat) so a symlinked triplet member is detected and SKIPPED:
+		// chmod follows symlinks and would change the LINK TARGET's mode.
+		info, err := os.Lstat(f)
+		if err != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue // never chmod a symlink target
+		}
+		if info.Mode().Perm()&0077 != 0 {
 			_ = os.Chmod(f, 0600)
 		}
 	}

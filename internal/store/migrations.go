@@ -259,6 +259,76 @@ func (e *ErrSchemaTooNew) Error() string {
 	)
 }
 
+// ErrSchemaVersionsGap signals that the schema_versions bookkeeping table is
+// INCONSISTENT: a known migration whose version is BELOW the highest recorded
+// version has no row of its own. migrate() applies AND records migrations
+// contiguously (it never commits version N without committing every version < N
+// the binary knows), so a gap below MAX(present) cannot arise from a normal
+// upgrade — it means the bookkeeping is corrupt or has been tampered with.
+//
+// Round 12, Finding 3: the prior behavior SNAPSHOTTED-AND-PROCEEDED on a gapped
+// table (treating the absent low row as a pending migration to run). But the
+// restore point's lineage fingerprint is computed PRE-migration over the rows
+// present at that moment (without the gapped row); once the gapped migration runs
+// and inserts the row, the fingerprint recomputed at restore time no longer
+// matches, so `restore --confirm` ALWAYS refuses — an UNRESTORABLE restore point.
+// Rather than create a restore point that can never be used (and run a destructive
+// rebuild against corrupt bookkeeping), we FAIL CLOSED: refuse to open/migrate so
+// the operator restores a real backup. This also subsumes the gapped-table arm of
+// the earlier "unprotected risky migration" concern — a gapped table never runs a
+// migration at all now. Typed so a future `doctor` command can branch on it.
+type ErrSchemaVersionsGap struct {
+	MissingVersion int
+	MaxPresent     int
+}
+
+func (e *ErrSchemaVersionsGap) Error() string {
+	return fmt.Sprintf(
+		"schema_versions is inconsistent (missing version %d below recorded max %d); "+
+			"database bookkeeping is corrupt — restore a backup",
+		e.MissingVersion, e.MaxPresent,
+	)
+}
+
+// detectSchemaVersionsGap fails closed with *ErrSchemaVersionsGap when some known
+// migration m with m.Version < MAX(present version) has NO schema_versions row.
+// migrate() records migrations contiguously, so such a gap is corrupt/tampered
+// bookkeeping (Round 12, Finding 3). It reads through the idempotent
+// schema_versions create the caller has already ensured; a pure read otherwise.
+//
+// Only versions strictly BELOW the present MAX are checked: a missing row AT or
+// ABOVE the max is a normal PENDING migration the migrator will apply, not a gap.
+// A fresh install (MAX == 0) has no gap. (A recorded version ABOVE head is the
+// separate ErrSchemaTooNew case, handled by the caller.)
+func (db *DB) detectSchemaVersionsGap() error {
+	var maxPresent int
+	if err := db.QueryRow(
+		`SELECT COALESCE(MAX(version), 0) FROM schema_versions`,
+	).Scan(&maxPresent); err != nil {
+		return fmt.Errorf("read schema_versions for gap check: %w", err)
+	}
+	if maxPresent == 0 {
+		return nil // fresh install — nothing below the max
+	}
+	for _, m := range migrations {
+		if m.Version >= maxPresent {
+			// At/above the present max: a missing row here is a pending migration,
+			// not a gap. (migrations is ascending, so nothing below remains.)
+			break
+		}
+		var count int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM schema_versions WHERE version = ?`, m.Version,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("gap check version %d: %w", m.Version, err)
+		}
+		if count == 0 {
+			return &ErrSchemaVersionsGap{MissingVersion: m.Version, MaxPresent: maxPresent}
+		}
+	}
+	return nil
+}
+
 // ensureSchemaVersionsTable creates the schema_versions bookkeeping table if it
 // does not exist. Split out so the risky-upgrade detection in Open() can read the
 // current version through the same idempotent create that migrate() relies on.
@@ -290,6 +360,13 @@ func (db *DB) riskyUpgradePending() (risky bool, maxApplied int, err error) {
 	if err := db.ensureSchemaVersionsTable(); err != nil {
 		return false, 0, err
 	}
+	// FAIL CLOSED on a gapped bookkeeping table BEFORE deciding the upgrade path
+	// (Round 12, Finding 3). A missing version row below MAX(present) is corrupt
+	// bookkeeping, not a pending migration to snapshot-and-run; refuse so Open never
+	// creates an unrestorable restore point or runs a rebuild against a gapped table.
+	if err := db.detectSchemaVersionsGap(); err != nil {
+		return false, 0, err
+	}
 	if err := db.QueryRow(
 		`SELECT COALESCE(MAX(version), 0) FROM schema_versions`,
 	).Scan(&maxApplied); err != nil {
@@ -315,6 +392,17 @@ func (db *DB) riskyUpgradePending() (risky bool, maxApplied int, err error) {
 func (db *DB) migrate() error {
 	// Create schema_versions table if it doesn't exist
 	if err := db.ensureSchemaVersionsTable(); err != nil {
+		return err
+	}
+
+	// FAIL CLOSED on a gapped bookkeeping table (Round 12, Finding 3). migrate()
+	// records migrations contiguously, so a known migration whose version is below
+	// MAX(present) but has no row is corrupt/tampered bookkeeping — NOT a pending
+	// migration to run. Refuse here, the universal migrate chokepoint, so no
+	// migration runs and no (unrestorable) restore point is created against a gapped
+	// table. A fresh install (MAX==0) and a contiguous table pass cleanly; this
+	// REPLACES the prior gapped snapshot-and-proceed.
+	if err := db.detectSchemaVersionsGap(); err != nil {
 		return err
 	}
 

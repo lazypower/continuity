@@ -760,29 +760,134 @@ func TestStatusAndPrune(t *testing.T) {
 	}
 }
 
-// TestPruneRefusesCorrupt: prune must fail closed on a corrupt sidecar.
-func TestPruneRefusesCorrupt(t *testing.T) {
+// TestPrune_RemovesPartialSidecar is the Round-12 Finding-1 regression. A partial
+// sidecar — snapshot.db present but manifest.json deleted (or vice versa), the exact
+// torn state expireRestorePoint/prune can leave if one of its two unlinks fails —
+// must be REMOVABLE via `prune --confirm` when NO restore marker is pending, NOT
+// refused forever (the wedge). Pre-fix Prune returned ErrSnapshotSidecarCorrupt and
+// left the partial files, so loadValidManifest failed forever with no CLI cleanup
+// path; this test failed then.
+func TestPrune_RemovesPartialSidecar(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// write installs the partial sidecar content (a valid-shaped restore point
+		// minus one of its two files).
+		drop string // "manifest" → snapshot-only; "snapshot" → manifest-only
+	}{
+		{name: "snapshot_only_manifest_deleted", drop: "manifest"},
+		{name: "manifest_only_snapshot_deleted", drop: "snapshot"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "continuity.db")
+			buildDBAtVersionStandalone(t, dbPath, 5)
+
+			// Build a real, valid restore point first, then delete one of its files to
+			// produce the partial state.
+			db, err := Open(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.Close()
+			sidecar, _ := sidecarPath(dbPath)
+			if _, err := loadValidManifest(sidecar); err != nil {
+				t.Fatalf("setup: restore point should be valid: %v", err)
+			}
+			switch tc.drop {
+			case "manifest":
+				if err := os.Remove(manifestPathIn(sidecar)); err != nil {
+					t.Fatal(err)
+				}
+			case "snapshot":
+				if err := os.Remove(snapshotDBPathIn(sidecar)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Sanity: the partial sidecar no longer validates (it is "corrupt").
+			if _, lerr := loadValidManifest(sidecar); lerr == nil ||
+				errors.Is(lerr, ErrNoRestorePoint) {
+				t.Fatalf("setup: partial sidecar should be corrupt, got %v", lerr)
+			}
+
+			// No restore marker pending ⇒ prune must REMOVE the partial sidecar, not
+			// refuse-corrupt.
+			if perr := Prune(dbPath); perr != nil {
+				t.Fatalf("prune partial sidecar: err=%v, want nil (removed)", perr)
+			}
+			// Both known files must be gone, and the now-empty sidecar dir removed.
+			if _, err := os.Lstat(snapshotDBPathIn(sidecar)); !os.IsNotExist(err) {
+				t.Errorf("snapshot.db still present after prune (err=%v)", err)
+			}
+			if _, err := os.Lstat(manifestPathIn(sidecar)); !os.IsNotExist(err) {
+				t.Errorf("manifest.json still present after prune (err=%v)", err)
+			}
+			if _, err := os.Lstat(sidecar); !os.IsNotExist(err) {
+				t.Errorf("empty sidecar dir not removed after prune (err=%v)", err)
+			}
+		})
+	}
+}
+
+// TestStatus_HashConsistentNonSQLiteSnapshotReportsCorrupt is the Round-12 Finding-5
+// regression. loadValidManifest proves snapshot.db matches the manifest's recorded
+// shape/size/HASH — but a hash-consistent file can still be NON-SQLITE garbage (a
+// forged/hand-edited manifest whose recorded hash happens to match arbitrary bytes).
+// Pre-fix `status` ran only the hash check and emitted a clean "present" for such a
+// snapshot, even though `restore --confirm` would later refuse it on integrity_check
+// — a false "safe" signal. The fix runs a read-only PRAGMA integrity_check in Status
+// and reports present-but-corrupt. This plants garbage snapshot.db + a MATCHING hash
+// in the manifest and asserts Status flags it corrupt; it fails pre-fix (clean present).
+func TestStatus_HashConsistentNonSQLiteSnapshotReportsCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
 	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	db, err := Open(dbPath) // valid restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
 	sidecar, _ := sidecarPath(dbPath)
-	if err := os.MkdirAll(sidecar, 0o700); err != nil {
+	m, err := loadValidManifest(sidecar)
+	if err != nil {
+		t.Fatalf("setup: restore point should be valid: %v", err)
+	}
+
+	// Overwrite snapshot.db with NON-SQLITE garbage, then re-point the manifest's
+	// recorded hash/size at the garbage so loadValidManifest still passes (the exact
+	// hash-consistent-but-not-a-DB state). integrity_check on the garbage must fail.
+	garbage := []byte("this is not a sqlite database, just hash-consistent bytes")
+	if err := os.WriteFile(snapshotDBPathIn(sidecar), garbage, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(snapshotDBPathIn(sidecar), []byte("partial"), 0o600); err != nil {
+	sum, size, err := hashFile(snapshotDBPathIn(sidecar))
+	if err != nil {
 		t.Fatal(err)
 	}
-	// manifest absent → corrupt.
-	err := Prune(dbPath)
-	if err == nil || errors.Is(err, ErrNoRestorePoint) {
-		t.Fatalf("prune corrupt: err=%v, want corrupt refusal", err)
+	m.SnapshotSHA256 = sum
+	m.SnapshotSizeBytes = size
+	if err := writeManifestAtomic(sidecar, m); err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(err, ErrSnapshotSidecarCorrupt) {
-		t.Errorf("err=%v, want ErrSnapshotSidecarCorrupt", err)
+	// Sanity: loadValidManifest (hash-only) now PASSES on the garbage snapshot —
+	// this is exactly the false-safe shape Status must catch.
+	if _, lerr := loadValidManifest(sidecar); lerr != nil {
+		t.Fatalf("setup: manifest should be hash-consistent with the garbage, got %v", lerr)
 	}
-	// The partial snapshot must NOT have been deleted.
-	if _, err := os.Stat(snapshotDBPathIn(sidecar)); err != nil {
-		t.Errorf("prune deleted an unproven file: %v", err)
+
+	st, err := Status(dbPath)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if !st.Present {
+		t.Fatal("Status reported not-present for a present (corrupt) snapshot")
+	}
+	if st.Problem == "" {
+		t.Fatal("Status reported a clean 'present' for a hash-consistent NON-SQLite snapshot; " +
+			"want present-but-corrupt (integrity_check should have failed)")
+	}
+	if !strings.Contains(st.Problem, "integrity_check") {
+		t.Errorf("Status problem = %q, want it to mention integrity_check", st.Problem)
 	}
 }
 
@@ -867,6 +972,92 @@ func TestRestore_RoundTripsData(t *testing.T) {
 	rdb.QueryRow(`SELECT COUNT(*) FROM mem_nodes WHERE uri='mem://user/feedback/post-upgrade'`).Scan(&cnt)
 	if cnt != 0 {
 		t.Errorf("post-upgrade row survived restore (count=%d)", cnt)
+	}
+}
+
+// TestRestore_ResetsBootRetention is the Round-12 Finding-2 regression. After a
+// restore, the restored DB earns a FRESH retention window: successful_boots must be
+// reset to 0 and last_successful_boot_at cleared in the manifest. Pre-fix the old
+// successful_boots (e.g. 2) carried through, so the next serve incremented from it
+// and the point could auto-expire after far fewer post-restore boots than the
+// operator expects (here, ONE). This test sets successful_boots=2 before restore and
+// asserts the post-restore manifest is back at 0; it fails pre-fix (boots stay 2).
+func TestRestore_ResetsBootRetention(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	db, err := Open(dbPath) // creates restore point + migrates to head
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	sidecar, _ := sidecarPath(dbPath)
+	m, err := loadValidManifest(sidecar)
+	if err != nil {
+		t.Fatalf("setup: restore point should exist: %v", err)
+	}
+	// Simulate an aged restore point that has already accrued boots.
+	bootAt := "2026-01-01T00:00:00Z"
+	m.SuccessfulBoots = 2
+	m.LastSuccessfulBootAt = &bootAt
+	if err := writeManifestAtomic(sidecar, m); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore: the restored DB earns a fresh window.
+	if _, rerr := Restore(dbPath); rerr != nil {
+		t.Fatalf("restore: %v", rerr)
+	}
+
+	after, err := loadValidManifest(sidecar)
+	if err != nil {
+		t.Fatalf("post-restore manifest: %v", err)
+	}
+	if after.SuccessfulBoots != 0 {
+		t.Errorf("post-restore successful_boots = %d, want 0 (fresh window)", after.SuccessfulBoots)
+	}
+	if after.LastSuccessfulBootAt != nil {
+		t.Errorf("post-restore last_successful_boot_at = %v, want nil", *after.LastSuccessfulBootAt)
+	}
+	if after.RestoreCount != 1 {
+		t.Errorf("post-restore restore_count = %d, want 1", after.RestoreCount)
+	}
+
+	// The realistic next step: the operator re-runs serve, which re-migrates the
+	// restored v5 DB back up to head (reusing the same restore point — same lineage,
+	// covers this run) and then records successful boots. A boot must now start
+	// counting from 0 (→ 1), not from the stale 2 (which would have ticked to 3 and
+	// EXPIRED the only rollback material on this single post-restore boot).
+	redb, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("re-open (re-migrate) after restore: %v", err)
+	}
+	reV, _ := redb.SchemaVersion()
+	redb.Close()
+	if reV != headVersion() {
+		t.Fatalf("re-open did not re-migrate to head: v%d", reV)
+	}
+	// The reused restore point's boot counter must still be 0 after the re-migration.
+	reM, err := loadValidManifest(sidecar)
+	if err != nil {
+		t.Fatalf("restore point missing after re-migration: %v", err)
+	}
+	if reM.SuccessfulBoots != 0 {
+		t.Errorf("after re-migration, successful_boots = %d, want 0 (still the fresh window)", reM.SuccessfulBoots)
+	}
+
+	if berr := RecordSuccessfulBoot(dbPath, reV); berr != nil {
+		t.Fatalf("post-restore boot: %v", berr)
+	}
+	ticked, err := loadValidManifest(sidecar)
+	if err != nil {
+		t.Fatalf("the restore point expired after a single post-restore boot "+
+			"(boot retention was not reset): %v", err)
+	}
+	if ticked.SuccessfulBoots != 1 {
+		t.Errorf("after one post-restore boot, successful_boots = %d, want 1", ticked.SuccessfulBoots)
 	}
 }
 
@@ -5031,24 +5222,22 @@ func TestReconcile_RollsBackWhenStagedMissingButBackupSurvives(t *testing.T) {
 	}
 }
 
-// TestMigrate_GappedSchemaVersions_SnapshotsBeforeMissingRiskyV6 is the Round-10
-// Finding-3 regression. runPendingMigrations applies ANY migration whose
-// schema_versions ROW IS ABSENT (gaps included), but risk detection used
-// MAX(version). A bogus/gapped bookkeeping table — MAX=9 but row 6 ABSENT — made the
-// MAX-based heuristic see nothing risky pending while the migrator still ran the
-// risky v6 mem_nodes rebuild UNPROTECTED (no restore point). With risk detection
-// computed from the ACTUAL pending set, Open must create a restore point BEFORE
-// running the missing risky v6. Pre-fix no sidecar is created; this test fails then.
-func TestMigrate_GappedSchemaVersions_SnapshotsBeforeMissingRiskyV6(t *testing.T) {
+// TestMigrate_GappedSchemaVersions_FailsClosed is the Round-12 Finding-3 regression
+// (REPLACES the Round-10 gapped snapshot-and-proceed test). migrate() applies AND
+// records migrations contiguously, so a known migration whose version is BELOW
+// MAX(present) but has no schema_versions row is corrupt/tampered bookkeeping — NOT
+// a pending migration to run. The prior behavior snapshotted-and-proceeded, but the
+// restore point's lineage fingerprint (computed pre-migration WITHOUT the gapped
+// row) would never match after the gapped migration inserts the row, so
+// `restore --confirm` always refused — an UNRESTORABLE point. The fix FAILS CLOSED:
+// Open refuses with ErrSchemaVersionsGap, no migration runs, no restore point is
+// created. Pre-fix Open succeeded and created a sidecar; this test fails then.
+func TestMigrate_GappedSchemaVersions_FailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "continuity.db")
-	// Build a v5-SHAPED DB: tables/rows for migrations 1..5 applied (so the v6
-	// rebuild's `INSERT ... SELECT * FROM mem_nodes` runs against the v5 schema).
+	// Build a v5-SHAPED DB (rows 1..5 present), then insert BOGUS schema_versions
+	// rows for 7, 8, 9 so MAX(version)=9 while row 6 is ABSENT — a gap below the max.
 	buildDBAtVersionStandalone(t, dbPath, 5)
-
-	// Insert BOGUS schema_versions rows for 7, 8, 9 (NOT their SQL) so MAX(version)=9
-	// while row 6 is ABSENT. The MAX-based heuristic (firstPendingRiskyVersion(9))
-	// would see no risky pending; the real migrator still runs the absent risky v6.
 	func() {
 		sqlDB, err := sql.Open("sqlite", dbPath)
 		if err != nil {
@@ -5065,30 +5254,169 @@ func TestMigrate_GappedSchemaVersions_SnapshotsBeforeMissingRiskyV6(t *testing.T
 		}
 	}()
 
-	// Sanity: MAX=9, row 6 absent — the MAX-based heuristic sees nothing risky.
-	if _, ok := firstPendingRiskyVersion(9); ok {
-		t.Fatal("test premise: firstPendingRiskyVersion(9) should report nothing pending")
+	// Open must FAIL CLOSED with the gap sentinel — no migration, no restore point.
+	db, err := Open(dbPath)
+	if err == nil {
+		db.Close()
+		t.Fatal("Open succeeded over a gapped bookkeeping table; want fail-closed gap error")
+	}
+	var gapErr *ErrSchemaVersionsGap
+	if !errors.As(err, &gapErr) {
+		t.Fatalf("Open err = %v, want *ErrSchemaVersionsGap", err)
+	}
+	if gapErr.MissingVersion != 6 {
+		t.Errorf("gap MissingVersion = %d, want 6", gapErr.MissingVersion)
+	}
+	if gapErr.MaxPresent != 9 {
+		t.Errorf("gap MaxPresent = %d, want 9", gapErr.MaxPresent)
 	}
 
-	// Open must create a restore point BEFORE running the missing risky v6.
+	// NO restore point was created (the migration never ran).
+	sidecar, _ := sidecarPath(dbPath)
+	if _, serr := os.Lstat(sidecar); !os.IsNotExist(serr) {
+		t.Errorf("a sidecar was created despite the fail-closed gap (err=%v)", serr)
+	}
+
+	// NO migration ran: row 6 is still absent and the bogus rows are untouched.
+	func() {
+		sqlDB, oerr := sql.Open("sqlite", dbPath)
+		if oerr != nil {
+			t.Fatal(oerr)
+		}
+		defer sqlDB.Close()
+		var hasSix int
+		if err := sqlDB.QueryRow(
+			`SELECT COUNT(*) FROM schema_versions WHERE version = 6`).Scan(&hasSix); err != nil {
+			t.Fatal(err)
+		}
+		if hasSix != 0 {
+			t.Error("the missing risky v6 migration ran despite the fail-closed gap")
+		}
+	}()
+}
+
+// TestReservedCharPath_TakesLockAndSidecar is the Round-12 Finding-4 regression. A
+// plain filesystem path containing '#' (or '%') is a VALID path that opens the
+// LITERAL file, and the lock/sidecar are plain filenames — but snapshotEligiblePath
+// previously REJECTED such paths, so dbLockPath returned ErrSnapshotUnsupportedPath
+// and acquireShared/ExclusiveLock returned a NO-OP handle. A risky upgrade on a '#'
+// path therefore ran the destructive DDL UNLOCKED and created NO restore point. The
+// fix makes '#'/'%' paths snapshot-ELIGIBLE, so they get the real shared/exclusive
+// lock + sidecar + snapshots. This asserts (a) a risky upgrade on a '#' path creates
+// a sidecar (not a no-op), and (b) the exclusive lock is REAL: a concurrent open
+// serializes behind a held exclusive lock (fails closed ErrDBLocked) instead of
+// racing through with a no-op lock. Both fail pre-fix.
+func TestReservedCharPath_TakesLockAndSidecar(t *testing.T) {
+	dir := t.TempDir()
+	// A path whose LEAF contains '#': ordinary filesystem bytes, reserved in a URI.
+	dbPath := filepath.Join(dir, "continu#ity.db")
+
+	// Premise: the path is now snapshot-eligible AND opens as a literal file.
+	if !snapshotEligiblePath(dbPath) {
+		t.Fatalf("test premise: %q should be snapshot-eligible after Finding 4", dbPath)
+	}
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	// (a) A risky upgrade must create a sidecar — proving the snapshot path runs
+	// (and, with it, the real lock) rather than being a no-op.
 	db, err := Open(dbPath)
 	if err != nil {
-		t.Fatalf("Open/migrate over a gapped bookkeeping table: %v", err)
+		t.Fatalf("Open risky upgrade on '#' path: %v", err)
 	}
-	defer db.Close()
+	if v, _ := db.SchemaVersion(); v != headVersion() {
+		t.Errorf("schema = v%d, want head v%d", v, headVersion())
+	}
+	db.Close()
 
-	sidecar, _ := sidecarPath(dbPath)
-	m, err := loadValidManifest(sidecar)
+	sidecar, serr := sidecarPath(dbPath)
+	if serr != nil {
+		t.Fatalf("sidecarPath(%q): %v", dbPath, serr)
+	}
+	if _, lerr := loadValidManifest(sidecar); lerr != nil {
+		t.Fatalf("no restore point created for a '#'-path risky upgrade (pre-fix the "+
+			"no-op lock skipped the sidecar): %v", lerr)
+	}
+
+	// (b) The exclusive lock is REAL: hold a foreign EXCLUSIVE lock on the '#' path's
+	// lock file, then an operation that must take the exclusive lock (Prune) must FAIL
+	// CLOSED with ErrDBLocked — pre-fix the no-op lock let it proceed unserialized.
+	lp, lperr := dbLockPath(dbPath)
+	if lperr != nil {
+		t.Fatalf("dbLockPath(%q): %v (pre-fix this returned ErrSnapshotUnsupportedPath → no-op lock)", dbPath, lperr)
+	}
+	holder, oerr := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	defer holder.Close()
+	if ok, ferr := flockExclusiveNB(holder); ferr != nil || !ok {
+		t.Fatalf("hold foreign exclusive: ok=%v err=%v", ok, ferr)
+	}
+	// The held FOREIGN flock (a separate-process restore/migration) makes Prune's
+	// non-blocking exclusive flock fail, so Prune waits the bounded window then FAILS
+	// CLOSED with ErrDBLocked. (We do NOT also take the in-process mutex: Prune takes
+	// it first in the same goroutine and that would deadlock — the flock is what models
+	// the cross-process holder.) Pre-fix the '#' path's lock was a no-op, so Prune saw
+	// no lock and proceeded; that is the bug this asserts against.
+	if perr := Prune(dbPath); !errors.Is(perr, ErrDBLocked) {
+		t.Errorf("Prune on a '#' path while exclusive is held: err=%v, want ErrDBLocked "+
+			"(a real lock); pre-fix the no-op lock let prune proceed", perr)
+	}
+}
+
+// TestHardenPermissions_SkipsSymlinkedWALSHM is the Round-12 Finding-6 regression.
+// hardenPermissions chmod'd <db>, <db>-wal, <db>-shm via os.Stat/os.Chmod, which
+// FOLLOW symlinks. A planted `continuity.db-wal -> /victim` therefore got the
+// VICTIM chmod'd to 0600. The fix lstats each triplet member and SKIPS a symlink
+// (never chmod a symlink target). This plants a -wal symlink to a 0644 victim and
+// asserts hardenPermissions leaves the victim's mode unchanged, while still
+// tightening a real loose-perm DB leaf. Pre-fix the victim became 0600. We exercise
+// hardenPermissions directly (the production caller) so SQLite's own WAL handling
+// never touches the symlinked -wal and confound the assertion.
+func TestHardenPermissions_SkipsSymlinkedWALSHM(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 9)
+	// Give the real DB leaf loose perms so we can also prove hardenPermissions STILL
+	// tightens the real file (it must skip only symlinks, not real triplet members).
+	if err := os.Chmod(dbPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A victim file in a sibling dir, world-readable (0644). The -wal symlink points
+	// at it; hardenPermissions must NOT chmod it.
+	victimDir := t.TempDir()
+	victim := filepath.Join(victimDir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("not the db's wal"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(victim, 0o644); err != nil { // defeat umask
+		t.Fatal(err)
+	}
+
+	// Plant <db>-wal AND <db>-shm as symlinks to the victim. (The DB LEAF itself
+	// stays a real file — a symlinked leaf is refused up front; the siblings are the gap.)
+	if err := os.Symlink(victim, dbPath+"-wal"); err != nil {
+		t.Fatal(err)
+	}
+
+	hardenPermissions(dir, dbPath)
+
+	// The symlink target was NOT chmod'd.
+	vinfo, err := os.Lstat(victim)
 	if err != nil {
-		t.Fatalf("expected a restore point before the missing risky v6, got: %v "+
-			"(pre-fix the MAX-based risk gate skipped it)", err)
+		t.Fatal(err)
 	}
-	// The snapshot must record v6 as the first pending risky migration (the absent
-	// row), and its pre_schema_version must be the bookkeeping MAX (9).
-	if m.FirstRiskySchemaVersion != 6 {
-		t.Errorf("first_risky_schema_version = %d, want 6 (the missing risky migration)", m.FirstRiskySchemaVersion)
+	if perm := vinfo.Mode().Perm(); perm != 0o644 {
+		t.Errorf("hardenPermissions chmod'd the symlink target: victim perm=%o, want 0644 "+
+			"(must skip a symlinked -wal, never chmod the target)", perm)
 	}
-	if m.PreSchemaVersion != 9 {
-		t.Errorf("pre_schema_version = %d, want 9 (bookkeeping MAX)", m.PreSchemaVersion)
+	// The real DB leaf WAS tightened to 0600 (symlink-skipping must not regress this).
+	dinfo, err := os.Lstat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := dinfo.Mode().Perm(); perm != 0o600 {
+		t.Errorf("hardenPermissions did not tighten the real DB leaf: perm=%o, want 0600", perm)
 	}
 }

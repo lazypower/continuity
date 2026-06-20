@@ -1,10 +1,117 @@
 # Restore Recovery Model — fail-closed pivot (Round 3)
 
+> **Round 12 update (Codex):** CORRECTNESS-EDGE pass — six non-critical edges (no
+> P1), each with a regression test that fails pre-fix. No new threat classes; these
+> close lifecycle/coordination gaps. See **"Round 12 — correctness edges"**
+> immediately below; the bar is unchanged.
+
 > **Round 10 update (Codex):** the symlinked-leaf refusal had a SIBLING plus a
 > too-strict recovery case and a risk-detection gap. Four fixes, each with a
 > regression test that fails pre-fix. See **"Round 10 — URI/DSN refusal, rollback
 > needs the backup, pending-set risk detection"** immediately below; the bar is
 > unchanged.
+
+## Round 12 — correctness edges (prunable partials, boot reset, gap fail-close, reserved-char eligibility, status integrity, no-follow harden)
+
+Six edges, each fixed + pinned by a regression test that is RED pre-fix:
+
+### F1. A PARTIAL sidecar is always PRUNABLE (no wedge)
+
+`expireRestorePoint`/`Prune` unlink `manifest.json` then `snapshot.db`. If the
+SECOND unlink fails (or a crash lands between them), the residual is a partial
+sidecar (snapshot-only, or manifest-only) that `loadValidManifest` rejects as
+corrupt — and the OLD `Prune` REFUSED on corrupt, so the operator was WEDGED (no
+CLI path to clean it; every later run fails closed). Fix: when `Prune` (explicit,
+`--confirm`) finds a corrupt/partial sidecar AND **no restore marker is pending**
+(the Round-5/8 pending-marker refusal is preserved, re-checked under the EXCLUSIVE
+lock), it now removes the KNOWN sidecar files by their canonical names via
+`pruneKnownSidecarFiles` — `snapshot.db` and `manifest.json` ONLY, each
+lstat-gated to a REGULAR non-symlink file (never unlink through a symlink, never
+touch a foreign/stray file), then rmdir the sidecar iff left empty. `expireRestorePoint`
+now documents the manifest-first deletion order (the manifest is what keys the
+point; voiding it first minimizes the still-loadable window, and either residual is
+prunable). Net: any partial sidecar is cleanable via the CLI. Pinned by
+`TestPrune_RemovesPartialSidecar` (snapshot-only AND manifest-only, no marker ⇒
+`prune --confirm` removes it; pre-fix it refused-corrupt).
+
+### F2. Boot retention RESET after a restore
+
+A restore left the manifest's `successful_boots` at its pre-restore value (e.g. 2),
+so the next `serve` incremented from there and the point could auto-expire after
+ONE post-restore boot — deleting the only rollback material for a re-restore. Fix:
+recording a successful restore now sets `successful_boots = 0` and
+`last_successful_boot_at = nil` (the restored DB earns a FRESH retention window).
+Pinned by `TestRestore_ResetsBootRetention` (set boots=2, restore ⇒ manifest back
+to 0; re-migrate to head + one `RecordSuccessfulBoot` ⇒ boots=1, point survives;
+pre-fix it expired on that single boot).
+
+### F3. Gapped `schema_versions` FAILS CLOSED (was an unrestorable point)
+
+`migrate()` applies+records migrations CONTIGUOUSLY, so a known migration `m` with
+`m.Version < MAX(present)` that has NO `schema_versions` row is corrupt/tampered
+bookkeeping — not a pending migration. The Round-10 behavior SNAPSHOTTED-AND-PROCEEDED
+on such a gap, but the restore point's lineage fingerprint is computed pre-migration
+WITHOUT the gapped row; once the gapped migration inserts the row, the fingerprint
+recomputed at restore time mismatches and `restore --confirm` ALWAYS refuses — an
+UNRESTORABLE point. Fix: a new `detectSchemaVersionsGap` (sentinel
+`*ErrSchemaVersionsGap`, message *"schema_versions is inconsistent (missing version
+N); database bookkeeping is corrupt — restore a backup"*) runs at the head of
+`riskyUpgradePending` AND `migrate()`, so Open FAILS CLOSED — no migration runs, no
+point is created. This REPLACES the Round-10 gapped snapshot-and-proceed (and
+subsumes its "unprotected risky migration" sub-case: a gapped table runs nothing).
+The absent-row `firstPendingRiskyMigrationActual` (Round-10 F3) is RETAINED for the
+contiguous-plus-trailing-tail case, which it still models faithfully; only its
+gapped sub-case now fails closed upstream. Pinned by
+`TestMigrate_GappedSchemaVersions_FailsClosed` (v5-shaped DB + bogus rows 7/8/9,
+MAX=9 row 6 absent ⇒ Open returns `*ErrSchemaVersionsGap{MissingVersion:6,
+MaxPresent:9}`, no sidecar, v6 never ran). REPLACES the Round-10
+`TestMigrate_GappedSchemaVersions_SnapshotsBeforeMissingRiskyV6`.
+
+### F4. Reserved-char ('#'/'%') paths are snapshot-ELIGIBLE (lock + sidecar applied)
+
+`refuseURIDSNPath` ALLOWS a plain path containing '#'/'%' (ordinary filesystem
+bytes; modernc opens the literal file), but `snapshotEligiblePath` REJECTED it — so
+`dbLockPath` returned `ErrSnapshotUnsupportedPath` and `acquireShared/ExclusiveLock`
+returned a NO-OP handle. A risky upgrade on such a path therefore ran the destructive
+DDL UNLOCKED and created NO restore point. Fix: `snapshotEligiblePath` now ACCEPTS
+'#'/'%' (only `:memory:`, the `file:` scheme, and a `?` query stay ineligible — the
+genuine URI/DSN shapes), so these paths get the real shared/exclusive lock + sidecar
++ snapshots. `OpenNoMigrate`/`roFileURI` already percent-escape the path into the
+`file:` URI (Round-7 F7), so read-only inspection still opens the literal file (the
+existing reserved-char read-only test is unaffected). Pinned by
+`TestReservedCharPath_TakesLockAndSidecar` (v5 DB at a '#' path ⇒ a risky upgrade
+creates a sidecar; a held foreign EXCLUSIVE flock makes `Prune` fail closed
+`ErrDBLocked` — proving the lock is real, not a no-op).
+
+### F5. `status` runs `integrity_check` (no false "safe" signal)
+
+`loadValidManifest` proves `snapshot.db` matches the manifest's recorded
+shape/size/HASH, but a hash-consistent file can still be NON-SQLITE garbage (a
+forged/hand-edited manifest whose hash happens to match arbitrary bytes); integrity
+was only checked on restore/reuse. So `status` emitted a clean "present" for a
+snapshot `restore --confirm` would later refuse. Fix: `Status` now runs a read-only
+`PRAGMA integrity_check` on `snapshot.db` and reports present-but-corrupt (the CLI
+exits non-zero) — ONLY in the status command, so routine creation/boot-tick are not
+slowed. Pinned by `TestStatus_HashConsistentNonSQLiteSnapshotReportsCorrupt`
+(garbage snapshot + matching manifest hash ⇒ `status` reports corrupt; pre-fix clean
+present).
+
+### F6. `hardenPermissions` SKIPS symlinked -wal/-shm (never chmod a target)
+
+`hardenPermissions` chmod'd `<db>`, `<db>-wal`, `<db>-shm` via `os.Stat`/`os.Chmod`,
+which FOLLOW symlinks. The DB LEAF is refused up front (symlinked-leaf gate), but the
+`-wal`/`-shm` siblings are not on that path — so a planted `continuity.db-wal ->
+/victim` got the VICTIM chmod'd to 0600. Fix: `hardenPermissions` now `Lstat`s each
+triplet member and SKIPS any symlink (never chmod a symlink target), while still
+tightening a real loose-perm member. Pinned by
+`TestHardenPermissions_SkipsSymlinkedWALSHM` (`-wal` symlinked to a 0644 victim ⇒
+the victim's mode is unchanged AND a real loose DB leaf is still tightened to 0600;
+pre-fix the victim became 0600).
+
+### Minor: `TestDBClose_LockOutlivesSQLHandle`
+
+Green in this sandbox (it probes raw same-process flock). Left as-is per the
+review note — no robustness change was needed here.
 
 ## Round 10 — URI/DSN refusal, rollback needs the backup, pending-set risk detection
 

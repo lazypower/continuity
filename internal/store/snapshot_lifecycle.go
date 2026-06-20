@@ -104,6 +104,14 @@ func expireRestorePoint(sidecar string, m *Manifest) error {
 		return err
 	}
 
+	// DELETION ORDER (Round 12, Finding 1): remove manifest.json FIRST, then
+	// snapshot.db. The manifest is what loadValidManifest keys the restore point on,
+	// so once it is gone the point is logically void — and if the snapshot.db unlink
+	// then fails, the residual snapshot-only sidecar is now PRUNABLE via
+	// `prune --confirm` (pruneKnownSidecarFiles), never a wedge. (The reverse order
+	// would leave a manifest naming an absent snapshot, which is also prunable, but
+	// voiding the manifest first minimizes the window in which a partially-deleted
+	// point still looks loadable.)
 	if err := os.Remove(manifestPathIn(sidecar)); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("snapshot: remove manifest on expiry: %w", err)
 	}
@@ -171,12 +179,36 @@ func Status(dbPath string) (*SnapshotStatus, error) {
 	}
 	st.Present = true
 	st.Manifest = m
+
+	// INTEGRITY CHECK ON STATUS (Round 12, Finding 5): loadValidManifest proves the
+	// snapshot.db matches the manifest's recorded shape/size/HASH, but a hash-consistent
+	// file can still be NON-SQLITE garbage (a forged/hand-edited manifest whose recorded
+	// hash happens to match arbitrary bytes). Without opening the image, `status` would
+	// report a clean "present" for a snapshot that `restore --confirm` later rejects on
+	// integrity_check — a false "safe" signal. Run the SAME read-only PRAGMA
+	// integrity_check restore/reuse run, but ONLY here in the status command, so routine
+	// snapshot CREATION and the boot-tick path are not slowed. A failure is reported as a
+	// present-but-corrupt Problem (the CLI exits non-zero); we never touch the sidecar.
+	if err := integrityCheck(snapshotDBPathIn(sidecar)); err != nil {
+		st.Problem = fmt.Errorf(
+			"%w: snapshot present and hash-consistent but failed integrity_check (%v); "+
+				"`continuity snapshot restore --confirm` would refuse it — run "+
+				"`continuity snapshot prune --confirm` to remove it",
+			ErrSnapshotSidecarCorrupt, err).Error()
+		return st, nil
+	}
 	return st, nil
 }
 
-// Prune removes a VALID restore point's snapshot.db + manifest.json. It
-// refuses (fails closed) on a corrupt/partial sidecar — the CLI never deletes
-// anything it cannot prove is ours. Never opens the DB.
+// Prune removes a restore point's snapshot.db + manifest.json. A VALID point is
+// removed via expireRestorePoint (re-validated immediately before deletion). A
+// PARTIAL/CORRUPT sidecar (e.g. snapshot.db present but manifest deleted, or vice
+// versa) is ALSO removable here (Round 12, Finding 1) — by its canonical file
+// names, regular-file/no-symlink-gated, via pruneKnownSidecarFiles — but ONLY when
+// NO restore marker is pending (that refusal is preserved). This is the explicit
+// `--confirm` escape hatch so a torn sidecar can always be cleaned via the CLI and
+// never wedges the operator. Never opens the DB; only ever touches the two known
+// canonical sidecar files and the sidecar dir (rmdir'd only if left empty).
 //
 // LOCKED AGAINST MIGRATION/RESTORE (Finding 2, Round 6): Prune now acquires the
 // EXCLUSIVE DB lock for the deletion. A risky migration holds EXCLUSIVE across
@@ -253,9 +285,81 @@ func Prune(dbPath string) error {
 		if errors.Is(err, ErrNoRestorePoint) {
 			return ErrNoRestorePoint
 		}
-		return err // corrupt → refuse
+		// PARTIAL/CORRUPT SIDECAR IS PRUNABLE (Round 12, Finding 1). Previously a
+		// corrupt or partial sidecar (e.g. snapshot.db present but manifest deleted,
+		// or vice versa — the exact torn state expireRestorePoint can leave if one of
+		// its two unlinks fails) made Prune REFUSE, so loadValidManifest failed forever
+		// and the operator was WEDGED with no CLI path to clean it. Since we are here
+		// under the EXCLUSIVE lock with NO restore marker pending (re-checked above),
+		// there is provably no in-flight migration/restore whose recovery material this
+		// is — so an explicit `prune --confirm` may remove the KNOWN sidecar files by
+		// their canonical names. pruneKnownSidecarFiles removes ONLY snapshot.db and
+		// manifest.json, and ONLY when each is a regular NON-SYMLINK file (it never
+		// unlinks through a symlink, never touches any other/foreign file), then rmdir's
+		// the sidecar if it is left empty. This makes any partial sidecar cleanable via
+		// the CLI; no wedge.
+		return pruneKnownSidecarFiles(sidecar)
 	}
 	return expireRestorePoint(sidecar, m)
+}
+
+// pruneKnownSidecarFiles removes the two KNOWN sidecar files (snapshot.db,
+// manifest.json) by their canonical names, for the partial/corrupt-sidecar prune
+// path (Round 12, Finding 1). The caller (Prune) holds the EXCLUSIVE DB lock and
+// has re-checked that NO restore marker is pending, so this only runs when there is
+// provably no in-flight migration/restore that owns this material.
+//
+// SAFETY BARS (match the global no-symlink / prove-it-is-ours discipline):
+//   - Each file is removed ONLY when lstat shows a REGULAR, non-symlink file. A
+//     symlink at snapshot.db / manifest.json is SKIPPED (never unlinked through —
+//     unlinking the link itself is fine, but to stay consistent with the managed-file
+//     gate we treat a symlink at a canonical name as foreign and leave it, surfacing
+//     it via the residual-content path below). A FIFO/device/dir is likewise skipped.
+//   - We touch ONLY these two canonical names — never a stray/foreign file.
+//   - The sidecar dir is rmdir'd ONLY if it is left empty afterward (anything we did
+//     not remove — a stray operator file, or a skipped symlink — keeps the dir).
+//
+// A residual non-removable entry is reported as an error so the operator knows the
+// sidecar was not fully cleaned, but the removable known files ARE removed first.
+func pruneKnownSidecarFiles(sidecar string) error {
+	var firstErr error
+	for _, p := range []string{snapshotDBPathIn(sidecar), manifestPathIn(sidecar)} {
+		info, lerr := os.Lstat(p)
+		if lerr != nil {
+			if os.IsNotExist(lerr) {
+				continue // already absent — nothing to remove
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("prune: lstat %s: %w", filepath.Base(p), lerr)
+			}
+			continue
+		}
+		// Only remove a REGULAR, non-symlink file at the canonical name. A symlink /
+		// FIFO / device / dir at this position is foreign-shaped — leave it (and keep
+		// the sidecar dir), matching the no-unlink-through-a-symlink discipline.
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			if firstErr == nil {
+				firstErr = fmt.Errorf(
+					"%w: %s is not a regular file; left in place — remove it by hand",
+					ErrSnapshotSidecarCorrupt, filepath.Base(p))
+			}
+			continue
+		}
+		if rmErr := os.Remove(p); rmErr != nil && !os.IsNotExist(rmErr) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("prune: remove %s: %w", filepath.Base(p), rmErr)
+			}
+		}
+	}
+	// Remove the sidecar dir only if empty — leave anything we did not remove.
+	if entries, err := os.ReadDir(sidecar); err == nil && len(entries) == 0 {
+		_ = os.Remove(sidecar)
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	fmt.Fprintf(os.Stderr, "  pruned partial restore point → removed %s\n", sidecar)
+	return nil
 }
 
 // probeRestorePointAbsent returns ErrNoRestorePoint when there is provably NO
@@ -716,7 +820,17 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 	}
 
 	// Record the restore in the manifest (best-effort).
+	//
+	// RESET BOOT RETENTION (Round 12, Finding 2): the restored DB earns a FRESH
+	// retention window. Without this, an old successful_boots>0 carried in the
+	// manifest would let the point auto-expire after FEWER post-restore boots than
+	// the operator expects (e.g. successful_boots=2, expires_after=3 ⇒ the point
+	// vanishes after ONE post-restore boot, removing the only rollback material for
+	// a re-restore). Zeroing the counter and clearing last_successful_boot_at means
+	// the next RecordSuccessfulBoot starts counting from 0 against the full window.
 	m.RestoreCount++
+	m.SuccessfulBoots = 0
+	m.LastSuccessfulBootAt = nil
 	nowStr := time.Now().UTC().Format(time.RFC3339)
 	m.LastRestoredAt = &nowStr
 	if werr := writeManifestAtomic(sidecar, m); werr != nil {

@@ -194,11 +194,13 @@ func refuseSymlinkedDBLeaf(dbPath string) error {
 //
 // We do NOT refuse a plain path that merely CONTAINS '#'/'%': those are ordinary
 // filesystem bytes and modernc opens such a path as the LITERAL file (verified).
-// snapshotEligiblePath additionally rejects '#'/'%' for SNAPSHOT eligibility
-// (because OpenNoMigrate BUILDS a file: URI from the path via roFileURI, where
-// those bytes are reserved and are percent-escaped) — that is a different concern:
-// such a path still opens the intended real file and is a SUPPORTED plain path
-// here (refusing it would break the reserved-char OpenNoMigrate guarantee).
+// snapshotEligiblePath now AGREES — a '#'/'%' path is snapshot-ELIGIBLE too (Round
+// 12, Finding 4): OpenNoMigrate percent-escapes the path into the file: URI it
+// builds (roFileURI), so the read-only inspection still opens the intended literal
+// file, while the lock/sidecar are plain filenames derived from the path. Only a
+// genuine URI/DSN shape (file: scheme / '?' query) is unsupported, and both gates
+// agree on that. Aligning them is what gives a '#'/'%' DB its lock + sidecar +
+// snapshots instead of leaving its risky DDL unguarded.
 //
 // `:memory:` is explicitly NOT a URI/DSN here: it has no on-disk file to
 // coordinate and is the spelling OpenMemory / the whole test suite relies on, so
@@ -254,17 +256,25 @@ func snapshotEligiblePath(path string) bool {
 	if strings.HasPrefix(p, "file:") {
 		return false
 	}
-	// URI-reserved characters make a "file:<path>?mode=ro" DSN ambiguous: '?'
-	// starts the query (so the rest of the path would be parsed as options), '#'
-	// starts a fragment, and '%' starts a percent-escape that could reinterpret
-	// following bytes. SQLite parses these specially even though the filesystem
-	// treats them as ordinary path bytes, so a path containing any of them could
-	// open a DIFFERENT file or silently drop mode=ro (Round 7, Finding 7). Refuse
-	// such paths for snapshot/restore eligibility entirely; OpenNoMigrate also
-	// percent-escapes the path it builds into a DSN as defense in depth.
-	if strings.ContainsAny(p, "?#%") {
+	// A '?' makes a path a DSN spelling ("<path>?mode=rwc"): SQLite parses the
+	// rest as the query string (so it could open a DIFFERENT file or drop mode=ro),
+	// and the literal string used to derive the lock/sidecar would no longer name
+	// the real file. Refuse '?' for eligibility (refuseURIDSNPath refuses it for
+	// open too) — it is a genuine URI/DSN shape.
+	if strings.ContainsRune(p, '?') {
 		return false
 	}
+	// '#' and '%' are ordinary FILESYSTEM bytes: modernc/SQLite opens such a path
+	// as the LITERAL file, refuseURIDSNPath ALLOWS it (it is a valid plain path),
+	// and the lock/sidecar are plain filenames derived from it. Previously these
+	// were rejected for snapshot eligibility, which split the contract: a '#'/'%'
+	// path was open-allowed but lock/sidecar-INELIGIBLE, so its risky DDL ran with
+	// a no-op lock and no restore point (Round 12, Finding 4). They are now ELIGIBLE
+	// — the shared/exclusive lock + sidecar + snapshots apply normally. OpenNoMigrate
+	// percent-escapes the path it builds into the file: URI (roFileURI), so the
+	// read-only inspection opens exactly the intended literal file (Round 7 behavior,
+	// pinned by the existing reserved-char read-only test). Only :memory: and genuine
+	// URI/DSN shapes (file: scheme / '?' query) stay ineligible.
 	return true
 }
 
@@ -925,16 +935,21 @@ func firstPendingRiskyVersion(preVersion int) (int, bool) {
 
 // firstPendingRiskyMigrationActual computes risk detection from the ACTUAL pending
 // set — exactly the migrations runPendingMigrations will apply: every migration
-// whose schema_versions ROW IS ABSENT, gaps included (Round 10, Finding 3). It
-// returns the version of the FIRST (lowest, in migration order) pending risky
-// migration and whether any pending migration is risky.
+// whose schema_versions ROW IS ABSENT. It returns the version of the FIRST (lowest,
+// in migration order) pending risky migration and whether any pending migration is
+// risky.
 //
-// This is what aligns the snapshot trigger with the real migrator: a gapped
-// bookkeeping table (MAX=9 but row 6 absent) now reports the missing risky v6 as
-// pending, so a restore point is created before it runs — instead of the MAX-based
-// heuristic seeing nothing pending and letting the risky rebuild run unprotected.
-// It reads through the idempotent schema_versions create the caller has already
-// ensured; a pure read otherwise.
+// It models the migrator faithfully rather than via a MAX(version) heuristic, so a
+// pending risky migration is never missed (the snapshot trigger matches what runs).
+//
+// GAPS ARE NOW REFUSED UPSTREAM (Round 12, Finding 3): a gapped bookkeeping table
+// (a known migration below MAX(present) with no row) is rejected by
+// detectSchemaVersionsGap in riskyUpgradePending/migrate BEFORE this runs, so in
+// practice this only ever sees a CONTIGUOUS present set plus a trailing pending
+// tail. The absent-row computation is retained because it remains the correct,
+// migrator-faithful model for that contiguous-plus-tail case (Round 10, Finding 3,
+// minus its gapped sub-case which now fails closed). A pure read; reads through the
+// idempotent schema_versions create the caller has already ensured.
 func (db *DB) firstPendingRiskyMigrationActual() (firstRisky int, hasRisky bool, err error) {
 	for _, m := range migrations {
 		var count int
