@@ -488,6 +488,114 @@ func TestMigrationE2E_IdempotentSecondBoot(t *testing.T) {
 	}
 }
 
+// =========================================================================
+// FK-cascade regression — the risky table-rebuild migrations must NOT wipe
+// mem_vectors (issue #40)
+// =========================================================================
+
+// seedVectorRow inserts a mem_vectors row referencing the given node_id with a
+// distinguishable embedding BLOB. mem_vectors exists from v4; this exercises
+// the FK ON DELETE CASCADE relationship that a careless DROP TABLE mem_nodes
+// (in the v6/v9 rebuilds) would trigger.
+func seedVectorRow(t *testing.T, dbPath string, nodeID int64) {
+	t.Helper()
+	withSeedDB(t, dbPath, func(db *sql.DB) error {
+		_, err := db.Exec(`
+			INSERT INTO mem_vectors (node_id, embedding, model, dimensions, created_at)
+			VALUES (?, ?, ?, ?, ?)
+		`, nodeID, []byte{0xde, 0xad, 0xbe, 0xef}, "test-model", 4, seedConst)
+		return err
+	})
+}
+
+// insertNodeReturningID inserts one mem_node and returns its rowid so a
+// mem_vectors row can reference it.
+func insertNodeReturningID(t *testing.T, dbPath, uri string) int64 {
+	t.Helper()
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open for node insert: %v", err)
+	}
+	defer sqlDB.Close()
+	res, err := sqlDB.Exec(`
+		INSERT INTO mem_nodes (uri, node_type, category, created_at, updated_at)
+		VALUES (?, 'leaf', 'profile', ?, ?)
+	`, uri, seedConst, seedConst)
+	if err != nil {
+		t.Fatalf("insert node: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("last insert id: %v", err)
+	}
+	return id
+}
+
+// assertVectorSurvives reopens the DB and asserts exactly one mem_vectors row
+// exists for nodeID after migration. Without the FK-off-on-pinned-conn fix, the
+// v6/v9 DROP TABLE mem_nodes cascade-deletes it and this count is 0.
+func assertVectorSurvives(t *testing.T, dbPath string, nodeID int64) {
+	t.Helper()
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen after migration: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM mem_vectors WHERE node_id = ?`, nodeID,
+	).Scan(&n); err != nil {
+		t.Fatalf("count mem_vectors: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("mem_vectors row for node %d = %d, want 1 "+
+			"(risky rebuild cascade-deleted the embedding cache — FK was not "+
+			"disabled on the migration's pinned connection)", nodeID, n)
+	}
+}
+
+// TestMigrationE2E_V9RebuildPreservesVectors is the regression test for issue
+// #40: the v9 full-table rebuild DROPs mem_nodes, and with FK enforcement on
+// that cascade-deletes every mem_vectors row (FK ON DELETE CASCADE, v4). We
+// build a DB at v8 (mem_vectors present, pre-v9-rebuild), seed a node + a
+// vector referencing it, migrate forward through v9 via Open(), and assert the
+// vector survives. Fails before the fix (count 0), passes after.
+func TestMigrationE2E_V9RebuildPreservesVectors(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := buildDBAtVersion(t, dir, 8)
+
+	nodeID := insertNodeReturningID(t, dbPath, "mem://user/profile/v8-with-vector")
+	seedVectorRow(t, dbPath, nodeID)
+
+	// Migrate forward through the v9 rebuild.
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open (migrate to head): %v", err)
+	}
+	db.Close()
+
+	assertVectorSurvives(t, dbPath, nodeID)
+}
+
+// TestMigrationE2E_V6RebuildPreservesVectors covers the earlier risky rebuild
+// (v6). Build at v5 (mem_vectors present from v4), seed a node + vector, migrate
+// forward through both v6 and v9 rebuilds, and assert the vector survives both.
+func TestMigrationE2E_V6RebuildPreservesVectors(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := buildDBAtVersion(t, dir, 5)
+
+	nodeID := insertNodeReturningID(t, dbPath, "mem://user/profile/v5-with-vector")
+	seedVectorRow(t, dbPath, nodeID)
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open (migrate to head): %v", err)
+	}
+	db.Close()
+
+	assertVectorSurvives(t, dbPath, nodeID)
+}
+
 // envGet pulls a single KEY=VAL out of an env vector (the env slice returned
 // by testharness.HermeticEnv). Used so the idempotency test can recover the
 // kernel-allocated port for its second-boot wait.
