@@ -3,8 +3,64 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestBuildServicePATH(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	home := "/home/tester"
+
+	t.Run("captured install PATH comes first and is preserved", func(t *testing.T) {
+		install := "/custom/tools" + sep + "/opt/homebrew/bin"
+		got := buildServicePATH(install, home)
+		parts := strings.Split(got, sep)
+		if parts[0] != "/custom/tools" {
+			t.Errorf("expected captured dir first, got %q (full: %q)", parts[0], got)
+		}
+		// The install-time PATH entries must all be present.
+		if !strings.Contains(got, "/custom/tools") {
+			t.Errorf("captured PATH dir missing: %q", got)
+		}
+	})
+
+	t.Run("common provider locations are always included", func(t *testing.T) {
+		got := buildServicePATH("/custom/tools", home)
+		for _, want := range []string{
+			"/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+			filepath.Join(home, ".claude", "local"),
+			filepath.Join(home, ".local", "bin"),
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("expected default dir %q in PATH, got %q", want, got)
+			}
+		}
+	})
+
+	t.Run("empty install PATH still yields a usable default PATH", func(t *testing.T) {
+		got := buildServicePATH("", home)
+		for _, want := range []string{"/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("expected default dir %q with empty install PATH, got %q", want, got)
+			}
+		}
+	})
+
+	t.Run("no duplicate entries", func(t *testing.T) {
+		// Install PATH already contains a default dir — it must not appear twice.
+		got := buildServicePATH("/usr/local/bin"+sep+"/usr/bin", home)
+		seen := map[string]int{}
+		for _, p := range strings.Split(got, sep) {
+			seen[p]++
+		}
+		if seen["/usr/local/bin"] != 1 {
+			t.Errorf("/usr/local/bin appeared %d times, want 1: %q", seen["/usr/local/bin"], got)
+		}
+		if seen["/usr/bin"] != 1 {
+			t.Errorf("/usr/bin appeared %d times, want 1: %q", seen["/usr/bin"], got)
+		}
+	})
+}
 
 func TestResolveBinaryPathFrom(t *testing.T) {
 	tmp := t.TempDir()

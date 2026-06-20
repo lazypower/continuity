@@ -135,7 +135,7 @@ func TestConfirmAndBounce_RefusesWhenLockHeldNoSignal(t *testing.T) {
 		matchingExe,
 	)
 
-	err := ConfirmAndBounce(&Client{}, 4242)
+	_, err := ConfirmAndBounce(&Client{}, 4242)
 	if err == nil {
 		t.Fatal("expected refusal when restart lock is held")
 	}
@@ -162,7 +162,7 @@ func TestConfirmAndBounce_AcquiresAndReleasesLock(t *testing.T) {
 		func(*Client) (*HealthStatus, error) { return strongHealth(4242), nil },
 		matchingExe,
 	)
-	if err := ConfirmAndBounce(&Client{}, 4242); err != nil {
+	if _, err := ConfirmAndBounce(&Client{}, 4242); err != nil {
 		t.Fatalf("bounce should succeed, got %v", err)
 	}
 	if _, statErr := os.Stat(lockPath); !os.IsNotExist(statErr) {

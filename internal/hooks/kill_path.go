@@ -41,10 +41,27 @@ var pidSignaller = func(pid int) error {
 	return osStopPID(pid)
 }
 
-// serverRespawner relaunches a detached serve. Injectable.
-var serverRespawner = func() error {
-	_, err := SpawnDetachedServe()
-	return err
+// processAlive reports whether the given pid currently exists (best-effort, via
+// signal 0 on unix). Injectable so the restart verify path can be tested without
+// real processes. A pid <= 0 is never alive.
+var processAlive = func(pid int) bool {
+	return osProcessAlive(pid)
+}
+
+// ProcessAlive is the exported best-effort liveness check used by the restart
+// command to detect a respawned bare child that has already died (a real
+// crash-on-boot) versus one that is merely slow to bind. It routes through the
+// injectable processAlive so tests can stub it.
+func ProcessAlive(pid int) bool {
+	return processAlive(pid)
+}
+
+// serverRespawner relaunches a detached serve and returns the new child's pid.
+// Injectable. The pid lets callers (continuity restart's bare path) liveness-poll
+// the exact child they spawned so a crash-on-boot can be detected as a real
+// failure rather than a slow startup.
+var serverRespawner = func() (int, error) {
+	return SpawnDetachedServe()
 }
 
 // ConfirmKillTarget runs the full pre-signal safety gate against the server the
@@ -96,8 +113,10 @@ func ConfirmKillTarget(c *Client, expectPID int) (*HealthStatus, error) {
 // ConfirmAndBounce is the full safe bounce: confirm the kill target, signal it,
 // then respawn a detached serve. It is the shared implementation behind both
 // `continuity restart`'s bare bounce and the hook auto-bounce, so the safety
-// gate can never be bypassed by one caller. Returns an error (without having
-// signalled) if the pre-signal gate fails.
+// gate can never be bypassed by one caller. Returns the respawned child's pid
+// (0 on any failure) and an error (without having signalled) if the pre-signal
+// gate fails. The pid lets the bare-path caller liveness-poll the exact child it
+// spawned so a crash-on-boot is detectable as a real failure.
 //
 // It serializes the entire critical section (revalidate -> signal -> respawn)
 // under the per-user restart lock so two concurrent bounces can never race the
@@ -107,22 +126,23 @@ func ConfirmKillTarget(c *Client, expectPID int) (*HealthStatus, error) {
 // calling this, so the prompt is never held inside the lock. If the lock is held
 // by another live bounce this returns *errRestartLockHeld (see
 // IsRestartLockHeld) WITHOUT signalling.
-func ConfirmAndBounce(c *Client, expectPID int) error {
+func ConfirmAndBounce(c *Client, expectPID int) (int, error) {
 	unlock, err := acquireRestartLock()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer unlock()
 
 	live, err := ConfirmKillTarget(c, expectPID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := pidSignaller(live.PID); err != nil {
-		return fmt.Errorf("stop server (pid %d): %w", live.PID, err)
+		return 0, fmt.Errorf("stop server (pid %d): %w", live.PID, err)
 	}
-	if err := serverRespawner(); err != nil {
-		return fmt.Errorf("respawn server: %w", err)
+	newPID, err := serverRespawner()
+	if err != nil {
+		return 0, fmt.Errorf("respawn server: %w", err)
 	}
-	return nil
+	return newPID, nil
 }

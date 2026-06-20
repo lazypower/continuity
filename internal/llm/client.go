@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"fmt"
+	"os/exec"
 
 	"github.com/lazypower/continuity/internal/config"
 )
@@ -50,4 +51,21 @@ func NewClient(cfg config.LLMConfig) (Client, error) {
 	default:
 		return nil, fmt.Errorf("unknown LLM provider: %q", cfg.Provider)
 	}
+}
+
+// ProviderBinaryUnresolved reports the external CLI binary a provider needs when
+// that binary is NOT resolvable on the current $PATH, or "" when the provider
+// needs no external binary (or its binary is present). It lets serve print one
+// clear startup warning instead of a per-extraction failure buried in the log —
+// the common service-managed case where launchd/systemd lacks the login PATH
+// (issue #41). Providers that don't shell out (anthropic, ollama-over-HTTP)
+// return "".
+func ProviderBinaryUnresolved(cfg config.LLMConfig) string {
+	if cfg.Provider != "claude-cli" {
+		return ""
+	}
+	if _, err := exec.LookPath("claude"); err != nil {
+		return "claude"
+	}
+	return ""
 }

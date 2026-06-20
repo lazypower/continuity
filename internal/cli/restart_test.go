@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/lazypower/continuity/internal/hooks"
 )
@@ -212,6 +213,97 @@ func TestIsDecodeError(t *testing.T) {
 				t.Errorf("isDecodeError() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDecideVerify(t *testing.T) {
+	now := time.Unix(1000, 0)
+	before := now.Add(5 * time.Second)  // deadline in the future
+	passed := now.Add(-1 * time.Second) // deadline already passed
+
+	tests := []struct {
+		name           string
+		deadline       time.Time
+		healthyBounced bool
+		childPID       int
+		childAlive     bool
+		want           verifyState
+	}{
+		{
+			name:           "healthy and bounced confirms (highest priority even past deadline)",
+			deadline:       passed,
+			healthyBounced: true,
+			childPID:       4242,
+			childAlive:     false,
+			want:           verifyConfirmed,
+		},
+		{
+			name:           "bare child dead before healthy is a hard failure",
+			deadline:       before,
+			healthyBounced: false,
+			childPID:       4242,
+			childAlive:     false,
+			want:           verifyFailedDead,
+		},
+		{
+			name:           "bare child still alive within deadline keeps waiting",
+			deadline:       before,
+			healthyBounced: false,
+			childPID:       4242,
+			childAlive:     true,
+			want:           verifyKeepWaiting,
+		},
+		{
+			name:           "bare child alive but deadline passed times out soft",
+			deadline:       passed,
+			healthyBounced: false,
+			childPID:       4242,
+			childAlive:     true,
+			want:           verifyTimedOutSoft,
+		},
+		{
+			name:           "managed (no child) within deadline keeps waiting",
+			deadline:       before,
+			healthyBounced: false,
+			childPID:       0,
+			childAlive:     false,
+			want:           verifyKeepWaiting,
+		},
+		{
+			name:           "managed (no child) past deadline times out soft, never hard-fails",
+			deadline:       passed,
+			healthyBounced: false,
+			childPID:       0,
+			childAlive:     false,
+			want:           verifyTimedOutSoft,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := decideVerify(now, tt.deadline, tt.healthyBounced, tt.childPID, tt.childAlive)
+			if got != tt.want {
+				t.Errorf("decideVerify() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRestartCmdSilencesUsage(t *testing.T) {
+	// A verify timeout / runtime failure must not make cobra dump the usage block,
+	// so restartCmd must declare SilenceUsage.
+	if !restartCmd.SilenceUsage {
+		t.Error("restartCmd.SilenceUsage must be true so runtime errors don't print the flags/usage block")
+	}
+}
+
+func TestRestartCmdHasTimeoutFlag(t *testing.T) {
+	f := restartCmd.Flags().Lookup("timeout")
+	if f == nil {
+		t.Fatal("restart command must expose a --timeout flag")
+	}
+	if f.DefValue != defaultRestartTimeout.String() {
+		t.Errorf("--timeout default = %q, want %q", f.DefValue, defaultRestartTimeout.String())
 	}
 }
 

@@ -28,6 +28,65 @@ func resolveBinaryPath() (string, error) {
 	return resolveBinaryPathFrom(self, pathLoc)
 }
 
+// servicePATH returns the PATH string to bake into a generated launchd plist /
+// systemd unit. A service started by launchd/systemd does NOT inherit the
+// interactive login shell's PATH, so the LLM provider binaries (`claude`,
+// `ollama`) that live in Homebrew / user-local dirs are invisible to the
+// service and extraction silently fails (issue #41).
+//
+// We capture the install-time PATH (the shell that ran `install-service` DOES
+// have the login PATH) and union it with a set of well-known locations so the
+// result is robust even when install happens from a minimal environment. The
+// captured entries come first (user intent wins), then any common dirs not
+// already present are appended. Duplicates and empties are dropped while order
+// is preserved.
+func servicePATH() string {
+	return buildServicePATH(os.Getenv("PATH"), os.Getenv("HOME"))
+}
+
+// buildServicePATH is the pure core of servicePATH, taking the install-time PATH
+// and HOME explicitly so it is unit-testable. When installPATH is empty it still
+// returns a usable PATH built solely from the common defaults.
+func buildServicePATH(installPATH, home string) string {
+	var ordered []string
+	seen := map[string]bool{}
+	add := func(dir string) {
+		if dir == "" || seen[dir] {
+			return
+		}
+		seen[dir] = true
+		ordered = append(ordered, dir)
+	}
+
+	// Captured install-time PATH first — preserves the user's own ordering.
+	for _, dir := range filepath.SplitList(installPATH) {
+		add(strings.TrimSpace(dir))
+	}
+
+	// Then well-known locations the provider binaries commonly live in, so the
+	// service can resolve `claude`/`ollama` even from a minimal install env.
+	defaults := []string{
+		"/opt/homebrew/bin",
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin",
+		"/usr/sbin",
+		"/sbin",
+	}
+	if home != "" {
+		// Claude Code's local install + the conventional user bin dir.
+		defaults = append(defaults,
+			filepath.Join(home, ".claude", "local"),
+			filepath.Join(home, ".local", "bin"),
+		)
+	}
+	for _, dir := range defaults {
+		add(dir)
+	}
+
+	return strings.Join(ordered, string(os.PathListSeparator))
+}
+
 func resolveBinaryPathFrom(self, pathLoc string) (string, error) {
 	selfReal, err := filepath.EvalSymlinks(self)
 	if err != nil {

@@ -231,7 +231,19 @@ func decideRestartAction(hs *hooks.HealthStatus, statusErr error, svc serviceSta
 	return actionRefuse, "a non-continuity process is responding on the configured port; refusing to kill it"
 }
 
-var restartYes bool
+var (
+	restartYes     bool
+	restartTimeout time.Duration
+)
+
+// defaultRestartTimeout is the deadline verifyBounce waits for the bounced server
+// to come back healthy. It is deliberately generous: the FIRST restart after an
+// upgrade runs the schema migration inside store.Open BEFORE the listener binds —
+// including a VACUUM INTO snapshot of the whole DB (observed at 169 MB) — plus
+// launchd/systemd relaunch latency. A flat 10s legitimately under-counts that and
+// reports a false failure on a successful-but-slow restart. 60s comfortably covers
+// the common case; --timeout extends it for very large DBs.
+const defaultRestartTimeout = 60 * time.Second
 
 var restartCmd = &cobra.Command{
 	Use:   "restart",
@@ -245,13 +257,20 @@ process it is about to stop is genuinely continuity. If an unrelated process is
 holding the port, restart refuses.
 
 The new server applies any pending schema migration on boot (a safety snapshot
-is taken automatically before migrating).`,
-	RunE: runRestart,
+is taken automatically before migrating). On the first restart after an upgrade
+this migration + snapshot can take a while on a large database, so restart waits
+patiently (default 60s; raise with --timeout) before reporting a problem.`,
+	// SilenceUsage: a verify timeout or other RUNTIME failure is not a usage
+	// error — cobra must print only the message, never dump the flags/usage block.
+	SilenceUsage: true,
+	RunE:         runRestart,
 }
 
 func init() {
 	restartCmd.Flags().BoolVarP(&restartYes, "yes", "y", false,
 		"skip the confirmation prompt (non-interactive)")
+	restartCmd.Flags().DurationVar(&restartTimeout, "timeout", defaultRestartTimeout,
+		"how long to wait for the server to come back healthy (raise for very large DBs)")
 	rootCmd.AddCommand(restartCmd)
 }
 
@@ -303,7 +322,8 @@ func runRestart(cmd *cobra.Command, args []string) error {
 		if err := platformServiceStart(); err != nil {
 			return fmt.Errorf("start service: %w", err)
 		}
-		return verifyBounce(client, 0)
+		// Manager-owned relaunch: no bare child pid to liveness-check.
+		return verifyBounce(client, 0, 0)
 
 	case actionRestartLaunchd, actionRestartSystemd:
 		if !confirmRestart() {
@@ -319,7 +339,9 @@ func runRestart(cmd *cobra.Command, args []string) error {
 		if err := platformServiceRestart(); err != nil {
 			return fmt.Errorf("restart service: %w", err)
 		}
-		return verifyBounce(client, oldPID)
+		// Manager-owned relaunch: the manager owns the new pid, so we can't
+		// liveness-check a bare child — just poll to the deadline.
+		return verifyBounce(client, oldPID, 0)
 
 	case actionBounceBare:
 		if !confirmRestart() {
@@ -333,14 +355,18 @@ func runRestart(cmd *cobra.Command, args []string) error {
 		// without signalling — if the live endpoint no longer strongly identifies
 		// as this same continuity pid.
 		oldPID := hs.PID
-		if err := hooks.ConfirmAndBounce(client, oldPID); err != nil {
+		newPID, err := hooks.ConfirmAndBounce(client, oldPID)
+		if err != nil {
 			if hooks.IsRestartLockHeld(err) {
 				// A concurrent restart/bounce already holds the lock; do NOT kill.
 				return fmt.Errorf("%v.\n  Wait for it to finish, then re-run `continuity restart` if needed", err)
 			}
 			return fmt.Errorf("bounce server: %w", err)
 		}
-		return verifyBounce(client, oldPID)
+		// BARE path: we spawned newPID ourselves, so if THAT exact child has
+		// already exited we can positively call it a dead-process failure rather
+		// than a slow startup.
+		return verifyBounce(client, oldPID, newPID)
 	}
 
 	return fmt.Errorf("internal: unhandled restart action %q", action)
@@ -361,24 +387,100 @@ func surfaceMigrationNote() {
 	fmt.Println("  note: the restarted server picks up the new binary and applies any pending schema migration (a safety snapshot is taken automatically).")
 }
 
-// verifyBounce polls /api/health until the server comes back healthy, then
-// prints the new version. oldPID, when > 0, lets us detect that the OLD process
-// is truly gone vs. a stale healthy response from a process that never bounced.
-func verifyBounce(client *hooks.Client, oldPID int) error {
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+// verifyState is the outcome of one poll iteration in the restart verify loop,
+// produced by the pure decideVerify so the timing/process logic can be table-
+// tested without real processes or sleeps.
+type verifyState int
+
+const (
+	// verifyKeepWaiting: not yet healthy, deadline not passed, and (for the bare
+	// path) the child we spawned is still alive — keep polling.
+	verifyKeepWaiting verifyState = iota
+
+	// verifyConfirmed: the server came back healthy as a DIFFERENT pid (or any
+	// healthy pid when we had no old pid) — the bounce succeeded.
+	verifyConfirmed
+
+	// verifyFailedDead: BARE path only — the child process we spawned has exited
+	// before becoming healthy. This is a positive, hard failure (crash on boot).
+	verifyFailedDead
+
+	// verifyTimedOutSoft: the deadline passed without a healthy server and we
+	// could NOT positively prove the process died (managed relaunch, or no child
+	// pid to probe). Report softly: it may still be coming up.
+	verifyTimedOutSoft
+)
+
+// decideVerify is the pure core of the restart verify loop. Given the current
+// time, the deadline, whether the endpoint is healthy-and-bounced this poll, and
+// (for the bare path) whether the spawned child is still alive, it returns the
+// next verifyState. It does NO I/O so it is exhaustively unit-testable.
+//
+//   - healthyBounced true                       -> confirmed (highest priority)
+//   - bare child known-dead (childPID>0,!alive) -> failed-dead (positive failure)
+//   - deadline passed                           -> timed-out-soft
+//   - otherwise                                 -> keep-waiting
+//
+// childPID == 0 means "no bare child to probe" (managed relaunch): childAlive is
+// then ignored and a missed deadline always lands on the soft timeout, never a
+// hard failure — we cannot prove a manager-owned process is dead.
+func decideVerify(now, deadline time.Time, healthyBounced bool, childPID int, childAlive bool) verifyState {
+	if healthyBounced {
+		return verifyConfirmed
+	}
+	if childPID > 0 && !childAlive {
+		return verifyFailedDead
+	}
+	if !now.Before(deadline) {
+		return verifyTimedOutSoft
+	}
+	return verifyKeepWaiting
+}
+
+// verifyBounce polls /api/health until the server comes back healthy, then prints
+// the new version. oldPID, when > 0, lets us detect that the OLD process is truly
+// gone vs. a stale healthy response from a process that never bounced. childPID,
+// when > 0, is the exact bare child we spawned — if it exits before becoming
+// healthy we can positively report a dead-process failure instead of a slow one.
+func verifyBounce(client *hooks.Client, oldPID, childPID int) error {
+	deadline := time.Now().Add(restartTimeout)
+	for {
 		hs, err := client.Status()
-		if err == nil && hooks.IsContinuityServer(hs) && (oldPID == 0 || hs.PID != oldPID) {
+		healthyBounced := err == nil && hooks.IsContinuityServer(hs) && (oldPID == 0 || hs.PID != oldPID)
+		childAlive := childPID > 0 && hooks.ProcessAlive(childPID)
+
+		switch decideVerify(time.Now(), deadline, healthyBounced, childPID, childAlive) {
+		case verifyConfirmed:
 			fmt.Printf("Restarted. Server is healthy: %s (pid %d).\n", hs.Version, hs.PID)
 			return nil
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
 
-	home, _ := os.UserHomeDir()
-	return fmt.Errorf(
-		"server did not come back healthy within 10s — it may have failed to start or a migration may have errored.\n  Check the log: %s/.continuity/serve.log",
-		home)
+		case verifyFailedDead:
+			// The bare child we spawned is gone before it ever served — a real
+			// crash-on-boot (e.g. a migration error). This is the only case we
+			// hard-fail with certainty.
+			home, _ := os.UserHomeDir()
+			return fmt.Errorf(
+				"the restarted server process (pid %d) exited before coming up — it likely failed to start or a migration errored.\n  Check the log: %s/.continuity/serve.log",
+				childPID, home)
+
+		case verifyTimedOutSoft:
+			// Deadline passed but we can't prove the process is dead. Do NOT cry a
+			// false failure: a first-upgrade restart migrates + snapshots the DB and
+			// can legitimately exceed the timeout on a large DB. Inform, don't fail.
+			home, _ := os.UserHomeDir()
+			fmt.Printf(
+				"Server has not reported healthy within %s.\n"+
+					"  A first-upgrade restart migrates and snapshots the database before it starts serving,\n"+
+					"  which can take longer than this on a large database — it may still be coming up.\n"+
+					"  Check status with `continuity` or watch the log: %s/.continuity/serve.log\n"+
+					"  (raise the wait with `continuity restart --timeout`).\n",
+				restartTimeout, home)
+			return nil
+
+		case verifyKeepWaiting:
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
 }
 
 // configuredAddr returns the human-facing address the client is targeting, for
