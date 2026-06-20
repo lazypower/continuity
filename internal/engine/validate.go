@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"fmt"
 	"log"
 	"strings"
 	"unicode"
@@ -58,19 +57,19 @@ func sanitizeURIHint(hint string) string {
 func validateCandidate(c memoryCandidate) (memoryCandidate, error) {
 	// Category must be valid
 	if !validCategories[c.Category] {
-		return c, fmt.Errorf("invalid category %q", c.Category)
+		return c, validationErrorf("invalid category %q", c.Category)
 	}
 
 	// Sanitize and validate URI hint
 	c.URIHint = sanitizeURIHint(c.URIHint)
 	if c.URIHint == "" {
-		return c, fmt.Errorf("empty URI hint after sanitization")
+		return c, validationErrorf("empty URI hint after sanitization")
 	}
 
 	// L0 is required
 	c.L0 = strings.TrimSpace(c.L0)
 	if c.L0 == "" {
-		return c, fmt.Errorf("empty L0 abstract")
+		return c, validationErrorf("empty L0 abstract")
 	}
 
 	// Trim all content tiers
@@ -79,7 +78,7 @@ func validateCandidate(c memoryCandidate) (memoryCandidate, error) {
 
 	// L1 must be non-trivial (it's the primary context injection content)
 	if len(c.L1) < minL1Chars {
-		return c, fmt.Errorf("L1 too short (%d chars, min %d)", len(c.L1), minL1Chars)
+		return c, validationErrorf("L1 too short (%d chars, min %d)", len(c.L1), minL1Chars)
 	}
 
 	// Size ceilings — truncate rather than reject, but log it

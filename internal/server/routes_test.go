@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -185,6 +186,204 @@ func testServerWithEngine(t *testing.T) *Server {
 	t.Cleanup(func() { db.Close() })
 	eng := engine.New(db, nil)
 	return New(db, eng, "test-version")
+}
+
+// TestRememberRouteInvalidCategorySurfacesReason is the regression for issue
+// #35: the remember handler used to collapse genuine validation errors into
+// the generic "failed to store memory" string, hiding the actionable reason
+// (e.g. an unknown category) server-side only. The reason must now reach the
+// client verbatim with a 400.
+func TestRememberRouteInvalidCategorySurfacesReason(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	body := `{"category":"feeback","name":"x","summary":"typo'd category","body":"body content long enough to clear the minimum length validation bar."}`
+	req := newTestRequest("POST", "/api/memories", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	got := resp["error"]
+	if got == "failed to store memory" {
+		t.Fatalf("client got the generic message, want the real validation reason; body: %s", w.Body.String())
+	}
+	if !strings.Contains(got, "invalid category") || !strings.Contains(got, "feeback") {
+		t.Errorf("error = %q, want it to name the bad category", got)
+	}
+}
+
+// TestRememberRouteRetractedMatchStillSequestered verifies the issue #35 change
+// did not disturb the retracted-match 409 path: a write that semantically
+// collides with a retracted memory must still get a 409 with matched URIs and
+// NO retraction reasons, not a 400 validation message.
+func TestRememberRouteRetractedMatchStillSequestered(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	// Mirror the engine-level regression ordering (retract_test.go): seed, then
+	// build the TFIDF embedder over the corpus, embed the node so the vector
+	// space has signal, and only then retract. This makes the
+	// dedup-against-retracted gate fire deterministically.
+	ctx := context.Background()
+	const l0 = "operator's mother's maiden name discussed in context"
+	uri, _, err := srv.engine.Remember(ctx, engine.RememberInput{
+		Category: "events", Name: "old-pii-event",
+		Summary: l0,
+		Body:    "Memory body content with more than enough length to pass validation thresholds.",
+		AcknowledgeRetracted: true,
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	embedder, err := engine.NewTFIDFEmbedder(srv.db, 512)
+	if err != nil {
+		t.Fatalf("embedder: %v", err)
+	}
+	srv.engine.SetEmbedder(embedder)
+	n, _ := srv.db.GetNodeByURI(uri)
+	if err := srv.engine.EmbedNode(ctx, n); err != nil {
+		t.Fatalf("embed: %v", err)
+	}
+	if _, err := srv.db.RetractNode(uri, "PII captured accidentally", ""); err != nil {
+		t.Fatalf("retract: %v", err)
+	}
+
+	body := `{"category":"events","name":"new-event","summary":"operator's mother's maiden name from earlier discussion","body":"Different body content with more than enough length to pass validation thresholds."}`
+	req := newTestRequest("POST", "/api/memories", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d (409 retracted-match); body: %s", w.Code, http.StatusConflict, w.Body.String())
+	}
+
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "matches_retracted" {
+		t.Errorf("status = %v, want matches_retracted", resp["status"])
+	}
+	if _, ok := resp["matched_uris"]; !ok {
+		t.Errorf("response missing matched_uris: %s", w.Body.String())
+	}
+	// The retraction reason must stay sequestered — it must not appear anywhere.
+	if strings.Contains(w.Body.String(), "PII") {
+		t.Errorf("retraction reason leaked into 409 response: %s", w.Body.String())
+	}
+}
+
+// TestRetractRouteInvalidURISurfacesReason confirms the same classification was
+// applied to the other write handler: a malformed URI is user input and its
+// reason must reach the client, not be collapsed to "failed to retract memory".
+func TestRetractRouteInvalidURISurfacesReason(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	body := `{"uri":"not-a-mem-uri","reason":"cleanup"}`
+	req := newTestRequest("POST", "/api/memories/retract", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	got := resp["error"]
+	if got == "failed to retract memory" {
+		t.Fatalf("client got the generic message, want the real validation reason; body: %s", w.Body.String())
+	}
+	if !strings.Contains(got, "must start with mem://") {
+		t.Errorf("error = %q, want it to explain the mem:// requirement", got)
+	}
+}
+
+// TestRememberRouteInternalErrorStaysGeneric documents that a non-validation
+// failure (here: a direct URI collision with a retracted tombstone is a
+// validation error, but a true internal error path) is NOT surfaced verbatim.
+// We exercise the closest practical internal-ish path: a retracted-slug
+// collision is classified as validation (safe to surface), while everything
+// the engine does not tag as ValidationError keeps the generic message. This
+// asserts the negative: the generic message is reachable and unchanged.
+func TestRememberRouteValidationVsGenericClassification(t *testing.T) {
+	// Sanity-check the classifier contract the handler relies on: a plain
+	// (non-ValidationError) error must NOT be reported as a validation error,
+	// so the handler falls through to the generic message + server log.
+	if isVal, _ := engine.IsValidationError(context.DeadlineExceeded); isVal {
+		t.Errorf("IsValidationError mis-classified a generic error as validation")
+	}
+	verr := &engine.ValidationError{Message: "invalid category \"feeback\""}
+	if isVal, msg := engine.IsValidationError(verr); !isVal || msg != verr.Message {
+		t.Errorf("IsValidationError(%v) = (%v, %q), want (true, %q)", verr, isVal, msg, verr.Message)
+	}
+}
+
+// TestRememberRouteInternalErrorStaysGenericOverHTTP drives the actual handler
+// with a genuine internal (non-validation) failure: closing the DB before an
+// otherwise-valid POST forces a "check existing" lookup error deep in
+// Engine.Remember, which is NOT a ValidationError. The client must see exactly
+// the generic "failed to store memory" and none of the underlying error text —
+// no DB/SQL/path leak. This is the positive complement to the classifier unit
+// test, exercising the real HTTP path the generic branch guards.
+func TestRememberRouteInternalErrorStaysGenericOverHTTP(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	// Force every subsequent store call to fail with an internal error.
+	srv.db.Close()
+
+	body := `{"category":"preferences","name":"devbox","summary":"Always use devbox","body":"The project uses devbox shell to provide Go and SQLite tools."}`
+	req := newTestRequest("POST", "/api/memories", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["error"] != "failed to store memory" {
+		t.Fatalf("error = %q, want exactly %q (generic, no internal detail)", resp["error"], "failed to store memory")
+	}
+	// Belt-and-suspenders: no internal error vocabulary may leak into the body.
+	for _, leak := range []string{"check existing", "sql", "SQL", "database is closed", "upsert"} {
+		if strings.Contains(w.Body.String(), leak) {
+			t.Errorf("internal detail %q leaked into client response: %s", leak, w.Body.String())
+		}
+	}
+}
+
+// TestRetractRouteStoreDomainRejectionSurfacesReason is the issue #35 follow-up:
+// store-level domain rejections (here, retracting a URI that does not exist) used
+// to fall through Engine.Retract unclassified and collapse into the generic
+// "failed to retract memory". They must now be surfaced as 400 with their real,
+// client-safe reason.
+func TestRetractRouteStoreDomainRejectionSurfacesReason(t *testing.T) {
+	srv := testServerWithEngine(t)
+
+	// Well-formed mem:// URI (passes the engine-level prefix check) that points at
+	// a memory that does not exist — a store-level domain rejection.
+	body := `{"uri":"mem://user/events/does-not-exist","reason":"cleanup"}`
+	req := newTestRequest("POST", "/api/memories/retract", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+
+	var resp map[string]string
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	got := resp["error"]
+	if got == "failed to retract memory" {
+		t.Fatalf("client got the generic message, want the real store-level reason; body: %s", w.Body.String())
+	}
+	if !strings.Contains(got, "not found") {
+		t.Errorf("error = %q, want it to explain the memory was not found", got)
+	}
 }
 
 func TestRememberRoute(t *testing.T) {

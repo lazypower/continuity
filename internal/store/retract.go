@@ -19,6 +19,30 @@ var systemOwnedURIs = map[string]bool{
 	"mem://user/profile/communication": true, // synthesized relational profile; bootstraps session context
 }
 
+// RetractValidationError signals that a retraction was rejected for a
+// user/domain reason (memory not found, target is a directory, system-owned URI,
+// self-supersession, missing successor) rather than an internal failure. Its
+// Message describes the caller's own input — no SQL, no filesystem paths — so
+// the boundary layer may surface it verbatim. Genuinely-internal failures (DB
+// errors) stay plain errors and stay generic at the boundary.
+//
+// store cannot import engine (engine imports store, not vice versa), so engine
+// detects this type via errors.As and re-wraps it as an engine.ValidationError
+// to reuse the existing HTTP-400 classification path. See issue #35.
+type RetractValidationError struct {
+	Message string
+}
+
+func (e *RetractValidationError) Error() string {
+	return e.Message
+}
+
+// retractValidationErrorf constructs a *RetractValidationError with a formatted,
+// client-safe message.
+func retractValidationErrorf(format string, args ...any) error {
+	return &RetractValidationError{Message: fmt.Sprintf(format, args...)}
+}
+
 // RetractNode marks a memory as retracted. The node remains in the database
 // (tombstone, not delete) but is excluded from default reads.
 //
@@ -34,13 +58,13 @@ var systemOwnedURIs = map[string]bool{
 // silently corrupt.
 func (db *DB) RetractNode(uri, reason, supersededBy string) (newly bool, err error) {
 	if uri == "" {
-		return false, fmt.Errorf("uri required")
+		return false, retractValidationErrorf("uri required")
 	}
 	if reason == "" {
-		return false, fmt.Errorf("reason required")
+		return false, retractValidationErrorf("reason required")
 	}
 	if systemOwnedURIs[uri] {
-		return false, fmt.Errorf("system-owned: %s cannot be retracted via the public verb", uri)
+		return false, retractValidationErrorf("system-owned: %s cannot be retracted via the public verb", uri)
 	}
 
 	target, err := db.GetNodeByURI(uri)
@@ -48,10 +72,10 @@ func (db *DB) RetractNode(uri, reason, supersededBy string) (newly bool, err err
 		return false, fmt.Errorf("look up target: %w", err)
 	}
 	if target == nil {
-		return false, fmt.Errorf("memory not found: %s", uri)
+		return false, retractValidationErrorf("memory not found: %s", uri)
 	}
 	if target.NodeType != "leaf" {
-		return false, fmt.Errorf("cannot retract %s node: %s (only leaf memories are retractable)", target.NodeType, uri)
+		return false, retractValidationErrorf("cannot retract %s node: %s (only leaf memories are retractable)", target.NodeType, uri)
 	}
 
 	if target.IsRetracted() {
@@ -60,14 +84,14 @@ func (db *DB) RetractNode(uri, reason, supersededBy string) (newly bool, err err
 
 	if supersededBy != "" {
 		if supersededBy == uri {
-			return false, fmt.Errorf("self-supersession: %s cannot supersede itself", uri)
+			return false, retractValidationErrorf("self-supersession: %s cannot supersede itself", uri)
 		}
 		successor, err := db.GetNodeByURI(supersededBy)
 		if err != nil {
 			return false, fmt.Errorf("look up successor: %w", err)
 		}
 		if successor == nil {
-			return false, fmt.Errorf("successor not found: %s", supersededBy)
+			return false, retractValidationErrorf("successor not found: %s", supersededBy)
 		}
 	}
 

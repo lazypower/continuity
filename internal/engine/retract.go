@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -29,14 +30,23 @@ type RetractInput struct {
 // as a marker — no silent erasure. See issue #12 / RFC for the contract.
 func (e *Engine) Retract(ctx context.Context, input RetractInput) (bool, error) {
 	if !strings.HasPrefix(input.URI, "mem://") {
-		return false, fmt.Errorf("invalid URI %q: must start with mem://", input.URI)
+		return false, validationErrorf("invalid URI %q: must start with mem://", input.URI)
 	}
 	if input.SupersededBy != "" && !strings.HasPrefix(input.SupersededBy, "mem://") {
-		return false, fmt.Errorf("invalid superseded_by URI %q: must start with mem://", input.SupersededBy)
+		return false, validationErrorf("invalid superseded_by URI %q: must start with mem://", input.SupersededBy)
 	}
 
 	newly, err := e.DB.RetractNode(input.URI, input.Reason, input.SupersededBy)
 	if err != nil {
+		// Store-level domain rejections (memory not found, directory node,
+		// system-owned URI, self-supersession, missing successor) are actionable
+		// user input — re-wrap as ValidationError so the HTTP boundary surfaces
+		// the real reason as 400. Internal failures (DB errors) stay plain and
+		// generic. store cannot import engine, hence the cross-layer re-wrap.
+		var rve *store.RetractValidationError
+		if errors.As(err, &rve) {
+			return false, validationErrorf("%s", rve.Message)
+		}
 		return false, err
 	}
 
