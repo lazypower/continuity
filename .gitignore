@@ -27,3 +27,8 @@ cmd/continuity/ui/
 *.db
 *.db-shm
 *.db-wal
+
+# Exception: migration golden fixtures are deliberately committed. They are
+# tiny, seeded images minted from real released binaries (not user data) and
+# feed the hermetic migration regression test. See scripts/gen-migration-fixtures.sh.
+!internal/store/testdata/migration/**/*.db

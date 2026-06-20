@@ -1,0 +1,47 @@
+name: Migration Fixtures
+
+# Real-artifact migration regression guard.
+#
+# The per-PR `ci.yml` e2e job already runs TestMigrationFixtureE2E_* against the
+# COMMITTED golden fixtures (hermetic, fast). This workflow is the heavier
+# scheduled complement: it re-pulls the actual released binaries, mints FRESH
+# database images from them, migrates those forward to head, and verifies the
+# committed goldens still match what the real binaries produce. It catches rot
+# the committed-fixture gate cannot — a re-uploaded release asset, a hand-edited
+# golden, or a historical migration that no longer reproduces.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * 1' # weekly, Monday 07:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  regen-and-verify:
+    runs-on: ubuntu-latest
+    env:
+      # gh release download authenticates with the workflow token.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Re-mint fixtures from real release binaries
+        run: OUT_DIR="$RUNNER_TEMP/fixtures" ./scripts/gen-migration-fixtures.sh
+
+      - name: Migrate freshly-minted images forward (real-artifact e2e)
+        run: |
+          CONTINUITY_FIXTURE_DIR="$RUNNER_TEMP/fixtures" \
+            go test -tags noembed -count=1 -timeout 10m \
+            -run TestMigrationFixtureE2E ./internal/store/
+
+      - name: Drift check — committed goldens vs freshly-minted
+        run: |
+          go run ./scripts/fixturedrift \
+            -committed internal/store/testdata/migration \
+            -fresh "$RUNNER_TEMP/fixtures"

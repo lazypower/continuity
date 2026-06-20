@@ -103,124 +103,49 @@ func buildDBAtVersion(t *testing.T, dir string, target int) string {
 	return path
 }
 
-// seedV5Data inserts a representative mix of rows at v5-era schema (pre-
-// moments, pre-tone, pre-retraction). Every column visible at v5 gets a
-// distinguishable value so a column-misalignment bug post-migration shows
-// up as garbled data, not just a missing column.
+// The seed helpers below delegate to the shared, version-aware seeders in
+// migrationseed.go so the replay-based tests here and the real-artifact tests
+// in migration_fixture_test.go insert byte-identical data. Each opens the DB,
+// runs one shared seed step, and fails the test on error. seedV5Data is the
+// v5 baseline; seedV6Moment / seedV7Tone / seedV8Tombstone layer the v6/v7/v8
+// additions à la carte (the historical call sites add them incrementally).
+
+// seedV5Data inserts the v5-era baseline (pre-moments, pre-tone, pre-retraction).
 func seedV5Data(t *testing.T, dbPath string) {
 	t.Helper()
-	sqlDB, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("seedV5: %v", err)
-	}
-	defer sqlDB.Close()
-
-	now := time.Now().UnixMilli()
-	// One node per v5-valid category to exercise the CHECK constraint range.
-	cats := []string{"profile", "preferences", "entities", "events", "patterns", "cases"}
-	for i, cat := range cats {
-		uri := fmt.Sprintf("mem://user/%s/v5-seed-%d", cat, i)
-		_, err := sqlDB.Exec(`
-			INSERT INTO mem_nodes (
-				uri, node_type, category,
-				l0_abstract, l1_overview, l2_content,
-				mergeable, relevance, last_access, access_count,
-				source_session, created_at, updated_at
-			) VALUES (?, 'leaf', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, uri, cat,
-			fmt.Sprintf("L0 for %s", cat),
-			fmt.Sprintf("L1 overview for %s with enough length", cat),
-			fmt.Sprintf("L2 detail for %s", cat),
-			i%2, 0.75, now, i*3,
-			"v5-test-session", now, now)
-		if err != nil {
-			t.Fatalf("seed mem_node %s: %v", cat, err)
-		}
-	}
-
-	if _, err := sqlDB.Exec(`
-		INSERT INTO sessions (
-			session_id, project, started_at, ended_at, status,
-			message_count, tool_count, extracted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, "v5-test-session", "/tmp/v5-project", now-3600000, now, "completed",
-		7, 3, now); err != nil {
-		t.Fatalf("seed session: %v", err)
-	}
-
-	if _, err := sqlDB.Exec(`
-		INSERT INTO observations (session_id, tool_name, tool_input, tool_response, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, "v5-test-session", "Write", `{"file":"v5.txt"}`, `{"ok":true}`, now); err != nil {
-		t.Fatalf("seed observation: %v", err)
-	}
+	withSeedDB(t, dbPath, seedV5Base)
 }
 
-// seedV7Tone adds a non-NULL tone value to the v5 session, exercising the
-// v7 ALTER TABLE ADD COLUMN tone path.
+// seedV7Tone adds a non-NULL tone value to the v5 session (v7 ALTER path).
 func seedV7Tone(t *testing.T, dbPath string) {
 	t.Helper()
-	sqlDB, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("seedV7Tone: %v", err)
-	}
-	defer sqlDB.Close()
-	if _, err := sqlDB.Exec(`UPDATE sessions SET tone = ? WHERE session_id = ?`,
-		"focused", "v5-test-session"); err != nil {
-		t.Fatalf("set tone: %v", err)
-	}
+	withSeedDB(t, dbPath, seedTone)
 }
 
-// seedV6Moment adds a 'moments' row, exercising the v6-introduced category
-// and the CHECK constraint's downstream survival through v9's table rebuild.
+// seedV6Moment adds a 'moments' row (v6-introduced category).
 func seedV6Moment(t *testing.T, dbPath string) {
 	t.Helper()
-	sqlDB, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("seedV6Moment: %v", err)
-	}
-	defer sqlDB.Close()
-	now := time.Now().UnixMilli()
-	if _, err := sqlDB.Exec(`
-		INSERT INTO mem_nodes (
-			uri, node_type, category,
-			l0_abstract, l1_overview,
-			created_at, updated_at
-		) VALUES (?, 'leaf', 'moments', ?, ?, ?, ?)
-	`, "mem://user/moments/v6-first-gift",
-		"received a thoughtful gift from a mentor",
-		"Detailed body content about the moment with enough length.",
-		now, now); err != nil {
-		t.Fatalf("seed moment: %v", err)
-	}
+	withSeedDB(t, dbPath, seedMoment)
 }
 
-// seedV8Tombstone adds a retracted (tombstoned) mem_node row, exercising
-// the v8 retraction columns and — critically — the v9 INSERT SELECT *
-// rebuild that must carry tombstone_at / tombstone_reason / superseded_by
-// across without misalignment.
+// seedV8Tombstone adds a retracted (tombstoned) mem_node row (v8 retraction
+// columns; load-bearing for the v9 INSERT SELECT * rebuild).
 func seedV8Tombstone(t *testing.T, dbPath string) {
+	t.Helper()
+	withSeedDB(t, dbPath, seedTombstone)
+}
+
+// withSeedDB opens dbPath with the raw sqlite driver, runs one shared seed
+// step, and fails the test on any error.
+func withSeedDB(t *testing.T, dbPath string, step func(*sql.DB) error) {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		t.Fatalf("seedV8Tombstone: %v", err)
+		t.Fatalf("open for seed: %v", err)
 	}
 	defer sqlDB.Close()
-	now := time.Now().UnixMilli()
-	if _, err := sqlDB.Exec(`
-		INSERT INTO mem_nodes (
-			uri, node_type, category,
-			l0_abstract, l1_overview,
-			tombstoned_at, tombstone_reason, superseded_by,
-			created_at, updated_at
-		) VALUES (?, 'leaf', 'events', ?, ?, ?, ?, ?, ?, ?)
-	`, "mem://user/events/v8-retracted-row",
-		"PII captured by mistake",
-		"Original L1 with enough length to look real.",
-		now-1000, "captured operator's home address by accident",
-		"mem://user/events/v8-replacement",
-		now-3600000, now-1000); err != nil {
-		t.Fatalf("seed tombstone: %v", err)
+	if err := step(sqlDB); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
 }
 
