@@ -49,9 +49,9 @@ jobs:
           VERSION=${GITHUB_REF_NAME}
           COMMIT=$(git rev-parse --short HEAD)
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          LDFLAGS="-X github.com/lazypower/continuity/internal/cli.Version=${VERSION}"
-          LDFLAGS="${LDFLAGS} -X github.com/lazypower/continuity/internal/cli.Commit=${COMMIT}"
-          LDFLAGS="${LDFLAGS} -X github.com/lazypower/continuity/internal/cli.BuildDate=${DATE}"
+          LDFLAGS="-X github.com/lazypower/continuity/internal/buildinfo.Version=${VERSION}"
+          LDFLAGS="${LDFLAGS} -X github.com/lazypower/continuity/internal/buildinfo.Commit=${COMMIT}"
+          LDFLAGS="${LDFLAGS} -X github.com/lazypower/continuity/internal/buildinfo.BuildDate=${DATE}"
 
           EXT=""
           if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi

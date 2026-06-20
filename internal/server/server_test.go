@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/lazypower/continuity/internal/buildinfo"
 	"github.com/lazypower/continuity/internal/store"
 )
 
@@ -376,6 +378,30 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 	if body["db"] != true {
 		t.Errorf("db = %v, want true", body["db"])
+	}
+
+	// Compatibility/skew fields (issue #36). JSON numbers decode as float64.
+	if v, ok := body["api_version"].(float64); !ok || int(v) != buildinfo.APIVersion {
+		t.Errorf("api_version = %v, want %d", body["api_version"], buildinfo.APIVersion)
+	}
+	if v, ok := body["schema_head"].(float64); !ok || int(v) != store.HeadSchemaVersion() {
+		t.Errorf("schema_head = %v, want %d", body["schema_head"], store.HeadSchemaVersion())
+	}
+	// schema_current should equal schema_head for a freshly-migrated test DB.
+	if v, ok := body["schema_current"].(float64); !ok || int(v) != store.HeadSchemaVersion() {
+		t.Errorf("schema_current = %v, want %d", body["schema_current"], store.HeadSchemaVersion())
+	}
+	if v, ok := body["pid"].(float64); !ok || int(v) != os.Getpid() {
+		t.Errorf("pid = %v, want %d", body["pid"], os.Getpid())
+	}
+	if _, ok := body["started_at"].(float64); !ok {
+		t.Errorf("started_at missing or wrong type: %v", body["started_at"])
+	}
+	if _, ok := body["db_path"]; !ok {
+		t.Error("db_path field missing")
+	}
+	if _, ok := body["exe"]; !ok {
+		t.Error("exe field missing")
 	}
 }
 
