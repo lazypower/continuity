@@ -12,7 +12,16 @@ LDFLAGS := -X $(CLI_PKG).Version=$(VERSION) \
 
 PLATFORMS := darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64
 
-.PHONY: build test vet clean run ui dist
+.PHONY: build test vet clean run ui dist migration-fixtures
+
+# Regenerate the migration golden fixtures from REAL released binaries.
+# Downloads one published binary per distinct shipped schema (v5/v7/v8), boots
+# each to mint + seed an isolated DB, and writes internal/store/testdata/migration/.
+# Requires: gh (authenticated) + network. The committed fixtures feed the
+# hermetic PR-gate test (TestMigrationFixtureE2E_*); rerun this after shipping a
+# release that introduces a NEW distinct schema.
+migration-fixtures:
+	./scripts/gen-migration-fixtures.sh
 
 ui:
 	devbox run -- bash -c 'cd ui && npm install && npm run build'

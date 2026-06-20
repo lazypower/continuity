@@ -2,12 +2,22 @@ package store
 
 import (
 	"fmt"
+	"os"
 )
 
 type migration struct {
 	Version     int
 	Description string
 	SQL         string
+
+	// Risky marks a migration as one that rebuilds or transforms user data
+	// in ways SQLite's transactional guarantees cannot recover from on
+	// developer error. Triggers an automatic safety snapshot before the
+	// migration runs (see snapshot.go). Set true for full-table rebuilds
+	// (CREATE _new + INSERT SELECT * + DROP + RENAME). Leave false for
+	// additive migrations (CREATE TABLE / ALTER TABLE ADD COLUMN) — those
+	// are reversible enough that the snapshot cost is unjustified.
+	Risky bool
 }
 
 var migrations = []migration{
@@ -111,6 +121,7 @@ CREATE TABLE mem_vectors (
 	{
 		Version:     6,
 		Description: "mem_nodes: add moments category",
+		Risky:       true, // full-table rebuild via INSERT SELECT *; column-order parity is by developer discipline
 		SQL: `
 PRAGMA foreign_keys=OFF;
 
@@ -171,6 +182,7 @@ ALTER TABLE mem_nodes ADD COLUMN superseded_by TEXT;
 	{
 		Version:     9,
 		Description: "mem_nodes: add feedback and reference categories (issue #24)",
+		Risky:       true, // full-table rebuild via INSERT SELECT *; column-order parity is by developer discipline
 		SQL: `
 PRAGMA foreign_keys=OFF;
 
@@ -269,7 +281,8 @@ func (db *DB) migrate() error {
 	// version may carry invariants we cannot uphold (CHECK constraints,
 	// triggers, foreign-key relationships), and silently ignoring them
 	// would risk corrupting the on-disk state. Fail fast with a clear
-	// operator-facing message instead.
+	// operator-facing message instead. Runs before any other setup so a
+	// too-new DB short-circuits before we touch snapshot bookkeeping.
 	var maxApplied int
 	if err := db.QueryRow(
 		`SELECT COALESCE(MAX(version), 0) FROM schema_versions`,
@@ -278,6 +291,13 @@ func (db *DB) migrate() error {
 	}
 	if head := headVersion(); maxApplied > head {
 		return &ErrSchemaTooNew{Found: maxApplied, Supported: head}
+	}
+
+	// Sidecar table for migration-snapshot bookkeeping. Lives outside the
+	// schema_versions migration system because we need it to exist before
+	// any risky migration runs (including v6, the first risky one).
+	if err := db.ensureSnapshotStateTable(); err != nil {
+		return err
 	}
 
 	for _, m := range migrations {
@@ -290,13 +310,41 @@ func (db *DB) migrate() error {
 			continue
 		}
 
+		// Capture the pre-migration schema version BEFORE taking the
+		// snapshot; we need this to record what the snapshot represents.
+		var preVersion int
+		if err := db.QueryRow(
+			`SELECT COALESCE(MAX(version), 0) FROM schema_versions`,
+		).Scan(&preVersion); err != nil {
+			return fmt.Errorf("read pre-version for migration %d: %w", m.Version, err)
+		}
+
+		// Snapshot BEFORE applying a risky migration. If snapshot creation
+		// fails, the migration MUST NOT proceed — that's the safety net
+		// contract. The operator can set CONTINUITY_NO_MIGRATION_SNAPSHOT
+		// to bypass when they've made an explicit decision to.
+		snapPath, err := db.snapshotBeforeRiskyMigration(m)
+		if err != nil {
+			return fmt.Errorf(
+				"snapshot before migration %d: %w "+
+					"(set %s=1 to skip snapshots, knowing you accept the risk)",
+				m.Version, err, EnvNoMigrationSnapshot,
+			)
+		}
+
 		tx, err := db.Begin()
 		if err != nil {
+			if snapPath != "" {
+				_ = os.Remove(snapPath) // migration won't run; snapshot is dead weight
+			}
 			return fmt.Errorf("begin migration %d: %w", m.Version, err)
 		}
 
 		if _, err := tx.Exec(m.SQL); err != nil {
 			tx.Rollback()
+			if snapPath != "" {
+				_ = os.Remove(snapPath)
+			}
 			return fmt.Errorf("migration %d (%s): %w", m.Version, m.Description, err)
 		}
 
@@ -305,11 +353,30 @@ func (db *DB) migrate() error {
 			m.Version, m.Description,
 		); err != nil {
 			tx.Rollback()
+			if snapPath != "" {
+				_ = os.Remove(snapPath)
+			}
 			return fmt.Errorf("record migration %d: %w", m.Version, err)
 		}
 
 		if err := tx.Commit(); err != nil {
+			if snapPath != "" {
+				_ = os.Remove(snapPath)
+			}
 			return fmt.Errorf("commit migration %d: %w", m.Version, err)
+		}
+
+		// Migration committed. Now enroll the snapshot in the tracking
+		// table and prune any older one. A failure here leaves the
+		// snapshot file on disk but unrecorded — `continuity snapshot
+		// prune` can mop up later, and the migration's success is the
+		// load-bearing outcome.
+		if snapPath != "" {
+			if err := db.recordSnapshotAndPruneOlder(snapPath, preVersion, m.Version); err != nil {
+				fmt.Fprintf(os.Stderr,
+					"warning: migration %d succeeded but snapshot %s could not be recorded: %v\n",
+					m.Version, snapPath, err)
+			}
 		}
 	}
 

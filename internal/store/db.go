@@ -53,6 +53,36 @@ func Open(path string) (*DB, error) {
 	return db, nil
 }
 
+// OpenNoMigrate opens the database WITHOUT running migrations. It is for
+// inspection/cleanup commands (`snapshot list`, `snapshot prune`) that must not
+// mutate schema as a side effect of being run. Opening with Open() would apply
+// any pending risky migration — which creates a safety snapshot — so a `prune`
+// against a not-yet-migrated DB would manufacture a snapshot and immediately
+// delete it, silently discarding the only rollback point. Managing snapshot
+// files is not a reason to upgrade the operator's schema.
+//
+// Callers that read sidecar tables (e.g. migration_snapshots) must tolerate
+// those tables being absent — a never-migrated DB has none.
+func OpenNoMigrate(path string) (*DB, error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, fmt.Errorf("create db dir: %w", err)
+	}
+	hardenPermissions(dir, path)
+
+	sqlDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+
+	db := &DB{DB: sqlDB, Path: path}
+	if err := db.configurePragmas(); err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
 // OpenMemory opens an in-memory SQLite database for testing.
 func OpenMemory() (*DB, error) {
 	sqlDB, err := sql.Open("sqlite", ":memory:")

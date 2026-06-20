@@ -1,0 +1,3 @@
+# Migration golden fixtures are minted SQLite images — opaque binaries, not text.
+# Marking them keeps git from attempting line-ending normalization or diffs.
+internal/store/testdata/migration/**/*.db binary

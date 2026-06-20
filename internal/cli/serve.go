@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -164,6 +165,33 @@ func runServe(cmd *cobra.Command, args []string) error {
 		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
+	// Bind the listener explicitly BEFORE advancing the snapshot retention
+	// counter. net.Listen surfaces a bind failure (e.g. the port is already
+	// in use) synchronously — a failed start must NOT count as a boot.
+	// Otherwise SnapshotRetentionBoots failed `serve` attempts in a row would
+	// auto-delete the migration safety snapshot without the migrated schema
+	// ever having served a single request: the exact case the snapshot guards.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+
+	// The listener is bound: this is a genuine "the new schema boots and
+	// serves" signal. Tick retention now, then surface what's still retained.
+	// Deliberately not in store.Open, so CLI subcommands that inspect or prune
+	// snapshots don't advance the counter — only a real serve boot does.
+	if err := db.TickSnapshotRetention(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: snapshot retention tick failed: %v\n", err)
+	}
+	if snaps, _ := db.ListMigrationSnapshots(); len(snaps) > 0 {
+		for _, s := range snaps {
+			fmt.Fprintf(os.Stderr,
+				"migration safety snapshot retained: %s (auto-deletes after %d more successful boots)\n",
+				s.Path, store.SnapshotRetentionBoots-s.BootsSince,
+			)
+		}
+	}
+
 	// Graceful shutdown
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
@@ -171,7 +199,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	go func() {
 		fmt.Fprintf(os.Stderr, "continuity serving on %s\n", addr)
 		fmt.Fprintf(os.Stderr, "  db: %s\n", dbPath)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 			os.Exit(1)
 		}
