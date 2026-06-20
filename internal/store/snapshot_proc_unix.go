@@ -55,22 +55,6 @@ func flockExclusiveNB(f *os.File) (bool, error) {
 	return false, err
 }
 
-// flockDowngradeToShared ATOMICALLY converts the exclusive (LOCK_EX) lock held on
-// h.f's open-file-description down to shared (LOCK_SH), WITHOUT an intervening
-// unlocked window (Finding 1, Round 6; Round 7, Finding 3). flock(2) permits
-// applying LOCK_SH to an fd already holding LOCK_EX as a single in-kernel
-// transition: the lock is never fully released, so no other process can slip an
-// exclusive acquire in between. This is what lets a risky migration run under
-// EXCLUSIVE and then hand the connection a lifetime SHARED hold on the SAME fd
-// with no cross-process gap. h.f is unchanged on unix (the same fd carries the
-// downgraded lock).
-func flockDowngradeToShared(h *dbLockHandle) error {
-	// Blocking form (no LOCK_NB): downgrading EX→SH never has to wait — we already
-	// hold the stronger lock — so this returns immediately, and retrying on EINTR
-	// keeps a signal from spuriously failing the transition.
-	return flockRetryEINTR(h.f, syscall.LOCK_SH)
-}
-
 // flockRetryEINTR calls flock(2) and retries on EINTR (a signal can interrupt a
 // blocking flock). The fd comes from *os.File so it stays valid for the call.
 func flockRetryEINTR(f *os.File, how int) error {
@@ -90,6 +74,18 @@ func flockRetryEINTR(f *os.File, how int) error {
 // way the symlink-following hashFile would (Round 7, Findings 1 & 2).
 func openNoFollow(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+}
+
+// createExclNoFollow CREATES a brand-new file at path with O_CREATE|O_EXCL and
+// O_NOFOLLOW (Round 19, Finding 1). O_EXCL fails if anything already exists at the
+// path (so we can never clobber a planted file), and O_NOFOLLOW makes a
+// pre-planted SYMLINK at the final component fail the create with ELOOP rather
+// than being followed to write through the link. The returned file is provably a
+// fresh, regular, 0-byte file we own. Used by the VACUUM-INTO temp reservation so
+// the reserved path is a real file we created (not removed-then-recreated), which
+// closes the remove→open symlink-plant window. 0600.
+func createExclNoFollow(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 }
 
 // openControlFileNoFollow opens a sidecar control file for reading without

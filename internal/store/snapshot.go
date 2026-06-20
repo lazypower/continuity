@@ -617,6 +617,16 @@ func fsyncFile(path string) error {
 // leaves a published manifest naming non-durable snapshot bytes (Round 9, Finding 1A).
 var hookSnapshotDirFsync func(sidecar string) error
 
+// hookAfterVacuumTempReserved is a TEST-ONLY seam (nil in production). When set it
+// fires inside writeRestorePoint AFTER the VACUUM-INTO temp is reserved (created
+// O_CREATE|O_EXCL|O_NOFOLLOW, left in place) and BEFORE the VACUUM INTO runs — the
+// exact window the round-19 Finding 1 TOCTOU targeted. A test uses it to attempt to
+// plant a symlink at the reserved path; with the no-remove-window fix the path
+// already holds our 0-byte file so the symlink plant fails and VACUUM writes into
+// our owned file (pre-fix the path was freed, so a planted symlink would be
+// followed and the snapshot written outside the sidecar).
+var hookAfterVacuumTempReserved func(tmpPath string)
+
 // hookAfterManifestRename is a TEST-ONLY seam (nil in production). When set it
 // fires inside writeManifestAtomic AFTER manifest.json has been renamed into the
 // sidecar and BEFORE the function returns; a non-nil return makes the manifest
@@ -728,25 +738,53 @@ func createOwnedTemp(dir, prefix, suffix string) (*os.File, string, error) {
 	return nil, "", fmt.Errorf("snapshot: could not create a unique temp in %s", dir)
 }
 
-// reserveOwnedTempName returns a path that is proven free AND owned by this
-// process for a primitive (like VACUUM INTO) that must create the file itself.
-// It O_EXCL-creates a placeholder to prove ownership, then removes that
-// placeholder (safe: we just created it) and returns the now-free path. A
-// caller that hands this path to VACUUM INTO will fail closed if a racing
-// process re-creates it in the meantime — never a clobber of foreign data.
-func reserveOwnedTempName(dir, prefix, suffix string) (string, error) {
-	f, path, err := createOwnedTemp(dir, prefix, suffix)
-	if err != nil {
-		return "", err
+// reserveOwnedTempName is REMOVED (Round 19, Finding 1): it O_EXCL-created a
+// placeholder then REMOVED it before handing the free path to VACUUM INTO, opening
+// a remove→open window in which a symlink could be planted and followed. It is
+// replaced by reserveOwnedTempNoFollow, which leaves a provably-ours 0-byte
+// non-symlink file in place (modernc's VACUUM INTO accepts it).
+
+// reserveOwnedTempNoFollow reserves a VACUUM-INTO temp target with NO
+// remove-then-recreate window (Round 19, Finding 1). It creates the file with
+// O_CREATE|O_EXCL|O_NOFOLLOW (via the per-OS createExclNoFollow) so:
+//   - O_EXCL means we never clobber a pre-existing file at the path;
+//   - O_NOFOLLOW means a SYMLINK pre-planted at the path fails the create rather
+//     than being followed (the prior reserve-then-remove approach REMOVED its
+//     placeholder before handing the free path to VACUUM INTO, and in that
+//     remove→open window an attacker could plant
+//     `snapshot.tmp… -> /tmp/victim`; VACUUM INTO opens
+//     READWRITE|CREATE and only rejects size>0, so it would follow the symlink and
+//     write the snapshot OUTSIDE the sidecar).
+//
+// The created 0-byte file is LEFT IN PLACE and its path returned: modernc/SQLite's
+// VACUUM INTO accepts a pre-existing 0-byte target (it only rejects size>0) and
+// writes into our owned regular file, so there is no window to exploit. The caller
+// must lstat the path again after VACUUM (defense in depth) before trusting it. On
+// the vanishingly rare O_EXCL token collision it retries with a fresh token; it
+// NEVER removes or truncates a pre-existing file. The file's fd is closed before
+// return (VACUUM INTO opens the path itself); the caller owns removing the path.
+func reserveOwnedTempNoFollow(dir, prefix, suffix string) (string, error) {
+	for i := 0; i < tempTokenAttempts; i++ {
+		tok, err := randomToken()
+		if err != nil {
+			return "", err
+		}
+		path := filepath.Join(dir, fmt.Sprintf("%s%d.%s%s", prefix, os.Getpid(), tok, suffix))
+		f, err := createExclNoFollow(path)
+		if err == nil {
+			if cerr := f.Close(); cerr != nil {
+				_ = os.Remove(path)
+				return "", cerr
+			}
+			return path, nil
+		}
+		if !os.IsExist(err) {
+			return "", err
+		}
+		// Collision (someone holds that exact name, or a planted file/symlink is
+		// there): pick a fresh token, never touch the existing entry.
 	}
-	if cerr := f.Close(); cerr != nil {
-		_ = os.Remove(path)
-		return "", cerr
-	}
-	if rerr := os.Remove(path); rerr != nil {
-		return "", rerr
-	}
-	return path, nil
+	return "", fmt.Errorf("snapshot: could not create a unique vacuum temp in %s", dir)
 }
 
 // lineageFingerprint computes sha256 over the DB's per-instance identity AND
@@ -1178,20 +1216,41 @@ func (db *DB) writeRestorePoint(sidecar string, preVersion, target, firstRisky i
 		return failClosed("", err)
 	}
 
-	// VACUUM INTO a temp file inside the sidecar. The name is reserved via an
-	// O_EXCL placeholder (proves ownership, then removed) so we never clobber a
-	// pre-existing snapshot.tmp from another process; VACUUM INTO then creates the
-	// file at that proven-free path. A racing re-create makes VACUUM fail closed
-	// rather than overwrite foreign data (Finding 7).
-	tmpSnap, terr := reserveOwnedTempName(sidecar, "snapshot.tmp.", "")
+	// VACUUM INTO a temp file inside the sidecar. The target is created via
+	// O_CREATE|O_EXCL|O_NOFOLLOW and LEFT IN PLACE — we do NOT remove it before the
+	// VACUUM (Round 19, Finding 1). The prior code removed the O_EXCL placeholder and
+	// handed the now-free path to VACUUM INTO; in that remove→open window an attacker
+	// could plant `snapshot.tmp… -> /tmp/victim`, and because VACUUM INTO opens
+	// READWRITE|CREATE and only rejects a target of size>0, it would FOLLOW the
+	// symlink and write the snapshot OUTSIDE the sidecar. By keeping a provably-ours,
+	// 0-byte, non-symlink file at the path there is no window: modernc/SQLite accepts
+	// the pre-existing 0-byte target (verified empirically) and writes into our file.
+	tmpSnap, terr := reserveOwnedTempNoFollow(sidecar, "snapshot.tmp.", "")
 	if terr != nil {
 		return failClosed("", terr)
+	}
+	// TEST SEAM (Round 19, Finding 1): fires in the reserved→VACUUM window the TOCTOU
+	// targeted. A test tries to plant a symlink at the reserved path here; the fix
+	// keeps our 0-byte file there so the plant fails and VACUUM writes into our file.
+	if hookAfterVacuumTempReserved != nil {
+		hookAfterVacuumTempReserved(tmpSnap)
 	}
 	if _, err := db.Exec(`VACUUM INTO ?`, tmpSnap); err != nil {
 		return failClosed(tmpSnap, fmt.Errorf("snapshot: VACUUM INTO: %w", err))
 	}
 	// From here on, remove tmpSnap (and our partial sidecar) on any failure.
 	cleanupTmp := func() { _ = os.Remove(tmpSnap) }
+	// DEFENSE IN DEPTH (Round 19, Finding 1): before trusting or hashing the snapshot,
+	// lstat the temp and FAIL CLOSED if it is now a symlink or no longer a regular
+	// file. The O_NOFOLLOW create already guarantees we wrote into a real file, but a
+	// post-VACUUM re-check ensures that even if some path swapped the entry we never
+	// hash/publish through a redirection — the snapshot is provably the owned file
+	// inside the sidecar, never a symlink target outside it.
+	if info, lerr := os.Lstat(tmpSnap); lerr != nil {
+		return failClosed(tmpSnap, fmt.Errorf("snapshot: lstat vacuum temp after VACUUM INTO: %w", lerr))
+	} else if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return failClosed(tmpSnap, fmt.Errorf("%w: vacuum temp is not a regular file after VACUUM INTO", ErrSnapshotSidecarCorrupt))
+	}
 
 	// Integrity-check the snapshot.
 	if err := integrityCheck(tmpSnap); err != nil {

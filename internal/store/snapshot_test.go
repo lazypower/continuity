@@ -512,6 +512,115 @@ func TestCorruptSidecarFailsClosed(t *testing.T) {
 	}
 }
 
+// TestCreateRestorePoint_VacuumTempSymlinkRefused is the Round 19 Finding 1 (P1)
+// regression for the VACUUM-INTO temp symlink TOCTOU. The temp was reserved via an
+// O_EXCL placeholder that was REMOVED, then the free path handed to VACUUM INTO —
+// which opens READWRITE|CREATE and only rejects size>0, so in the remove→open window
+// an attacker could plant `snapshot.tmp… -> /victim` and VACUUM would FOLLOW it,
+// writing the snapshot OUTSIDE the sidecar.
+//
+// The fix reserves the temp with O_CREATE|O_EXCL|O_NOFOLLOW and LEAVES it in place
+// (no remove→recreate window). This test drives the exact window via the
+// hookAfterVacuumTempReserved seam: after the temp is reserved and before VACUUM, it
+// (a) asserts the reserved path already holds a real 0-byte regular file (NOT freed),
+// (b) tries to plant a symlink there pointing at an out-of-sidecar victim, which must
+// FAIL because our file occupies the path, and (c) lets VACUUM proceed. The test then
+// asserts the snapshot.db landed as a real regular file INSIDE the sidecar and the
+// victim path was never written. Pre-fix the reserved path was free, the symlink
+// plant would have succeeded, and VACUUM would have written through it to the victim.
+func TestCreateRestorePoint_VacuumTempSymlinkRefused(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	sidecar, _ := sidecarPath(dbPath)
+
+	// An out-of-sidecar victim the attacker's symlink would target.
+	victimDir := t.TempDir()
+	victim := filepath.Join(victimDir, "victim")
+	if err := os.WriteFile(victim, []byte("ORIGINAL VICTIM CONTENT"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var seamFired bool
+	var plantErr error
+	hookAfterVacuumTempReserved = func(tmpPath string) {
+		seamFired = true
+		// (a) The reserved path must ALREADY hold our 0-byte regular file — proof the
+		// remove→open window is gone.
+		info, lerr := os.Lstat(tmpPath)
+		if lerr != nil {
+			t.Errorf("reserved vacuum temp does not exist before VACUUM (remove→open window still open): %v", lerr)
+			return
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() != 0 {
+			t.Errorf("reserved vacuum temp not a 0-byte regular file: mode=%v size=%d", info.Mode(), info.Size())
+		}
+		// (b) Attempt to plant a symlink at the reserved path → must FAIL (our file is
+		// there). Pre-fix the path was free and this would succeed, redirecting VACUUM.
+		plantErr = os.Symlink(victim, tmpPath)
+	}
+	defer func() { hookAfterVacuumTempReserved = nil }()
+
+	db := openWritableNoMigrate(t, dbPath)
+	defer db.Close()
+	if err := db.createRestorePoint(5, headVersion(), 6); err != nil {
+		t.Fatalf("createRestorePoint: %v", err)
+	}
+	if !seamFired {
+		t.Fatal("post-reserve seam did not fire — VACUUM temp reservation path not exercised")
+	}
+	if plantErr == nil {
+		t.Fatal("symlink plant at the reserved vacuum temp SUCCEEDED; the remove→open window is still present")
+	}
+
+	// The snapshot.db must be a real regular file INSIDE the sidecar.
+	snapInfo, err := os.Lstat(snapshotDBPathIn(sidecar))
+	if err != nil {
+		t.Fatalf("snapshot.db missing inside sidecar: %v", err)
+	}
+	if snapInfo.Mode()&os.ModeSymlink != 0 || !snapInfo.Mode().IsRegular() {
+		t.Errorf("snapshot.db inside sidecar is not a regular file: mode=%v", snapInfo.Mode())
+	}
+	if snapInfo.Size() == 0 {
+		t.Error("snapshot.db inside sidecar is empty — VACUUM did not write into our owned file")
+	}
+
+	// The victim outside the sidecar must be UNTOUCHED — VACUUM never followed a
+	// symlink out of the sidecar.
+	got, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatalf("read victim: %v", err)
+	}
+	if string(got) != "ORIGINAL VICTIM CONTENT" {
+		t.Errorf("victim outside the sidecar was overwritten (VACUUM followed a symlink out of the sidecar): %q", string(got))
+	}
+}
+
+// TestCreateExclNoFollow_RefusesPlantedSymlink proves the per-OS no-follow create
+// primitive refuses a pre-planted symlink rather than following it (Round 19,
+// Finding 1) — the property reserveOwnedTempNoFollow relies on.
+func TestCreateExclNoFollow_RefusesPlantedSymlink(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("victim"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "planted")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	f, err := createExclNoFollow(link)
+	if err == nil {
+		f.Close()
+		t.Fatal("createExclNoFollow followed/clobbered a planted symlink; it must fail closed")
+	}
+	// The victim must be untouched.
+	got, _ := os.ReadFile(victim)
+	if string(got) != "victim" {
+		t.Errorf("victim modified through the planted symlink: %q", string(got))
+	}
+}
+
 // TestMigrateFailsClosedOnCorruptSidecar: the full migrate() path must abort
 // before applying any pending migration when a corrupt sidecar blocks the
 // restore point, leaving the schema at v5.
@@ -718,6 +827,65 @@ func TestExpiryLeavesUnprovenFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(sidecar); err != nil {
 		t.Errorf("sidecar dir removed despite stray file present: %v", err)
+	}
+}
+
+// TestExpiry_RemovesOwnedTempLeftover_NoCorruptWedge is the Round 19 Finding 4
+// regression. Auto-expiry removed ONLY snapshot.db + manifest.json and rmdir'd the
+// sidecar only if it was then empty. A crash that left an OWNED temp leftover (a
+// stray snapshot.tmp.* from an aborted VACUUM) beside an otherwise-valid point meant
+// expiry "succeeded" but the sidecar dir PERSISTED holding only the temp — no
+// manifest — which loadValidManifest then reports as a corrupt sidecar, wedging every
+// later run/migration (fail closed forever).
+//
+// The fix makes expiry use the SAME decisive owned-cleanup as prune: it removes ALL
+// owned contents (canonical + owned temp patterns) and rmdir's the empty sidecar. This
+// test plants a leftover snapshot.tmp.* beside a valid point, drives expiry, and
+// asserts the sidecar dir is GONE (no corrupt-sidecar wedge). Pre-fix the snapshot.tmp.*
+// kept the dir alive and a subsequent Status/Open would report the sidecar corrupt.
+func TestExpiry_RemovesOwnedTempLeftover_NoCorruptWedge(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // creates restore point + migrates to head
+	if err != nil {
+		t.Fatal(err)
+	}
+	curV, _ := db.SchemaVersion()
+	db.Close()
+
+	sidecar, _ := sidecarPath(dbPath)
+	if _, err := loadValidManifest(sidecar); err != nil {
+		t.Fatalf("restore point should exist: %v", err)
+	}
+
+	// Plant an OWNED temp leftover (an aborted-VACUUM remnant) beside the valid point.
+	leftover := filepath.Join(sidecar, "snapshot.tmp.12345.deadbeefdeadbeef")
+	if err := os.WriteFile(leftover, []byte("aborted vacuum remnant"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drive expiry (default threshold 3).
+	for i := 0; i < 3; i++ {
+		if err := RecordSuccessfulBoot(dbPath, curV); err != nil {
+			t.Fatalf("boot %d: %v", i, err)
+		}
+	}
+
+	// DECISIVE: the whole sidecar dir must be gone — the owned temp leftover was
+	// cleaned along with snapshot.db + manifest.json, so no manifest-less dir wedges
+	// future runs.
+	if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+		t.Fatalf("sidecar dir persists after expiry with an owned temp leftover (corrupt-sidecar wedge): err=%v", err)
+	}
+
+	// And Status reports a clean, not-present, not-corrupt state — no wedge.
+	st, serr := Status(dbPath)
+	if serr != nil {
+		t.Fatalf("status after expiry: %v", serr)
+	}
+	if st.Present || st.Problem != "" {
+		t.Errorf("status after expiry: present=%v problem=%q, want a clean absent state", st.Present, st.Problem)
 	}
 }
 
@@ -1837,6 +2005,61 @@ func TestRestore_NeverOverwritesExistingBackup(t *testing.T) {
 	}
 }
 
+// TestRestore_BackupPrefixOverwriteRefused is the Round 19 Finding 2 regression for
+// the backup-name TOCTOU. The free backup prefix is computed ONCE
+// (uniquePreRestorePrefix) and exposed in the marker, but the move-aside used
+// os.Rename, which OVERWRITES — so a file created at the backup prefix AFTER it was
+// chosen but BEFORE the move loop would be silently clobbered. The fix lstat's the
+// destination immediately before EACH move-aside rename and FAILS CLOSED if it
+// exists. This test plants a regular file at the chosen prefix via the
+// hookAfterMarkerBeforeMoveAside seam (which fires in exactly that window) and asserts
+// (a) Restore fails closed, and (b) the planted file is NOT overwritten. Pre-fix the
+// rename clobbered it and the restore reported success.
+func TestRestore_BackupPrefixOverwriteRefused(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // creates restore point + migrates to head
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	const sentinel = "PRE-EXISTING BACKUP — DO NOT CLOBBER"
+	var seamFired bool
+	var plantedAt string
+	hookAfterMarkerBeforeMoveAside = func(backupPrefix string) {
+		seamFired = true
+		// Plant a regular file at the exact backup prefix (the "" suffix the move-aside
+		// will try to rename the live DB onto). It appears AFTER the prefix was chosen.
+		plantedAt = backupPrefix
+		if werr := os.WriteFile(backupPrefix, []byte(sentinel), 0o600); werr != nil {
+			t.Errorf("plant backup-prefix file: %v", werr)
+		}
+	}
+	defer func() { hookAfterMarkerBeforeMoveAside = nil }()
+
+	_, rerr := Restore(dbPath)
+	if !seamFired {
+		t.Fatal("move-aside seam did not fire — restore did not reach the move loop")
+	}
+	if rerr == nil {
+		t.Fatal("Restore succeeded despite a pre-existing file at the backup prefix; it must fail closed (never overwrite)")
+	}
+	if !contains(rerr.Error(), "overwrite") && !contains(rerr.Error(), "backup") {
+		t.Errorf("Restore err = %v, want a fail-closed no-overwrite error", rerr)
+	}
+
+	// The planted file must be UNTOUCHED — never renamed over.
+	got, err := os.ReadFile(plantedAt)
+	if err != nil {
+		t.Fatalf("planted backup file vanished (it was overwritten/clobbered): %v", err)
+	}
+	if string(got) != sentinel {
+		t.Errorf("planted backup file was overwritten by the move-aside: %q", string(got))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ROUND 2 Finding 4: an interrupted upgrade continues under the still-covering
 // restore point (reuse), and a COMPLETED/non-covering point fails closed.
@@ -2202,14 +2425,21 @@ func TestCreateOwnedTemp_ExclusiveOwnership(t *testing.T) {
 		t.Errorf("createOwnedTemp returned a colliding path twice: %s", path2)
 	}
 
-	// reserveOwnedTempName returns a proven-free path (file removed after the
-	// O_EXCL placeholder), suitable for VACUUM INTO.
-	reserved, err := reserveOwnedTempName(dir, "v.tmp.", "")
+	// reserveOwnedTempNoFollow returns an owned path whose 0-byte file is LEFT IN
+	// PLACE (no remove→recreate window) for VACUUM INTO (Round 19, Finding 1).
+	reserved, err := reserveOwnedTempNoFollow(dir, "v.tmp.", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(reserved); !os.IsNotExist(err) {
-		t.Errorf("reserved temp name is not free: %v", err)
+	info, serr := os.Lstat(reserved)
+	if serr != nil {
+		t.Fatalf("reserved no-follow temp should exist (left in place): %v", serr)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		t.Errorf("reserved no-follow temp is not a regular file: mode=%v", info.Mode())
+	}
+	if info.Size() != 0 {
+		t.Errorf("reserved no-follow temp should be 0 bytes, got %d", info.Size())
 	}
 }
 
@@ -3648,6 +3878,111 @@ func TestOpen_RiskyUpgrade_BlocksOnForeignExclusive(t *testing.T) {
 	defer chk.Close()
 	if v, _ := chk.SchemaVersion(); v != 5 {
 		t.Errorf("schema advanced to v%d despite failing closed on the foreign exclusive; want v5", v)
+	}
+}
+
+// TestOpen_RiskyUpgrade_ReturnsSharedLock is the Round 19 Finding 3 regression. The
+// risky upgrade ran the destructive DDL under EXCLUSIVE and then handed the caller a
+// connection holding a LIFETIME SHARED lock. The old path did this via an atomic
+// flock EX→SH downgrade plus a Windows "bridge" SHARED lock on byte 1 that OVERLAPPED
+// the [0,2) exclusive range — LockFileEx rejects that overlap with
+// ERROR_LOCK_VIOLATION, so risky migrations could not complete on Windows at all. The
+// fix removes the downgrade/bridge and instead closes the migration conn, releases
+// exclusive, re-acquires SHARED, and reopens. This test asserts the END STATE the
+// downgrade was supposed to produce, on every platform:
+//
+//   - the risky upgrade SUCCEEDS and the DB is migrated to head;
+//   - while the returned conn is OPEN, a concurrent foreign SHARED lock can be taken
+//     (the returned conn holds SHARED, not EXCLUSIVE — many readers coexist);
+//   - while it is open, a concurrent foreign EXCLUSIVE acquire is REFUSED (a restore
+//     is excluded only as long as a writer holds the shared lock);
+//   - after Close(), the foreign EXCLUSIVE acquire SUCCEEDS (the lock was released).
+func TestOpen_RiskyUpgrade_ReturnsSharedLock(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	// Sanity: this open really does take the risky-upgrade transition path.
+	var seamFired bool
+	hookAfterExclusiveReleasedBeforeShared = func() { seamFired = true }
+	defer func() { hookAfterExclusiveReleasedBeforeShared = nil }()
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("risky upgrade Open: %v", err)
+	}
+	if !seamFired {
+		db.Close()
+		t.Fatal("EX→SH seam did not fire — Open did not take the risky-upgrade transition path")
+	}
+	if v, _ := db.SchemaVersion(); v != headVersion() {
+		db.Close()
+		t.Fatalf("schema = v%d after risky upgrade, want head v%d", v, headVersion())
+	}
+
+	lp, err := dbLockPath(dbPath)
+	if err != nil {
+		db.Close()
+		t.Fatalf("dbLockPath: %v", err)
+	}
+
+	// (1) A concurrent foreign SHARED lock must be grantable while the returned conn
+	// is open — proving the returned conn holds SHARED (not EXCLUSIVE). A separate fd
+	// bypasses the in-process registry, so cross-process flock treats it as real.
+	shf, err := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		db.Close()
+		t.Fatalf("open lock file (shared probe): %v", err)
+	}
+	okShared, lerr := flockSharedNB(shf)
+	if lerr != nil {
+		shf.Close()
+		db.Close()
+		t.Fatalf("foreign shared probe errored: %v", lerr)
+	}
+	if !okShared {
+		shf.Close()
+		db.Close()
+		t.Fatal("a foreign SHARED lock was refused while the risky-upgraded conn was open; the returned conn does not hold SHARED (held EXCLUSIVE?)")
+	}
+	shf.Close()
+
+	// (2) A concurrent foreign EXCLUSIVE acquire must be REFUSED while the conn is
+	// open — a restore is excluded as long as a writer holds the shared lock.
+	exf, err := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		db.Close()
+		t.Fatalf("open lock file (exclusive probe): %v", err)
+	}
+	okEx, lerr := flockExclusiveNB(exf)
+	if lerr != nil {
+		exf.Close()
+		db.Close()
+		t.Fatalf("foreign exclusive probe errored: %v", lerr)
+	}
+	if okEx {
+		exf.Close()
+		db.Close()
+		t.Fatal("a foreign EXCLUSIVE acquire SUCCEEDED while the risky-upgraded conn was open; the conn does not hold its shared lock")
+	}
+	exf.Close()
+
+	// (3) After Close, the shared lock is released and a foreign EXCLUSIVE acquire
+	// (a restore) succeeds.
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close risky-upgraded conn: %v", err)
+	}
+	exf2, err := os.OpenFile(lp, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatalf("open lock file (post-close exclusive probe): %v", err)
+	}
+	defer exf2.Close()
+	okEx2, lerr := flockExclusiveNB(exf2)
+	if lerr != nil {
+		t.Fatalf("post-close exclusive probe errored: %v", lerr)
+	}
+	if !okEx2 {
+		t.Fatal("a foreign EXCLUSIVE acquire was refused AFTER Close; the risky-upgrade conn leaked its lock")
 	}
 }
 

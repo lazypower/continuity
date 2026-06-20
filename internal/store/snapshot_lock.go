@@ -116,12 +116,6 @@ type dbLockHandle struct {
 	exclusive bool
 	mu        *sync.RWMutex
 	f         *os.File
-	// bridge is a SECOND lock-file handle the windows EX→SH downgrade holds a
-	// SHARED sub-range lock on so an inter-process lock is held continuously across
-	// the non-atomic downgrade (Round 7, Finding 3). nil on unix (the atomic
-	// flock downgrade needs no bridge) and until a downgrade runs. Closed by
-	// release alongside f.
-	bridge *os.File
 }
 
 // release drops the kernel flock (by closing the fd) then the in-process
@@ -137,11 +131,6 @@ func (h *dbLockHandle) release() {
 			// description. We do not call flockUnlock separately: close is the
 			// canonical drop and avoids a double-unlock race.
 			_ = h.f.Close()
-		}
-		if h.bridge != nil {
-			// The windows downgrade's second (bridge) handle, if any. Closing it
-			// releases its shared sub-range lock.
-			_ = h.bridge.Close()
 		}
 		if h.mu != nil {
 			if h.exclusive {
@@ -364,46 +353,12 @@ func AcquireServeLock(dbPath string) (*ServeLock, error) {
 	return &ServeLock{f: f}, nil
 }
 
-// downgradeExclusiveToShared converts the DB's currently-held EXCLUSIVE lock into
-// the lifetime SHARED hold the returned connection keeps (Finding 1, Round 6),
-// with NO cross-process unlocked window. It is called by openRiskyUpgradeUnderExclusive
-// after the destructive DDL has run, to hand the connection a normal shared
-// lifetime lock without ever releasing the flock to a foreign process.
-//
-// Cross-process: flockDowngradeToShared applies LOCK_SH to the SAME fd that holds
-// LOCK_EX — a single in-kernel transition with no gap a second process can exploit.
-// In-process: the RWMutex is not atomically downgradable, so we drop its write lock
-// and take its read lock around the flock downgrade. That leaves at most an
-// IN-PROCESS window, which is harmless: a same-process restore/migration would
-// itself need the in-process write lock AND the flock, and the flock is never
-// released to a foreign process across this call. The handle's flags flip from
-// exclusive to shared so DB.Close() releases the correct in-process lock.
-func (db *DB) downgradeExclusiveToShared() error {
-	h := db.lock
-	if h == nil || h.mu == nil || h.f == nil {
-		// No real lock to downgrade (:memory:/URI/ineligible). Nothing to do —
-		// these opens never carried a flock anyway.
-		return nil
-	}
-	if !h.exclusive {
-		return fmt.Errorf("internal: downgradeExclusiveToShared on a non-exclusive lock")
-	}
-	// Cross-process downgrade with NO unlocked window (Round 7, Finding 3). On
-	// unix this is the atomic flock EX→SH on the same fd. On windows — which has
-	// no atomic EX→SH — it acquires a SHARED lock on a SECOND handle BEFORE
-	// releasing the EXCLUSIVE one, so an inter-process lock is held CONTINUOUSLY
-	// across the transition and a concurrent restore can never grab EXCLUSIVE in a
-	// gap while the migrated SQLite conn is still live. The handle h.f keeps is
-	// updated to whichever fd now holds the shared lock.
-	if err := flockDowngradeToShared(h); err != nil {
-		return fmt.Errorf("store: flock downgrade ex->sh: %w", err)
-	}
-	// Transition the in-process RWMutex from write to read. The cross-process flock
-	// stays held (shared) across this, so no foreign process can slip in; only same-
-	// process goroutines could observe the brief gap, and they are gated by the same
-	// flock + the in-process lock they would themselves need.
-	h.mu.Unlock()
-	h.mu.RLock()
-	h.exclusive = false
-	return nil
-}
+// NOTE (Round 19, Finding 3): the prior downgradeExclusiveToShared /
+// flockDowngradeToShared / Windows lock-bridge machinery is REMOVED. The risky
+// upgrade now hands back a SHARED-locked conn via a close-conn → release-exclusive
+// → acquire-shared → reopen-conn sequence (openRiskyUpgradeUnderExclusive), so no
+// SQLite handle is open across the lock transition and no atomic downgrade is
+// needed. The Windows bridge attempted a SHARED sub-range lock on byte 1 that
+// overlapped the [0,2) EXCLUSIVE range and failed with ERROR_LOCK_VIOLATION,
+// breaking risky migrations on Windows outright; removing it fixes that and makes
+// the path identical on unix and Windows.

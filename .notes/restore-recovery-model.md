@@ -1,5 +1,81 @@
 # Restore Recovery Model — fail-closed pivot (Round 3)
 
+> **Round 19 update (cross-model):** HARDENING pass — one P1 + three P2, each code
+> fix paired with a regression test that is RED pre-fix. Platform/TOCTOU/cleanup-
+> coverage edges; no new threat classes. See **"Round 19 — VACUUM temp no-remove
+> window, backup no-overwrite, Windows downgrade via close-reopen, decisive expiry"**
+> immediately below; the bar is unchanged.
+
+## Round 19 — VACUUM temp no-remove window, backup no-overwrite, Windows downgrade via close-reopen, decisive expiry
+
+Four edges fixed + pinned by a regression test that is RED pre-fix.
+
+### F1 [P1]. VACUUM-INTO temp symlink TOCTOU — NO remove-then-recreate window
+
+The snapshot VACUUM target was reserved by O_EXCL-creating a placeholder, REMOVING
+it, then handing the now-free path to `VACUUM INTO`. `VACUUM INTO` opens the target
+`READWRITE|CREATE` and only rejects a target of size>0, so in the remove→open window
+an attacker could plant `snapshot.tmp… -> /tmp/victim` and VACUUM would FOLLOW the
+symlink, writing the snapshot OUTSIDE the sidecar. Fix: `reserveOwnedTempNoFollow`
+creates the temp with `O_CREATE|O_EXCL|O_NOFOLLOW` (per-OS `createExclNoFollow`; on
+Windows `CREATE_NEW` + `FILE_FLAG_OPEN_REPARSE_POINT`) and LEAVES the 0-byte file in
+place — there is no window. modernc/SQLite's `VACUUM INTO` ACCEPTS a pre-existing
+0-byte target (verified empirically: it writes the image straight in), so no subdir
+fallback was needed. Defense-in-depth: after VACUUM and before hashing, `lstat` the
+temp and FAIL CLOSED if it is now a symlink/non-regular. The old `reserveOwnedTempName`
+(O_EXCL-then-remove) is deleted. Pinned by `TestCreateRestorePoint_VacuumTempSymlinkRefused`
+(plant a symlink at the reserved path in the reserved→VACUUM seam ⇒ plant fails, snapshot
+lands in our owned file inside the sidecar, the out-of-sidecar victim is untouched) and
+`TestCreateExclNoFollow_RefusesPlantedSymlink`.
+
+### F2 [P2]. Restore backup-name TOCTOU — never `os.Rename` over an existing file
+
+The free pre-restore backup prefix is computed ONCE (`uniquePreRestorePrefix`) and
+exposed in the marker, but the move-aside used `os.Rename`, which OVERWRITES — a file
+created at the prefix after the choice but before the move loop was silently clobbered.
+Fix: immediately before EACH move-aside rename, `lstat` the destination and FAIL CLOSED
+if ANYTHING exists there (any type), rolling back already-moved suffixes. The residual
+sub-microsecond window under a directory-write attacker stays the documented out-of-model
+boundary; this closes the practical/non-adversarial overwrite. Pinned by
+`TestRestore_BackupPrefixOverwriteRefused` (plant a file at the chosen prefix in the
+after-marker/before-move seam ⇒ restore fails closed, planted file untouched).
+
+### F3 [P2]. Windows EX→SH downgrade — REMOVED; replaced by close-reopen
+
+The Round-7 "bridge shared lock on byte 1" overlapped the `[0,2)` exclusive range, so
+`LockFileEx` returned `ERROR_LOCK_VIOLATION` on Windows and risky migrations could not
+complete their downgrade there at all. Fix: REMOVE the atomic-downgrade + Windows bridge
+entirely (`downgradeExclusiveToShared`, `flockDowngradeToShared`, the `bridge` field,
+`hookWindowsDowngradeGap`, and the 2-byte lock range → back to 1). The risky upgrade now
+applies the SAME no-open-handle-across-the-transition pattern to the EX→SH side: after
+the migration completes under EXCLUSIVE, CLOSE the conn, RELEASE exclusive, ACQUIRE
+shared (re-checking the interrupted-restore marker under it), then REOPEN a fresh conn
+under the lifetime SHARED lock. No SQLite handle is open across the release-exclusive →
+acquire-shared window, so no atomic downgrade is needed and the path is identical on
+unix and Windows. In-process RWMutex discipline stays coherent (write during migration,
+read after). Pinned by `TestOpen_RiskyUpgrade_ReturnsSharedLock` (after a risky upgrade
+the returned conn holds SHARED — a concurrent reader can open, a concurrent restore is
+excluded only while the conn is open, and exclusive frees after Close) plus the existing
+`TestOpen_RiskyUpgrade_NoHandleAcrossLockTransition`; the obsolete windows bridge test is
+replaced by `TestWindowsExReleaseThenSharedAcquire`; `GOOS=windows go build` compiles
+with no bridge.
+
+### F4 [P2]. Auto-expiry — DECISIVE owned cleanup (no corrupt-sidecar wedge)
+
+`expireRestorePoint` removed ONLY `snapshot.db` + `manifest.json` and rmdir'd the sidecar
+only if it was then empty. A crash that left an owned `snapshot.tmp.*` beside a valid
+point meant expiry "succeeded" but the sidecar dir PERSISTED holding only the temp — no
+manifest — which `loadValidManifest` then reports as a corrupt sidecar, wedging every
+later run/migration. Fix: factor the owned-cleanup out of prune into the shared
+`removeOwnedSidecarContents` helper (canonical + owned temp patterns, regular-file/
+no-symlink gated) used by BOTH prune and expiry. Expiry now removes ALL owned contents
+and rmdir's the empty sidecar. Because expiry is AUTOMATIC (a boot tick), a residual
+FOREIGN entry is LEFT in place and logged as a WARNING (not an error, not deleted) —
+unlike operator-driven prune, which errors. Pinned by
+`TestExpiry_RemovesOwnedTempLeftover_NoCorruptWedge` (valid point + leftover
+`snapshot.tmp.*` ⇒ after expiry the sidecar dir is gone and Status is clean;
+pre-fix the temp kept the dir alive and Status reported corrupt).
+
 > **Round 13 update (cross-model):** HARDENING pass — three non-critical edges (no
 > P1) plus one doc note, each code fix paired with a regression test that fails
 > pre-fix. No new threat classes; these close a Windows-durability abort, an
@@ -513,15 +589,18 @@ with NO marker, so the next `Open` would fabricate a fresh DB instead of returni
 `ErrRestoreInterrupted` — the data the restore point existed to protect, silently
 destroyed.
 
-### 6. WINDOWS EX→SH DOWNGRADE HOLDS A LOCK CONTINUOUSLY (Finding 3)
+### 6. WINDOWS EX→SH DOWNGRADE HOLDS A LOCK CONTINUOUSLY (Finding 3) — SUPERSEDED BY ROUND 19 F3
 
-Windows has no atomic flock EX→SH. `flockDowngradeToShared` (windows) now takes a
-SHARED lock on a bridge sub-range (byte 1) on a SECOND handle BEFORE releasing the
-EXCLUSIVE primary-range lock, then re-takes SHARED on the primary range. A foreign
-EXCLUSIVE acquirer must lock the WHOLE range and so still conflicts with the bridge
-byte during the unlock/relock window — no fully-unlocked cross-process gap while a
-migrated SQLite conn is live. Unix keeps the atomic single-fd downgrade. Pinned by
-`TestFlockDowngrade_NoForeignExclusiveInGap` (windows seam).
+**This Round-7 bridge approach was REMOVED in Round 19 (F3).** The bridge took a
+SHARED lock on a sub-range (byte 1) that OVERLAPPED the `[0,2)` EXCLUSIVE range held
+on the same lock file; `LockFileEx` rejects a shared request overlapping a range the
+process already holds exclusive with `ERROR_LOCK_VIOLATION`, so the downgrade failed
+and risky migrations could not complete on Windows. There is now NO atomic EX→SH
+downgrade and NO bridge on either platform: the risky upgrade closes its conn,
+releases exclusive, re-acquires shared, and reopens, so no SQLite handle is open
+across the transition (see the Round 19 F3 section at the top). The
+`flockDowngradeToShared` / `downgradeExclusiveToShared` / bridge / 2-byte lock range
+are all deleted.
 
 ### 7. OpenNoMigrate BUILDS A SAFE URI (Finding 7)
 

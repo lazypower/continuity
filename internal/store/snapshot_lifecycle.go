@@ -24,6 +24,12 @@ import (
 // See TestRestore_StaleWALRemovalFailureIsError.
 var hookAfterPublishBeforeWALScrub func(resolvedDB string)
 
+// hookAfterMarkerBeforeMoveAside is a TEST-ONLY seam (nil in production) fired in
+// Restore after the restore marker is written (exposing the chosen backup prefix)
+// and before the move-aside rename loop — the window the Round 19 Finding 2
+// no-overwrite check guards. See TestRestore_BackupPrefixOverwriteRefused.
+var hookAfterMarkerBeforeMoveAside func(backupPrefix string)
+
 // RecordSuccessfulBoot is called by `serve` AFTER a successful TCP bind. It
 // increments successful_boots on a valid active manifest whose
 // target_schema_version <= currentSchemaVersion. When the count reaches the
@@ -90,10 +96,23 @@ func RecordSuccessfulBoot(dbPath string, currentSchemaVersion int) error {
 	return writeManifestAtomic(sidecar, m)
 }
 
-// expireRestorePoint deletes ONLY the validated snapshot.db and manifest.json.
-// The manifest m passed in has already been validated by loadValidManifest, so
-// both files are proven ours. The sidecar directory itself is removed only if
-// it is then empty (we never rmdir a dir that still holds unproven files).
+// expireRestorePoint removes a validated restore point on automatic boot expiry,
+// using the SAME DECISIVE cleanup as the explicit prune (Round 19, Finding 4). The
+// manifest m passed in has already been validated by loadValidManifest, so the
+// canonical files are proven ours.
+//
+// Pre-fix this removed ONLY snapshot.db + manifest.json and rmdir'd the sidecar only
+// if it was then empty. A crash that left a leftover snapshot.tmp.* beside the valid
+// point meant expiry "succeeded" but the sidecar dir PERSISTED without a manifest —
+// which loadValidManifest then reports as a corrupt sidecar, so every later run and
+// migration fails closed (a wedge). The fix removes ALL OWNED sidecar contents
+// (canonical + owned temp patterns, regular-file / no-symlink gated) via the shared
+// removeOwnedSidecarContents helper and rmdir's the now-empty sidecar.
+//
+// Expiry is AUTOMATIC (it runs during a serve boot tick), so unlike the operator-
+// driven prune it does NOT error on a residual foreign entry — it leaves foreign
+// files in place and logs a WARNING rather than failing the boot or claiming a clean
+// dir. It never deletes foreign files.
 func expireRestorePoint(sidecar string, m *Manifest) error {
 	// Re-validate the snapshot one more time immediately before deletion so a
 	// race that corrupted it since load leaves it untouched.
@@ -105,23 +124,26 @@ func expireRestorePoint(sidecar string, m *Manifest) error {
 		return err
 	}
 
-	// DELETION ORDER (Round 12, Finding 1): remove manifest.json FIRST, then
-	// snapshot.db. The manifest is what loadValidManifest keys the restore point on,
-	// so once it is gone the point is logically void — and if the snapshot.db unlink
-	// then fails, the residual snapshot-only sidecar is now PRUNABLE via
-	// `prune --confirm` (pruneKnownSidecarFiles), never a wedge. (The reverse order
-	// would leave a manifest naming an absent snapshot, which is also prunable, but
-	// voiding the manifest first minimizes the window in which a partially-deleted
-	// point still looks loadable.)
-	if err := os.Remove(manifestPathIn(sidecar)); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("snapshot: remove manifest on expiry: %w", err)
+	// DECISIVE cleanup: remove every OWNED entry (canonical files AND owned temp
+	// leftovers like a stray snapshot.tmp.*), so expiry can never leave a
+	// manifest-less sidecar dir behind that wedges future runs. Foreign / non-regular
+	// entries are returned as residual and left untouched.
+	residual, rerr := removeOwnedSidecarContents(sidecar)
+	if rerr != nil {
+		return fmt.Errorf("snapshot: read sidecar dir on expiry: %w", rerr)
 	}
-	if err := os.Remove(snapPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("snapshot: remove snapshot on expiry: %w", err)
+	if len(residual) > 0 {
+		// Foreign material remains — do NOT rmdir, do NOT delete it, do NOT error the
+		// automatic boot. Warn so an operator notices; the owned files are already gone.
+		fmt.Fprintf(os.Stderr,
+			"warning: restore point expired after %d successful boots, but sidecar %s has entries continuity does not own and left in place: %v\n",
+			m.SuccessfulBoots, sidecar, residual)
+		return nil
 	}
-	// Remove the sidecar dir only if empty — leave anything we did not prove.
-	if entries, err := os.ReadDir(sidecar); err == nil && len(entries) == 0 {
-		_ = os.Remove(sidecar)
+
+	// Every entry was ours and removed; the sidecar is now empty — rmdir it.
+	if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("snapshot: remove empty sidecar dir on expiry %s: %w", sidecar, err)
 	}
 	fmt.Fprintf(os.Stderr,
 		"  restore point expired after %d successful boots → removed %s\n",
@@ -403,9 +425,51 @@ func isOwnedSidecarName(name string) bool {
 //   - A FOREIGN entry is NEVER touched — we only ever remove names we recognize as ours.
 //   - The sidecar dir is rmdir'd ONLY if it is left empty afterward.
 func pruneKnownSidecarFiles(sidecar string) error {
-	entries, rerr := os.ReadDir(sidecar)
+	residual, rerr := removeOwnedSidecarContents(sidecar)
 	if rerr != nil {
 		return fmt.Errorf("prune: read sidecar dir: %w", rerr)
+	}
+
+	if len(residual) > 0 {
+		// HONEST: foreign/non-removable entries remain — do NOT rmdir, do NOT claim
+		// success. Name them so the operator can clean up by hand.
+		return fmt.Errorf(
+			"%w: sidecar %s has entries continuity does not own and did not remove: %v; remove them by hand",
+			ErrSnapshotSidecarCorrupt, sidecar, residual)
+	}
+
+	// DECISIVE: every entry was ours and removed; the sidecar is now empty — rmdir it.
+	if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("prune: remove empty sidecar dir %s: %w", sidecar, err)
+	}
+	fmt.Fprintf(os.Stderr, "  pruned partial restore point → removed %s\n", sidecar)
+	return nil
+}
+
+// removeOwnedSidecarContents removes ALL of continuity's OWN sidecar contents — the
+// canonical files (snapshot.db, manifest.json, restore.in-progress.json) AND the
+// owned temp patterns (snapshot.tmp.* / manifest.tmp.* / restore.marker.tmp.* /
+// .restore.staged.*) — each through the regular-file / no-symlink gate, and returns
+// the list of RESIDUAL entries left in place (foreign, or owned-but-not-a-regular-
+// file). It is the SHARED decisive-cleanup primitive used by BOTH the explicit
+// `prune --confirm` (pruneKnownSidecarFiles) and automatic boot expiry
+// (expireRestorePoint), so a sidecar wedged by an aborted creation — e.g. a leftover
+// snapshot.tmp.* beside an otherwise-valid point — is fully cleaned by either path
+// (Round 19, Finding 4). It does NOT rmdir the sidecar; the caller decides what to do
+// with the residual list (prune errors, expiry warns).
+//
+// SAFETY BARS (match the global no-symlink / prove-it-is-ours discipline):
+//   - Each OWNED entry is removed ONLY when lstat shows a REGULAR, non-symlink file. A
+//     symlink / FIFO / device / dir at an owned name is NOT unlinked through; it is
+//     left and surfaced as a residual.
+//   - A FOREIGN entry is NEVER touched — we only ever remove names we recognize as ours.
+//
+// Returns (residual, err) where err is only a read-dir failure; per-entry removal
+// failures are recorded as residual, never fatal.
+func removeOwnedSidecarContents(sidecar string) ([]string, error) {
+	entries, rerr := os.ReadDir(sidecar)
+	if rerr != nil {
+		return nil, rerr
 	}
 
 	var residual []string // entries left in place (foreign, or owned-but-not-regular)
@@ -414,7 +478,7 @@ func pruneKnownSidecarFiles(sidecar string) error {
 		p := filepath.Join(sidecar, name)
 
 		if !isOwnedSidecarName(name) {
-			// FOREIGN: never delete it. Record it so we can fail honestly below.
+			// FOREIGN: never delete it. Record it so the caller can report honestly.
 			residual = append(residual, name)
 			continue
 		}
@@ -438,21 +502,7 @@ func pruneKnownSidecarFiles(sidecar string) error {
 			residual = append(residual, name)
 		}
 	}
-
-	if len(residual) > 0 {
-		// HONEST: foreign/non-removable entries remain — do NOT rmdir, do NOT claim
-		// success. Name them so the operator can clean up by hand.
-		return fmt.Errorf(
-			"%w: sidecar %s has entries continuity does not own and did not remove: %v; remove them by hand",
-			ErrSnapshotSidecarCorrupt, sidecar, residual)
-	}
-
-	// DECISIVE: every entry was ours and removed; the sidecar is now empty — rmdir it.
-	if err := os.Remove(sidecar); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("prune: remove empty sidecar dir %s: %w", sidecar, err)
-	}
-	fmt.Fprintf(os.Stderr, "  pruned partial restore point → removed %s\n", sidecar)
-	return nil
+	return residual, nil
 }
 
 // probeRestorePointAbsent returns ErrNoRestorePoint when there is provably NO
@@ -824,11 +874,38 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		snapshotSHA256: m.SnapshotSHA256,
 	}
 
+	// TEST SEAM (Round 19, Finding 2): fires AFTER the marker (which exposes the
+	// chosen BackupPrefix) is written and BEFORE the move-aside loop — the window in
+	// which a file could appear at the backup prefix and be silently overwritten by
+	// os.Rename. A test plants a file at the prefix here and asserts the move-aside
+	// refuses to overwrite it. nil in production.
+	if hookAfterMarkerBeforeMoveAside != nil {
+		hookAfterMarkerBeforeMoveAside(movedAsidePrefix)
+	}
+
 	// Move the current triplet aside to the unique pre-restore names. We do NOT
 	// delete them — they are crash material and an operator escape hatch.
 	for _, suffix := range movedSuffixes {
 		src := resolvedDB + suffix
 		dst := movedAsidePrefix + suffix
+		// NO-OVERWRITE move-aside (Round 19, Finding 2): the backup prefix was chosen
+		// free once (uniquePreRestorePrefix) and is exposed in the marker, but os.Rename
+		// has OVERWRITE semantics — a file created at dst between that choice and this
+		// loop would be silently clobbered. lstat dst immediately before the rename and
+		// FAIL CLOSED if ANYTHING exists there (regular, symlink, dir — any type): never
+		// rename over an existing file. (The residual sub-microsecond window under a
+		// directory-write attacker is the documented out-of-model boundary; this closes
+		// the practical/non-adversarial overwrite.) We have already moved 0..n suffixes;
+		// finishPendingRestore rolls those back before we abort.
+		if _, lerr := os.Lstat(dst); lerr == nil {
+			_ = finishPendingRestore(cr)
+			_ = os.Remove(staged)
+			return "", fmt.Errorf("restore: refusing to overwrite existing backup %s during move-aside (fail closed)", dst)
+		} else if !os.IsNotExist(lerr) {
+			_ = finishPendingRestore(cr)
+			_ = os.Remove(staged)
+			return "", fmt.Errorf("restore: lstat backup target %s before move-aside: %w", dst, lerr)
+		}
 		if err := os.Rename(src, dst); err != nil {
 			// Roll back whatever we already moved, then clear the marker.
 			_ = finishPendingRestore(cr)
