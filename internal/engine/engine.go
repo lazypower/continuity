@@ -291,7 +291,7 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 	// silently overwriting the tombstone. The agent must choose a different slug
 	// or, if the retraction was wrong, restore via SQL (the friction-bearing path).
 	if existing != nil && existing.IsRetracted() {
-		return "", false, fmt.Errorf("uri %s is retracted; choose a different slug", requestedURI)
+		return "", false, validationErrorf("uri %s is retracted; choose a different slug", requestedURI)
 	}
 
 	// Dedup against retracted memories. Retracted memories must still participate

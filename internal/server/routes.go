@@ -324,6 +324,13 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		// Genuine user-input validation errors (bad category, missing field,
+		// out-of-bounds tier, retracted slug collision) are safe to surface
+		// verbatim. Internal failures stay generic — logged, not leaked.
+		if isValidation, msg := engine.IsValidationError(err); isValidation {
+			jsonError(w, msg, http.StatusBadRequest)
+			return
+		}
 		log.Printf("remember: %v", err)
 		jsonError(w, "failed to store memory", http.StatusBadRequest)
 		return
@@ -376,6 +383,10 @@ func (s *Server) handleRetract(w http.ResponseWriter, r *http.Request) {
 		SupersededBy: req.SupersededBy,
 	})
 	if err != nil {
+		if isValidation, msg := engine.IsValidationError(err); isValidation {
+			jsonError(w, msg, http.StatusBadRequest)
+			return
+		}
 		log.Printf("retract: %v", err)
 		jsonError(w, "failed to retract memory", http.StatusBadRequest)
 		return
