@@ -134,11 +134,13 @@ type SnapshotStatus struct {
 // Status derives the sidecar from dbPath and reports the restore point state
 // WITHOUT opening the DB. Ineligible paths report "not present".
 func Status(dbPath string) (*SnapshotStatus, error) {
-	// A symlinked DB FILE (leaf) is an UNSUPPORTED config, not an absent restore
-	// point: refuse with ErrSymlinkedDBUnsupported (Change 1) rather than report
-	// "not present", matching Open/OpenNoMigrate/Restore/Prune. The operator must
-	// point CONTINUITY_DB at the real file.
-	if err := refuseSymlinkedDBLeaf(dbPath); err != nil {
+	// A symlinked DB FILE (leaf) OR a SQLite URI/DSN path is an UNSUPPORTED config,
+	// not an absent restore point: refuse up front (ErrSymlinkedDBUnsupported /
+	// ErrURIDSNUnsupported) rather than report "not present", matching
+	// Open/OpenNoMigrate/Restore/Prune. The operator must point CONTINUITY_DB at the
+	// real file path. (A URI path would otherwise fall through to sidecarPath, whose
+	// ErrSnapshotUnsupportedPath we report as "not present" — masking the misconfig.)
+	if err := refuseUnsupportedDBPath(dbPath); err != nil {
 		return nil, err
 	}
 	sidecar, err := sidecarPath(dbPath)
@@ -195,6 +197,12 @@ func Status(dbPath string) (*SnapshotStatus, error) {
 // while we waited for the lock must still stop us), so a marker that appears at any
 // point up to the deletion makes prune refuse.
 func Prune(dbPath string) error {
+	// REFUSE AN UNSUPPORTED DB PATH up front (before sidecarPath, which would mask a
+	// URI/DSN as ErrSnapshotUnsupportedPath): a symlinked leaf → ErrSymlinkedDBUnsupported,
+	// a SQLite URI/DSN → ErrURIDSNUnsupported. Matches Open/OpenNoMigrate/Status/Restore.
+	if perr := refuseUnsupportedDBPath(dbPath); perr != nil {
+		return perr
+	}
 	sidecar, err := sidecarPath(dbPath)
 	if err != nil {
 		return err
@@ -269,12 +277,12 @@ func Prune(dbPath string) error {
 //
 // Ineligible paths (:memory:/URI) have no sidecar → ErrNoRestorePoint.
 func probeRestorePointAbsent(dbPath string) error {
-	// A symlinked DB FILE (leaf) is an UNSUPPORTED config, not an absent restore
-	// point (Change 1): Restore/Prune call this FIRST, so refusing here with
-	// ErrSymlinkedDBUnsupported makes both fail closed up front — before any lock
-	// file is created or contended — rather than report ErrNoRestorePoint. The
-	// operator must point CONTINUITY_DB at the real file.
-	if err := refuseSymlinkedDBLeaf(dbPath); err != nil {
+	// A symlinked DB FILE (leaf) OR a SQLite URI/DSN path is an UNSUPPORTED config,
+	// not an absent restore point: Restore/Prune call this FIRST, so refusing here
+	// (ErrSymlinkedDBUnsupported / ErrURIDSNUnsupported) makes both fail closed up
+	// front — before any lock file is created or contended — rather than report
+	// ErrNoRestorePoint. The operator must point CONTINUITY_DB at the real file path.
+	if err := refuseUnsupportedDBPath(dbPath); err != nil {
 		return err
 	}
 	sidecar, err := sidecarPath(dbPath)
@@ -332,6 +340,13 @@ func refuseIfRestoreMarkerPending(dbPath string) error {
 // Returns the directory-prefix of the moved-aside files so the CLI can report
 // where the operator can find the prior DB.
 func Restore(dbPath string) (movedAsidePrefix string, err error) {
+	// REFUSE AN UNSUPPORTED DB PATH up front (before sidecarPath, which would mask a
+	// URI/DSN as ErrSnapshotUnsupportedPath): a symlinked leaf → ErrSymlinkedDBUnsupported,
+	// a SQLite URI/DSN → ErrURIDSNUnsupported. The operator must point CONTINUITY_DB
+	// at the real file path. Matches Open/OpenNoMigrate/Status/Prune.
+	if rerr := refuseUnsupportedDBPath(dbPath); rerr != nil {
+		return "", rerr
+	}
 	sidecar, err := sidecarPath(dbPath)
 	if err != nil {
 		return "", err
@@ -543,6 +558,20 @@ func Restore(dbPath string) (movedAsidePrefix string, err error) {
 		movedSuffixes = append(movedSuffixes, suffix)
 		movedEntries = append(movedEntries, movedEntry{Suffix: suffix, SHA256: sum})
 		movedHashes[suffix] = sum
+	}
+
+	// DEFENSE-IN-DEPTH durability of the staged temp before the marker (Round 10,
+	// Finding 2). The staged BYTES are already fsync'd (copyFileToOpenFd → Sync),
+	// but the staged DIRECTORY ENTRY is not durable until the DB dir is fsync'd —
+	// the first dir-fsync today is AFTER the move-aside (below). fsync the DB dir
+	// here so the `.restore.staged.*` entry is durable before the marker references
+	// it, narrowing the torn window where a crash after the move-aside-rename loses
+	// the staged entry while the backup survives. This is BEST-EFFORT (non-fatal):
+	// recovery's rollback depends ONLY on the provenance-verified BACKUP, not on the
+	// staged file (reconcile CASE B no longer requires stagedPresent), so a
+	// dir-fsync failure here must not abort an otherwise-valid restore.
+	if err := fsyncDir(dbDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: restore: fsync db dir after staging snapshot (defense-in-depth; rollback does not depend on it): %v\n", err)
 	}
 
 	// Write the restore marker BEFORE the first destructive rename. From here a

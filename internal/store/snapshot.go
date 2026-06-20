@@ -136,6 +136,21 @@ var (
 	// point CONTINUITY_DB at the real file. Parent-DIRECTORY symlinks (real leaf)
 	// remain fully supported — only a symlinked LEAF is refused.
 	ErrSymlinkedDBUnsupported = errors.New("store: continuity does not support a symlinked database file")
+	// ErrURIDSNUnsupported is returned when the DB path is a SQLite URI/DSN
+	// spelling (a `file:` scheme, or a DSN query string carrying URI-reserved
+	// bytes like '?'/'#'/'%') that references a REAL on-disk file. Such a path
+	// opens the real DB but is INVISIBLE to the path-owned coordination the
+	// snapshot/restore feature relies on: AcquireServeLock is a no-op for it,
+	// store.Open takes no shared lock, and the interrupted-restore detector
+	// canonicalizes the literal URI string (so it misses the real
+	// `<db>.snapshot/restore.in-progress.json`). serve-via-URI and
+	// restore-via-real-path would then NOT mutually exclude, and crash recovery
+	// via a URI open would miss the marker. Rather than try to recover the real
+	// file from a DSN (the symlinked-leaf bug class's sibling), we FAIL CLOSED at
+	// every DB open and every path-derived snapshot operation BEFORE any
+	// lock/marker/sql.Open. `:memory:` is NOT a URI/DSN in this sense (it has no
+	// file to coordinate) and stays allowed.
+	ErrURIDSNUnsupported = errors.New("store: continuity requires a plain database file path, not a SQLite URI/DSN")
 )
 
 // refuseSymlinkedDBLeaf fails closed with ErrSymlinkedDBUnsupported when the DB
@@ -165,6 +180,59 @@ func refuseSymlinkedDBLeaf(dbPath string) error {
 			ErrSymlinkedDBUnsupported, dbPath)
 	}
 	return nil
+}
+
+// refuseURIDSNPath fails closed with ErrURIDSNUnsupported when dbPath is a SQLite
+// URI/DSN spelling that references a real file: a `file:` scheme OR a `?` DSN
+// query. BOTH were verified to make modernc/SQLite open the REAL db while the
+// LITERAL path string (used for the lock/marker/sidecar derivation) no longer
+// names that file's canonical path — `file:/abs/db?mode=ro` parses as a URI, and
+// a bare `<path>?mode=rwc` opens the real file with the DSN query parsed off. So a
+// serve-via-URI and a restore-via-real-path would not mutually exclude, and crash
+// recovery via the URI would miss the real sidecar marker. We refuse both at the
+// SAME up-front gate as the symlinked leaf, before any MkdirAll/lock/marker/sql.Open.
+//
+// We do NOT refuse a plain path that merely CONTAINS '#'/'%': those are ordinary
+// filesystem bytes and modernc opens such a path as the LITERAL file (verified).
+// snapshotEligiblePath additionally rejects '#'/'%' for SNAPSHOT eligibility
+// (because OpenNoMigrate BUILDS a file: URI from the path via roFileURI, where
+// those bytes are reserved and are percent-escaped) — that is a different concern:
+// such a path still opens the intended real file and is a SUPPORTED plain path
+// here (refusing it would break the reserved-char OpenNoMigrate guarantee).
+//
+// `:memory:` is explicitly NOT a URI/DSN here: it has no on-disk file to
+// coordinate and is the spelling OpenMemory / the whole test suite relies on, so
+// it is allowed through. A plain filesystem path (even one with parent-directory
+// symlinks, or '#'/'%' bytes) is likewise allowed — only `file:`/`?` shapes refuse.
+func refuseURIDSNPath(dbPath string) error {
+	p := strings.TrimSpace(dbPath)
+	if p == "" || p == ":memory:" {
+		return nil
+	}
+	if strings.HasPrefix(p, "file:") || strings.ContainsRune(p, '?') {
+		return fmt.Errorf(
+			"%w; set CONTINUITY_DB to the file path (got %q)",
+			ErrURIDSNUnsupported, dbPath)
+	}
+	return nil
+}
+
+// refuseUnsupportedDBPath is the SINGLE up-front refusal every DB open
+// (store.Open / OpenNoMigrate) and every path-derived snapshot operation
+// (Status / Restore / Prune / AcquireServeLock) runs BEFORE any MkdirAll / lock
+// acquire / marker check / sql.Open. It bundles the two unsupported-path classes
+// that both open a real DB while defeating the path-owned coordination layer:
+//
+//	(1) a symlinked DB FILE (leaf)      → ErrSymlinkedDBUnsupported
+//	(2) a SQLite URI/DSN spelling       → ErrURIDSNUnsupported
+//
+// `:memory:` passes both (it has no file to coordinate). Keeping both checks in
+// one helper means a new entry point cannot add one refusal and forget the other.
+func refuseUnsupportedDBPath(dbPath string) error {
+	if err := refuseSymlinkedDBLeaf(dbPath); err != nil {
+		return err
+	}
+	return refuseURIDSNPath(dbPath)
 }
 
 // snapshotEligiblePath reports whether path can host a path-owned sidecar /
@@ -744,7 +812,14 @@ func (db *DB) ensureUpgradeRestorePoint(preVersion int) error {
 		return nil // fresh install — nothing to restore to
 	}
 
-	firstRisky, hasRisky := firstPendingRiskyVersion(preVersion)
+	// Use the ACTUAL pending set (absent rows), matching the migrator and the
+	// risk-detection gate (Round 10, Finding 3). A MAX-based firstPendingRiskyVersion(
+	// preVersion) would miss a gapped risky migration (MAX=9, row 6 absent) and skip
+	// the restore point even though runPendingMigrations runs the risky v6.
+	firstRisky, hasRisky, ferr := db.firstPendingRiskyMigrationActual()
+	if ferr != nil {
+		return ferr
+	}
 	if !hasRisky {
 		return nil
 	}
@@ -792,7 +867,12 @@ func (db *DB) ensureUpgradeRestorePointLocked(preVersion int) error {
 	if preVersion <= 0 {
 		return nil
 	}
-	firstRisky, hasRisky := firstPendingRiskyVersion(preVersion)
+	// ACTUAL pending set (absent rows), matching the migrator and risk gate (Round
+	// 10, Finding 3) — a gapped risky migration must still get a restore point.
+	firstRisky, hasRisky, ferr := db.firstPendingRiskyMigrationActual()
+	if ferr != nil {
+		return ferr
+	}
 	if !hasRisky {
 		return nil
 	}
@@ -824,6 +904,16 @@ func (db *DB) ensureUpgradeRestorePointLocked(preVersion int) error {
 
 // firstPendingRiskyVersion returns the version of the first risky migration
 // strictly greater than preVersion (i.e. pending), and whether any exists.
+//
+// NOTE: this MAX-version heuristic is NOT a faithful model of which migrations
+// the migrator will run. runPendingMigrations applies ANY migration whose
+// schema_versions ROW IS ABSENT — gaps included — so a gapped/bogus bookkeeping
+// table (e.g. MAX=9 but row 6 missing) would make this report "nothing risky
+// pending" while the migrator still runs the risky v6 rebuild UNPROTECTED
+// (Round 10, Finding 3). The risk-detection call sites therefore use
+// db.firstPendingRiskyMigrationActual (the absent-row set, matching the
+// migrator). This helper is retained only for the manifest `firstRisky` field
+// where preVersion is the verified MAX of a contiguous bookkeeping table.
 func firstPendingRiskyVersion(preVersion int) (int, bool) {
 	for _, m := range migrations {
 		if m.Version > preVersion && m.Risky {
@@ -831,6 +921,38 @@ func firstPendingRiskyVersion(preVersion int) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// firstPendingRiskyMigrationActual computes risk detection from the ACTUAL pending
+// set — exactly the migrations runPendingMigrations will apply: every migration
+// whose schema_versions ROW IS ABSENT, gaps included (Round 10, Finding 3). It
+// returns the version of the FIRST (lowest, in migration order) pending risky
+// migration and whether any pending migration is risky.
+//
+// This is what aligns the snapshot trigger with the real migrator: a gapped
+// bookkeeping table (MAX=9 but row 6 absent) now reports the missing risky v6 as
+// pending, so a restore point is created before it runs — instead of the MAX-based
+// heuristic seeing nothing pending and letting the risky rebuild run unprotected.
+// It reads through the idempotent schema_versions create the caller has already
+// ensured; a pure read otherwise.
+func (db *DB) firstPendingRiskyMigrationActual() (firstRisky int, hasRisky bool, err error) {
+	for _, m := range migrations {
+		var count int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM schema_versions WHERE version = ?", m.Version,
+		).Scan(&count); err != nil {
+			return 0, false, fmt.Errorf("check migration %d pending: %w", m.Version, err)
+		}
+		if count > 0 {
+			continue // already applied — migrator skips it
+		}
+		// Absent row → the migrator WILL run this migration. If it is risky, it is
+		// the first pending risky migration (migrations is in ascending order).
+		if m.Risky {
+			return m.Version, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 // createRestorePoint writes (or reuses) the sidecar restore point, ACQUIRING

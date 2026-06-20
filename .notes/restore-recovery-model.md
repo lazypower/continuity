@@ -1,5 +1,78 @@
 # Restore Recovery Model — fail-closed pivot (Round 3)
 
+> **Round 10 update (Codex):** the symlinked-leaf refusal had a SIBLING plus a
+> too-strict recovery case and a risk-detection gap. Four fixes, each with a
+> regression test that fails pre-fix. See **"Round 10 — URI/DSN refusal, rollback
+> needs the backup, pending-set risk detection"** immediately below; the bar is
+> unchanged.
+
+## Round 10 — URI/DSN refusal, rollback needs the backup, pending-set risk detection
+
+### F1 + F4. REFUSE SQLite URI/DSN DB PATHS (the symlinked-leaf SIBLING)
+
+A SQLite URI/DSN path (`file:/abs/db?mode=rwc`, or any path carrying a URI-reserved
+`?`/`#`/`%`) opens the REAL database but is INVISIBLE to the path-owned coordination
+the snapshot/restore feature relies on: `AcquireServeLock` is a no-op for it,
+`store.Open` takes no shared lock, and `detectRestoreInterrupted` canonicalizes the
+LITERAL URI string (so it misses the real `<db>.snapshot/restore.in-progress.json`).
+serve-via-URI and restore-via-real-path therefore did NOT mutually exclude, and
+crash recovery via a URI open missed the marker — the exact sibling of the
+symlinked-leaf bug. Fix: a new `refuseURIDSNPath` (sentinel `ErrURIDSNUnsupported`,
+message *"continuity requires a plain database file path, not a SQLite URI/DSN; set
+CONTINUITY_DB to the file path"*) is bundled with `refuseSymlinkedDBLeaf` into ONE
+up-front gate `refuseUnsupportedDBPath`, run as the FIRST line of `store.Open` /
+`store.OpenNoMigrate` and at the head of `Status` / `Restore` / `Prune` —
+BEFORE any MkdirAll / lock / marker / `sql.Open`. So serve + every `openDB()` CLI
+command + Status/Restore/Prune fail closed on a URI/DSN with no lock/sidecar/marker
+touched. `:memory:` is explicitly NOT a URI/DSN (no file to coordinate) and stays
+allowed — `OpenMemory` and the whole `:memory:` test suite are unaffected. F4: the
+same gate is also the FIRST line of `AcquireServeLock` (which serve calls BEFORE
+`store.Open`), so NO `<db>.serve.lock` is created for a symlinked-leaf OR URI/DSN
+path — the serve-lock-before-refusal window is closed. Pinned by
+`TestSnapshot_URIDSNPath_Unsupported` (Open/OpenNoMigrate/AcquireServeLock/Status/
+Restore/Prune all fail closed with `ErrURIDSNUnsupported`, no lock/sidecar/serve-lock
+created, `OpenMemory(:memory:)` still works) and the existing symlinked-leaf test
+(now also covering the no-`.serve.lock` property through the shared gate).
+
+### F2. ROLLBACK NEEDS THE BACKUP, NOT THE STAGED SNAPSHOT (reconcile CASE B)
+
+A crash AFTER the live DB was renamed to `<db>.pre-restore.<token>` but BEFORE the
+DB-dir fsync can leave the `.restore.staged.*` entry (never dir-synced) VANISHED
+while the provenance-hash-verified backup SURVIVES — `livePresent=false`,
+`dbBackupPresent=true`, `stagedPresent=FALSE`. CASE B required `stagedPresent`, so
+reconcile fell through to the generic corrupt-state error and WEDGED the DB even
+though the backup ALONE is sufficient to roll back. Fix: CASE B now fires on
+`!livePresent && dbBackupPresent` (no `stagedPresent` requirement) — the rollback
+restores the BACKUP (`rollbackReconciled` → `verifyMovedBackupProvenance`, all
+provenance/symlink/canonical checks intact); the staged copy is only the forward
+image we DROP, and `removeProvenStaged` no-ops a missing staged file. Defense in
+depth: forward `Restore` now also best-effort `fsyncDir(dbDir)` after staging and
+before the marker, so the staged entry is durable before the marker references it —
+but the rollback does NOT depend on it (a fsync failure there is non-fatal). Pinned
+by `TestReconcile_RollsBackWhenStagedMissingButBackupSurvives` (torn state, backup
+present + verified, staged MISSING ⇒ reconcile rolls back and clears the marker;
+fails pre-fix with the corrupt-state wedge).
+
+### F3. RISK DETECTION USES THE ACTUAL PENDING SET, NOT MAX(version)
+
+`runPendingMigrations` applies ANY migration whose `schema_versions` ROW IS ABSENT
+(gaps included), but risk detection used `firstPendingRiskyVersion(maxApplied)` —
+keyed to MAX(version). A gapped/bogus bookkeeping table (MAX=9 but row 6 absent)
+made the MAX-based heuristic see nothing risky pending while the migrator still ran
+the risky v6 mem_nodes rebuild UNPROTECTED (no restore point). Fix: a new
+`db.firstPendingRiskyMigrationActual()` computes the pending set EXACTLY as the
+migrator does (per-migration `COUNT(*) ... WHERE version = ?` → absent rows) and
+reports the first pending RISKY migration. All four risk-detection call sites
+(`riskyUpgradePending`, `migrate`'s `riskyUpgrade` gate, and BOTH
+`ensureUpgradeRestorePoint`/`ensureUpgradeRestorePointLocked` — which also needed it
+so the restore point isn't skipped for the gapped risky migration) now use it; the
+`maxApplied > 0` fresh-install gate is unchanged. `firstPendingRiskyVersion` is
+retained only for the manifest `first_risky` field where preVersion is a verified
+contiguous MAX. Pinned by `TestMigrate_GappedSchemaVersions_SnapshotsBeforeMissingRiskyV6`
+(v5-shaped DB + bogus rows 7/8/9 so MAX=9, row 6 absent ⇒ Open creates a restore
+point recording first_risky=6 before running the missing risky v6; fails pre-fix
+with "no restore point").
+
 > **Round 9 update (Codex):** DURABILITY-AUDIT pass + a control-file read gap and
 > a documented threat-model boundary. The ninth review found the durability
 > ordering was applied per-spot but not UNIFORMLY: some fsyncs that a later

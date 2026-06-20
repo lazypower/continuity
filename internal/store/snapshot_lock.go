@@ -325,6 +325,16 @@ func (s *ServeLock) Release() {
 //
 // Ineligible paths (:memory:/URI/DSN) cannot host a lock file → a no-op handle.
 func AcquireServeLock(dbPath string) (*ServeLock, error) {
+	// REFUSE AN UNSUPPORTED DB PATH BEFORE creating <db>.serve.lock (Finding 4):
+	// serve calls AcquireServeLock before store.Open, so without this guard a
+	// symlinked-leaf or URI/DSN path would have its serve lock file created (or, for
+	// a URI, a no-op handle returned that silently lets serve proceed unprotected)
+	// before Open's refusal ever ran. Refusing here means NO <db>.serve.lock is
+	// touched for an unsupported path and serve fails closed at the first lock call.
+	// A symlinked leaf → ErrSymlinkedDBUnsupported; a URI/DSN → ErrURIDSNUnsupported.
+	if err := refuseUnsupportedDBPath(dbPath); err != nil {
+		return nil, err
+	}
 	if !snapshotEligiblePath(dbPath) {
 		return &ServeLock{}, nil
 	}

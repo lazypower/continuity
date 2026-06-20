@@ -734,10 +734,23 @@ func reconcilePendingRestore(cr *canonicalRestore) error {
 		return removeRestoreMarker(cr.sidecar)
 	}
 
-	// CASE B — genuine pre-publish torn state: the live DB is gone, the original
-	// was moved aside (DB backup present), and a staged image is waiting. Roll
-	// back to the moved-aside original after proving its provenance.
-	if !livePresent && dbBackupPresent && stagedPresent {
+	// CASE B — genuine pre-publish torn state: the live DB is gone and the original
+	// was moved aside (DB backup present). Roll back to the moved-aside original
+	// after proving its provenance.
+	//
+	// ROLLBACK NEEDS THE BACKUP, NOT THE STAGED SNAPSHOT (Round 10, Finding 2). The
+	// rollback restores the provenance-hash-verified BACKUP over the live name; the
+	// `.restore.staged.*` copy is only the forward image we DROP (removeProvenStaged
+	// no-ops a missing staged file). A crash AFTER the live DB was renamed to
+	// `<db>.pre-restore.<token>` but BEFORE the DB-dir fsync can leave the staged
+	// entry (never dir-synced) vanished while the backup survives — livePresent=false,
+	// dbBackupPresent=true, stagedPresent=false. Requiring stagedPresent here wedged
+	// that torn state in the generic fail-closed below even though the verified backup
+	// ALONE is sufficient to roll back. We therefore no longer require stagedPresent —
+	// the rollback depends only on the backup proving out. All provenance / symlink /
+	// canonical-path checks on the backup are kept (verifyMovedBackupProvenance runs
+	// inside rollbackReconciled before any rename).
+	if !livePresent && dbBackupPresent {
 		// Provenance: the DB backup must hash to the recorded original. A planted
 		// or corrupt <db>.pre-restore.* can never be renamed over the DB.
 		if cr.originalDBSHA256 == "" {

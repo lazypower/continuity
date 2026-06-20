@@ -4863,3 +4863,232 @@ func TestManagedFileGate_SymlinkOrFIFORejected(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// ===========================================================================
+// Round 10 regressions (Codex cross-model review)
+// ===========================================================================
+
+// TestSnapshot_URIDSNPath_Unsupported is the Round-10 Finding-1 (the symlink
+// sibling) + Finding-4 regression. A SQLite URI/DSN path (`file:/abs/db?mode=rwc`)
+// opens the REAL db but bypasses the path-owned coordination layer: AcquireServeLock
+// is a no-op for it, store.Open takes no shared lock, and the interrupted-restore
+// detector canonicalizes the literal URI string and misses the real sidecar marker.
+// Open / OpenNoMigrate / serve(AcquireServeLock) / Status / Restore / Prune must all
+// FAIL CLOSED with ErrURIDSNUnsupported and create NO lock/sidecar/serve-lock file,
+// while OpenMemory(:memory:) stays allowed. Pre-fix Open/OpenNoMigrate SUCCEEDED on
+// the URI and AcquireServeLock returned a no-op handle, so this fails before the fix.
+func TestSnapshot_URIDSNPath_Unsupported(t *testing.T) {
+	dir := t.TempDir()
+	realDB := filepath.Join(dir, "real.db")
+	buildDBAtVersionStandalone(t, realDB, 5)
+
+	// A `file:` URI and a bare DSN-query spelling, both pointing at the real file.
+	uriPaths := []string{
+		"file:" + realDB + "?mode=rwc",
+		realDB + "?mode=rwc", // DSN query without the file: scheme (reserved '?')
+		"file://" + realDB,
+	}
+
+	for _, p := range uriPaths {
+		p := p
+		t.Run(p, func(t *testing.T) {
+			if db, oerr := Open(p); !errors.Is(oerr, ErrURIDSNUnsupported) {
+				if db != nil {
+					db.Close()
+				}
+				t.Fatalf("Open(%q): err = %v, want ErrURIDSNUnsupported", p, oerr)
+			}
+			// Message must be actionable: name the path + point at CONTINUITY_DB.
+			if _, oerr := Open(p); oerr == nil ||
+				!contains(oerr.Error(), "CONTINUITY_DB") {
+				t.Errorf("Open(%q) message not actionable: %v", p, oerr)
+			}
+			if rdb, oerr := OpenNoMigrate(p); !errors.Is(oerr, ErrURIDSNUnsupported) {
+				if rdb != nil {
+					rdb.Close()
+				}
+				t.Errorf("OpenNoMigrate(%q): err = %v, want ErrURIDSNUnsupported", p, oerr)
+			}
+			// serve's first call (AcquireServeLock) must refuse BEFORE creating a
+			// serve lock file (Finding 4).
+			if sl, slErr := AcquireServeLock(p); !errors.Is(slErr, ErrURIDSNUnsupported) {
+				if sl != nil {
+					sl.Release()
+				}
+				t.Errorf("AcquireServeLock(%q): err = %v, want ErrURIDSNUnsupported", p, slErr)
+			}
+			if _, serr := Status(p); !errors.Is(serr, ErrURIDSNUnsupported) {
+				t.Errorf("Status(%q): err = %v, want ErrURIDSNUnsupported", p, serr)
+			}
+			if _, rerr := Restore(p); !errors.Is(rerr, ErrURIDSNUnsupported) {
+				t.Errorf("Restore(%q): err = %v, want ErrURIDSNUnsupported", p, rerr)
+			}
+			if perr := Prune(p); !errors.Is(perr, ErrURIDSNUnsupported) {
+				t.Errorf("Prune(%q): err = %v, want ErrURIDSNUnsupported", p, perr)
+			}
+		})
+	}
+
+	// NO lock / sidecar / serve-lock / marker file was created beside the real DB:
+	// every refusal happened before any file touch.
+	for _, suffix := range []string{snapshotSidecarSuffix, ".lock", ".serve.lock"} {
+		if _, statErr := os.Lstat(realDB + suffix); !os.IsNotExist(statErr) {
+			t.Errorf("a %s file was created beside the real DB on a refused URI/DSN op: %v", suffix, statErr)
+		}
+	}
+
+	// :memory: must STAY ALLOWED — it has no file to coordinate and the whole test
+	// suite relies on it. OpenMemory and a bare-:memory: AcquireServeLock both work.
+	mdb, merr := OpenMemory()
+	if merr != nil {
+		t.Fatalf("OpenMemory(:memory:) must stay allowed, got: %v", merr)
+	}
+	mdb.Close()
+	if sl, slErr := AcquireServeLock(":memory:"); slErr != nil {
+		t.Errorf("AcquireServeLock(:memory:) must stay allowed (no-op), got: %v", slErr)
+	} else {
+		sl.Release()
+	}
+}
+
+// TestReconcile_RollsBackWhenStagedMissingButBackupSurvives is the Round-10
+// Finding-2 regression. A crash AFTER the live DB was renamed to
+// <db>.pre-restore.<token> but BEFORE the DB-dir fsync can leave the
+// `.restore.staged.*` entry (never dir-synced) vanished while the backup survives:
+// livePresent=false, dbBackupPresent=true, stagedPresent=FALSE. The
+// provenance-hash-verified BACKUP alone is sufficient to roll back. Pre-fix CASE B
+// required stagedPresent, so reconcile fell through to the corrupt-state error and
+// WEDGED the DB; this test fails before the fix and passes after.
+func TestReconcile_RollsBackWhenStagedMissingButBackupSurvives(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	buildDBAtVersionStandalone(t, dbPath, 5)
+	db, err := Open(dbPath) // migrate to head + create a VALID restore point
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sidecar, _ := sidecarPath(dbPath)
+	resolved, _ := resolveDBPath(dbPath)
+
+	// Manufacture the torn state: record provenance, move the triplet aside, write a
+	// not-yet-published marker that NAMES a staged path — but DO NOT create the
+	// staged file (it vanished before the DB-dir fsync). Live DB MISSING.
+	origSum, _, err := hashFile(resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupPrefix := resolved + ".pre-restore.stagedmissing"
+	staged := filepath.Join(filepath.Dir(resolved), ".restore.staged.stagedmissing.db")
+	var moved []string
+	var movedEntries []movedEntry
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := resolved + suffix
+		if _, statErr := os.Lstat(src); statErr != nil {
+			continue
+		}
+		sum, _, hErr := hashFile(src)
+		if hErr != nil {
+			t.Fatal(hErr)
+		}
+		if err := os.Rename(src, backupPrefix+suffix); err != nil {
+			t.Fatal(err)
+		}
+		moved = append(moved, suffix)
+		movedEntries = append(movedEntries, movedEntry{Suffix: suffix, SHA256: sum})
+	}
+	// Sanity: the staged file is genuinely absent (the crux of the torn state).
+	if _, statErr := os.Lstat(staged); !os.IsNotExist(statErr) {
+		t.Fatalf("test setup: staged file unexpectedly present: %v", statErr)
+	}
+	mk := &restoreMarker{
+		Version: 1, RestoredDBPath: resolved, StagedPath: staged,
+		BackupPrefix: backupPrefix, MovedSuffixes: moved, DBPublished: false,
+		OriginalDBSHA256: origSum,
+		MovedEntries:     movedEntries,
+	}
+	if err := writeRestoreMarkerAtomic(sidecar, mk); err != nil {
+		t.Fatal(err)
+	}
+
+	// Explicit recovery must ROLL BACK to the provenance-verified backup (NOT wedge):
+	// the backup alone is sufficient even though the staged file is gone.
+	if err := recoverPendingRestore(dbPath); err != nil {
+		t.Fatalf("recover must roll back to the surviving backup, got: %v", err)
+	}
+	// The original DB is back at the live name and openable.
+	rdb, err := OpenNoMigrate(dbPath)
+	if err != nil {
+		t.Fatalf("original DB not restored by rollback: %v", err)
+	}
+	rdb.Close()
+	// Marker cleared; the moved-aside backup consumed (renamed back).
+	if _, err := os.Stat(restoreMarkerPathIn(sidecar)); !os.IsNotExist(err) {
+		t.Errorf("marker survived rollback (DB wedged?)")
+	}
+	if _, err := os.Lstat(backupPrefix); !os.IsNotExist(err) {
+		t.Errorf("main-DB backup not consumed by rollback")
+	}
+}
+
+// TestMigrate_GappedSchemaVersions_SnapshotsBeforeMissingRiskyV6 is the Round-10
+// Finding-3 regression. runPendingMigrations applies ANY migration whose
+// schema_versions ROW IS ABSENT (gaps included), but risk detection used
+// MAX(version). A bogus/gapped bookkeeping table — MAX=9 but row 6 ABSENT — made the
+// MAX-based heuristic see nothing risky pending while the migrator still ran the
+// risky v6 mem_nodes rebuild UNPROTECTED (no restore point). With risk detection
+// computed from the ACTUAL pending set, Open must create a restore point BEFORE
+// running the missing risky v6. Pre-fix no sidecar is created; this test fails then.
+func TestMigrate_GappedSchemaVersions_SnapshotsBeforeMissingRiskyV6(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "continuity.db")
+	// Build a v5-SHAPED DB: tables/rows for migrations 1..5 applied (so the v6
+	// rebuild's `INSERT ... SELECT * FROM mem_nodes` runs against the v5 schema).
+	buildDBAtVersionStandalone(t, dbPath, 5)
+
+	// Insert BOGUS schema_versions rows for 7, 8, 9 (NOT their SQL) so MAX(version)=9
+	// while row 6 is ABSENT. The MAX-based heuristic (firstPendingRiskyVersion(9))
+	// would see no risky pending; the real migrator still runs the absent risky v6.
+	func() {
+		sqlDB, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sqlDB.Close()
+		for _, v := range []int{7, 8, 9} {
+			if _, err := sqlDB.Exec(
+				`INSERT INTO schema_versions (version, description) VALUES (?, ?)`,
+				v, fmt.Sprintf("bogus-gap-row-v%d", v),
+			); err != nil {
+				t.Fatalf("insert bogus row v%d: %v", v, err)
+			}
+		}
+	}()
+
+	// Sanity: MAX=9, row 6 absent — the MAX-based heuristic sees nothing risky.
+	if _, ok := firstPendingRiskyVersion(9); ok {
+		t.Fatal("test premise: firstPendingRiskyVersion(9) should report nothing pending")
+	}
+
+	// Open must create a restore point BEFORE running the missing risky v6.
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open/migrate over a gapped bookkeeping table: %v", err)
+	}
+	defer db.Close()
+
+	sidecar, _ := sidecarPath(dbPath)
+	m, err := loadValidManifest(sidecar)
+	if err != nil {
+		t.Fatalf("expected a restore point before the missing risky v6, got: %v "+
+			"(pre-fix the MAX-based risk gate skipped it)", err)
+	}
+	// The snapshot must record v6 as the first pending risky migration (the absent
+	// row), and its pre_schema_version must be the bookkeeping MAX (9).
+	if m.FirstRiskySchemaVersion != 6 {
+		t.Errorf("first_risky_schema_version = %d, want 6 (the missing risky migration)", m.FirstRiskySchemaVersion)
+	}
+	if m.PreSchemaVersion != 9 {
+		t.Errorf("pre_schema_version = %d, want 9 (bookkeeping MAX)", m.PreSchemaVersion)
+	}
+}

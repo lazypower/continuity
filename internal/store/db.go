@@ -83,14 +83,19 @@ func DefaultDBPath() (string, error) {
 // (or exclusive-restore-in-progress) Open is no-touch: it never chmod's the DB
 // before failing closed.
 func Open(path string) (*DB, error) {
-	// REFUSE A SYMLINKED DB FILE (leaf) up front, for ALL operations (Change 1).
-	// continuity does not support a symlinked database file: rather than resolve a
-	// symlinked leaf (the recurring complexity/bug source across review rounds) we
-	// FAIL CLOSED with ErrSymlinkedDBUnsupported BEFORE the interrupted-restore
-	// marker check, MkdirAll, lock acquisition, or sql.Open — so a symlinked-leaf DB
-	// never reaches migrations, the marker check, or any file touch. Parent-DIRECTORY
-	// symlinks (real leaf) remain fully supported (canonicalDBPath resolves them).
-	if err := refuseSymlinkedDBLeaf(path); err != nil {
+	// REFUSE AN UNSUPPORTED DB PATH up front, for ALL operations. Two classes both
+	// open a real DB while bypassing the path-owned coordination layer and so are
+	// refused at this single gate BEFORE the interrupted-restore marker check,
+	// MkdirAll, lock acquisition, or sql.Open:
+	//   (1) a symlinked DB FILE (leaf)  → ErrSymlinkedDBUnsupported
+	//   (2) a SQLite URI/DSN spelling   → ErrURIDSNUnsupported (the symlink sibling:
+	//       a `file:/abs/db?mode=rwc` opens the real DB but AcquireServeLock is a
+	//       no-op for it, no shared lock is taken, and the marker detector
+	//       canonicalizes the literal URI string and misses the real sidecar).
+	// Failing closed here means a symlinked-leaf OR URI/DSN DB never reaches
+	// migrations, the marker check, or any file touch. `:memory:` passes (no file to
+	// coordinate); parent-DIRECTORY symlinks remain supported (canonicalDBPath).
+	if err := refuseUnsupportedDBPath(path); err != nil {
 		return nil, err
 	}
 
@@ -281,13 +286,15 @@ var ErrDBMissing = errors.New("store: database file does not exist")
 // file first and return ErrDBMissing when it is absent. This is what stops
 // restore from silently materializing an empty DB over a missing live one.
 func OpenNoMigrate(path string) (*DB, error) {
-	// REFUSE A SYMLINKED DB FILE (leaf) up front, exactly like Open (Change 1):
-	// every DB open — including the inspection-only path reached by non-server
-	// commands and by snapshot lineage/integrity checks of the LIVE DB — fails
-	// closed with ErrSymlinkedDBUnsupported before any stat/sql.Open. (Snapshot
-	// IMAGE inspection inside the sidecar passes the sidecar's snapshot.db path,
-	// which is a real file, so integrity/lineage checks are unaffected.)
-	if err := refuseSymlinkedDBLeaf(path); err != nil {
+	// REFUSE AN UNSUPPORTED DB PATH up front, exactly like Open: every DB open —
+	// including the inspection-only path reached by non-server commands and by
+	// snapshot lineage/integrity checks of the LIVE DB — fails closed before any
+	// stat/sql.Open. A symlinked leaf → ErrSymlinkedDBUnsupported; a SQLite URI/DSN
+	// path → ErrURIDSNUnsupported (so a restore that inspects the live DB via a URI
+	// spelling cannot silently bypass the marker/lock coordination). Snapshot IMAGE
+	// inspection inside the sidecar passes the sidecar's snapshot.db path, a real
+	// plain file, so integrity/lineage checks are unaffected.
+	if err := refuseUnsupportedDBPath(path); err != nil {
 		return nil, err
 	}
 

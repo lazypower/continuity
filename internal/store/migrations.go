@@ -298,7 +298,17 @@ func (db *DB) riskyUpgradePending() (risky bool, maxApplied int, err error) {
 	if head := headVersion(); maxApplied > head {
 		return false, maxApplied, &ErrSchemaTooNew{Found: maxApplied, Supported: head}
 	}
-	_, hasRisky := firstPendingRiskyVersion(maxApplied)
+	// Risk detection from the ACTUAL pending set (absent rows), NOT MAX(version)
+	// (Round 10, Finding 3): a gapped bookkeeping table (MAX=9 but row 6 absent)
+	// would make the MAX-based firstPendingRiskyVersion(maxApplied) see nothing
+	// pending while runPendingMigrations still runs the risky v6 rebuild. Computing
+	// the pending set the same way the migrator does aligns the snapshot trigger
+	// with what actually runs. The maxApplied > 0 gate keeps a FRESH install (all
+	// rows absent) from snapshotting — there is nothing to restore to.
+	_, hasRisky, rerr := db.firstPendingRiskyMigrationActual()
+	if rerr != nil {
+		return false, maxApplied, rerr
+	}
 	return maxApplied > 0 && hasRisky && snapshotEligiblePath(db.Path), maxApplied, nil
 }
 
@@ -353,7 +363,14 @@ func (db *DB) migrate() error {
 	// still requires an eligible path (the op-lock lives beside the sidecar, which
 	// is path-derived); :memory:/URI/DSN upgrades cannot take it and the
 	// restore-point helper fails closed on them unless opted out.
-	_, hasRisky := firstPendingRiskyVersion(maxApplied)
+	// Risk detection from the ACTUAL pending set (absent rows), aligned with
+	// runPendingMigrations and with riskyUpgradePending's probe (Round 10, Finding
+	// 3). A gapped bookkeeping table (MAX=9, row 6 absent) would let the MAX-based
+	// heuristic miss the risky v6 the migrator still runs unprotected.
+	_, hasRisky, hrErr := db.firstPendingRiskyMigrationActual()
+	if hrErr != nil {
+		return hrErr
+	}
 	riskyUpgrade := maxApplied > 0 && hasRisky && snapshotEligiblePath(db.Path)
 
 	if riskyUpgrade {
