@@ -246,13 +246,21 @@ func hashFeature(term string, dims int) (bucket int, sign float64) {
 	return bucket, -1.0
 }
 
-// tokenize splits text into lowercase tokens, stripping punctuation.
+// tokenize splits text into lowercase alphanumeric tokens, treating every other
+// rune — including '-' and '_' — as a separator.
+//
+// Splitting on '-'/'_' (rather than keeping them inside tokens) is load-bearing
+// for the retraction-resurrection gate: the same PII reformatted differently
+// must still collide. Otherwise "phone 555-123-4567" tokenizes to one opaque
+// token while "phone 555 123 4567" tokenizes to three, the two share almost no
+// buckets, and the gate misses the exact same number. As a bonus, compound terms
+// like "wal-mode" now match their spaced form "wal mode".
 func tokenize(text string) []string {
 	text = strings.ToLower(text)
 	var tokens []string
 	var current strings.Builder
 	for _, r := range text {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
 			current.WriteRune(r)
 		} else {
 			if current.Len() > 1 { // skip single-char tokens

@@ -342,12 +342,12 @@ var (
 var dedupCmd = &cobra.Command{
 	Use:   "dedup",
 	Short: "Deduplicate semantically similar memory nodes",
-	Long:  "Finds and merges duplicate memory nodes using cosine similarity. Requires a running Ollama instance or falls back to TF-IDF.",
+	Long:  "Finds and merges duplicate memory nodes using cosine similarity. Uses Ollama if available, otherwise the hashed lexical fallback. When --threshold is not set, the default is calibrated to the active embedder (lower for the lexical fallback), matching the engine's automatic dedup.",
 	RunE:  runDedup,
 }
 
 func init() {
-	dedupCmd.Flags().Float64Var(&dedupThreshold, "threshold", 0.65, "Cosine similarity threshold (0.0-1.0)")
+	dedupCmd.Flags().Float64Var(&dedupThreshold, "threshold", 0.65, "Cosine similarity threshold (0.0-1.0); default is embedder-aware when unset")
 	dedupCmd.Flags().BoolVar(&dedupDryRun, "dry-run", false, "Show what would be removed without deleting")
 }
 
@@ -395,12 +395,22 @@ func runDedup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("dedup refused — %s", reason)
 	}
 
+	// Embedder-aware default: the lexical fallback produces lower cosines than a
+	// semantic model, so a fixed 0.65 would leave behind duplicates the engine's
+	// automatic dedup (which uses MatchThreshold) already merges. Honor an
+	// explicit --threshold; otherwise calibrate to the active embedder.
+	threshold := dedupThreshold
+	if !cmd.Flags().Changed("threshold") {
+		threshold = engine.MatchThreshold(emb)
+	}
+	fmt.Printf("Threshold: %.2f\n", threshold)
+
 	if dedupDryRun {
 		fmt.Println("\n[dry-run] Would deduplicate — rerun without --dry-run to apply")
 		return nil
 	}
 
-	removed, err := eng.Dedup(ctx, dedupThreshold)
+	removed, err := eng.Dedup(ctx, threshold)
 	if err != nil {
 		return fmt.Errorf("dedup: %w", err)
 	}

@@ -16,6 +16,9 @@ func TestTokenize(t *testing.T) {
 		{"a b c", 0}, // single chars skipped
 		{"SQLite WAL mode", 3},
 		{"", 0},
+		{"wal-mode", 2},        // '-' is a separator → wal, mode
+		{"555-123-4567", 3},    // hyphenated digits split → 555, 123, 4567
+		{"snake_case_name", 3}, // '_' is a separator too
 	}
 
 	for _, tt := range tests {
@@ -141,6 +144,28 @@ func TestHashEmbedderEmpty(t *testing.T) {
 		if v != 0 {
 			t.Fatalf("token-less text must embed to all-zero; vec[%d]=%f", i, v)
 		}
+	}
+}
+
+// TestHashEmbedderReformattedDigitsCollide pins the retraction-gate normalization
+// fix (Codex finding): the same PII written with different digit-group separators
+// must still land in the same buckets, so a reformatted re-write trips the gate.
+// Before the tokenize fix, "555-123-4567" was one opaque token and "555 123 4567"
+// was three, so the two barely overlapped and the gate missed identical PII.
+func TestHashEmbedderReformattedDigitsCollide(t *testing.T) {
+	ctx := context.Background()
+	emb, _ := NewHashEmbedder(0)
+
+	hyphen, _ := emb.Embed(ctx, "phone 555-123-4567")
+	spaced, _ := emb.Embed(ctx, "phone 555 123 4567")
+	if sim := CosineSimilarity(hyphen, spaced); sim < lexicalMatchThreshold {
+		t.Errorf("reformatted phone cosine = %f, want >= gate threshold %f", sim, lexicalMatchThreshold)
+	}
+
+	ssnH, _ := emb.Embed(ctx, "ssn 123-45-6789")
+	ssnS, _ := emb.Embed(ctx, "ssn 123 45 6789")
+	if sim := CosineSimilarity(ssnH, ssnS); sim < lexicalMatchThreshold {
+		t.Errorf("reformatted ssn cosine = %f, want >= gate threshold %f", sim, lexicalMatchThreshold)
 	}
 }
 
