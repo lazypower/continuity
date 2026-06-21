@@ -71,6 +71,17 @@ func hashURI(uri string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
+// hashMatchedURIs joins the opaque hashes of matched retracted nodes for a single
+// log line, so match events are observable without leaking the URIs (and through
+// them, the reasons) into passive log feeds. See hashURI.
+func hashMatchedURIs(nodes []store.MemNode) string {
+	hs := make([]string, len(nodes))
+	for i, n := range nodes {
+		hs[i] = hashURI(n.URI)
+	}
+	return strings.Join(hs, ",")
+}
+
 // findRetractedMatches returns retracted leaf nodes in the given category whose
 // embedding similarity to candidateText is above threshold. Returns all matches
 // (not just the best), so multi-match aggregation is possible at the caller.
@@ -84,14 +95,27 @@ func (e *Engine) findRetractedMatches(ctx context.Context, candidateText, catego
 	if e.Embedder == nil || candidateText == "" || e.identityMismatch {
 		return nil, nil
 	}
+	return findRetractedMatchesIn(ctx, e.DB, e.Embedder, candidateText, category, threshold)
+}
 
-	candidateVec, err := e.Embedder.Embed(ctx, candidateText)
+// findRetractedMatchesIn is the embedder-space comparison core of the retraction
+// gate, with no engine/lock state. Callers MUST ensure the embedder is usable
+// (non-nil and compatible with the corpus — i.e. the vector identity is not
+// locked) before calling; it compares the candidate against stored retracted
+// vectors of the same identity only. Shared by the engine method (Remember) and
+// the extraction path so both gate identically.
+func findRetractedMatchesIn(ctx context.Context, db *store.DB, embedder Embedder, candidateText, category string, threshold float64) ([]store.MemNode, error) {
+	if embedder == nil || candidateText == "" {
+		return nil, nil
+	}
+
+	candidateVec, err := embedder.Embed(ctx, candidateText)
 	if err != nil {
 		return nil, fmt.Errorf("embed candidate: %w", err)
 	}
-	activeID := EmbedderIdentity(e.Embedder)
+	activeID := EmbedderIdentity(embedder)
 
-	vectors, err := e.DB.AllVectors()
+	vectors, err := db.AllVectors()
 	if err != nil {
 		return nil, fmt.Errorf("load vectors: %w", err)
 	}
@@ -103,7 +127,7 @@ func (e *Engine) findRetractedMatches(ctx context.Context, candidateText, catego
 	for i, v := range vectors {
 		nodeIDs[i] = v.NodeID
 	}
-	nodes, err := e.DB.GetNodesByIDs(nodeIDs)
+	nodes, err := db.GetNodesByIDs(nodeIDs)
 	if err != nil {
 		return nil, fmt.Errorf("get nodes: %w", err)
 	}

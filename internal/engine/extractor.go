@@ -181,6 +181,28 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 			uri = c.MergeTarget
 		}
 
+		// Retraction-resurrection gate (per-candidate, fail-closed): an extracted
+		// candidate that matches a retracted memory must NOT be written — otherwise
+		// retracted (e.g. PII) content silently resurfaces as a fresh live node.
+		// findSimilarNode above deliberately skips retracted nodes (so it can never
+		// merge INTO one), which is exactly why this separate gate is required to
+		// catch the create-a-new-node resurrection path. Skip only the offending
+		// candidate — one bad candidate must not drop the rest of the batch. On a
+		// gate error we also skip (fail closed) rather than write unchecked. The
+		// embedder is nil only in `none` mode (operator opted out of the gate) — the
+		// locked case is deferred upstream in extractSession, never reaching here.
+		if embedder != nil && c.L0 != "" {
+			matches, err := findRetractedMatchesIn(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
+			if err != nil {
+				log.Printf("extraction: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
+				continue
+			}
+			if len(matches) > 0 {
+				log.Printf("extraction: skipping %s — matches %d retracted node(s) hash=%s", uri, len(matches), hashMatchedURIs(matches))
+				continue
+			}
+		}
+
 		// Similarity gate: check if a semantically equivalent node already exists
 		if embedder != nil && c.Category != "" {
 			match, sim, err := findSimilarNode(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
