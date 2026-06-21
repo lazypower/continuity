@@ -252,11 +252,11 @@ The tradeoff is deliberate: it's a **stable lexical safety net**, not a semantic
 
 ## Operator CLI + Health
 
-A corpus is **bound to a vector identity** — the `model:dimensions` of whatever embedder first wrote it (e.g. `ollama:nomic-embed-text:768` or `hashtf:2048`). Vectors are only comparable within one identity, so the server refuses to compare across spaces: if the active embedder doesn't match the corpus, **search fails closed** (returns nothing rather than garbage) instead of silently mixing vector spaces.
+A corpus is **bound to a vector identity** — the `model:dimensions` of whatever embedder first wrote it (e.g. `ollama:nomic-embed-text:768` or `hashtf:2048`). Vectors are only comparable within one identity, so the server refuses to compare across spaces: if the active embedder doesn't match the corpus, **search fails closed** — it returns an error (HTTP `503`) rather than scoring across incompatible vector spaces and handing back garbage.
 
 The common way to hit this: run Ollama-free for a while (corpus bound to `hashtf:2048`), then install Ollama. The next start probes Ollama, the active embedder becomes `ollama:...:768`, it no longer matches the corpus — and search locks until you re-embed. This is intended (it never silently corrupts the index), but you have to know the recovery.
 
-**`continuity doctor`** is the read-only diagnosis — it never writes, re-embeds, or touches access metrics:
+**`continuity doctor`** diagnoses without touching your memories — it never re-embeds, writes vectors, or bumps access metrics (like any command, opening the database may apply a pending migration, snapshot-first):
 
 ```bash
 continuity doctor          # active embedder vs corpus identity, vector
