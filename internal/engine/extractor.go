@@ -202,6 +202,14 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 			case target.IsRetracted():
 				log.Printf("extraction: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
 				continue
+			case !target.Mergeable:
+				// Merge-into only happens for mergeable targets; for an immutable
+				// target UpsertNode IGNORES the merge and creates a new suffixed leaf
+				// carrying the CANDIDATE's category — so gating on target.Category
+				// would check the wrong space. Ignore the merge_target and fall back
+				// to the constructed uri + declared category, which is exactly where
+				// the content will actually land.
+				log.Printf("extraction: ignoring merge_target %s — target is immutable (not a merge); using %s", c.MergeTarget, uri)
 			default:
 				uri = target.URI
 				gateCat = target.Category

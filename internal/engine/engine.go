@@ -558,6 +558,11 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 			case target.IsRetracted():
 				log.Printf("signal: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
 				continue
+			case !target.Mergeable:
+				// Immutable target: UpsertNode won't merge, it creates a suffixed leaf
+				// with the CANDIDATE's category, so gating on target.Category would
+				// check the wrong space. Ignore merge_target; use the constructed uri.
+				log.Printf("signal: ignoring merge_target %s — target is immutable (not a merge); using %s", c.MergeTarget, uri)
 			default:
 				uri = target.URI
 				gateCat = target.Category

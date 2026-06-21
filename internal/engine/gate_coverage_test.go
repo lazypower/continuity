@@ -214,6 +214,42 @@ func TestExtraction_IgnoresUnresolvableMergeTarget(t *testing.T) {
 	assertNoResurrection(t, db, canonical, before)
 }
 
+// TestExtraction_IgnoresImmutableMergeTarget pins the round-5 fix: merge_target
+// is honored only for MERGEABLE targets. UpsertNode never merges into an immutable
+// node (it creates a suffixed leaf with the candidate's category), so gating on an
+// immutable target's category would check the wrong space. The merge_target must
+// be ignored, falling back to the candidate's category — where the gate then
+// catches a same-category retracted match.
+func TestExtraction_IgnoresImmutableMergeTarget(t *testing.T) {
+	db := testDB(t)
+	emb, _ := NewHashEmbedder(0)
+
+	// Retracted PREFERENCE (mergeable category) with a vector.
+	const pii = "secret pii content nine eight seven six"
+	seedRetracted(t, db, emb, "mem://user/preferences/old-secret", "preferences", pii)
+
+	// A LIVE IMMUTABLE events node to (ab)use as a merge_target.
+	ev := &store.MemNode{URI: "mem://user/events/some-event", NodeType: "leaf", Category: "events",
+		L0Abstract: "deployed on friday", L1Overview: "Body content with enough length to pass validation thresholds easily."}
+	if err := db.CreateNode(ev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Candidate is a preferences write reproducing the retracted PII, but points
+	// merge_target at the immutable events node to dodge the preferences gate.
+	resp := `[{"category":"preferences","uri_hint":"new-pref","merge_target":"mem://user/events/some-event","l0":"secret pii content nine eight seven six","l1":"Body content with enough length to pass validation thresholds easily."}]`
+	mock := &llm.MockClient{Response: &llm.Response{Content: resp, Provider: "mock"}}
+
+	if err := extractMemories(db, mock, emb, "sess", makeTranscript(t)); err != nil {
+		t.Fatalf("extractMemories: %v", err)
+	}
+
+	// Gate ran on preferences (the real landing category) and skipped — no live node.
+	if n, _ := db.GetNodeByURI("mem://user/preferences/new-pref"); n != nil {
+		t.Errorf("immutable merge_target let a preferences candidate dodge the gate: %+v", n)
+	}
+}
+
 // TestExtraction_DeferredWhenLocked pins finding #2: while the vector identity is
 // locked the gate cannot run, so extraction must write NOTHING (fail closed) and
 // must not mark the session extracted. Proven non-vacuous by showing the same
