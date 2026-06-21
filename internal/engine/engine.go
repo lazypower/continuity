@@ -49,17 +49,17 @@ func (e *Engine) SetEmbedder(emb Embedder) {
 	e.Embedder = emb
 }
 
-// EmbedNode generates and stores an embedding for a single node.
+// EmbedNode brings a node's stored vector in sync with its current content, or
+// removes a stale one. When the active embedder can't produce a vector
+// compatible with the corpus — none configured, or the vector identity is locked
+// — it DELETES any existing vector and leaves the node Pending. This is critical
+// on a content UPDATE: skipping the embed while leaving the old vector in place
+// would make search serve a vector describing the previous content once the
+// embedder returns (EmbedMissing only fills MISSING vectors). DeleteVector is a
+// no-op when none exists, so a fresh node simply stays Pending.
 func (e *Engine) EmbedNode(ctx context.Context, node *store.MemNode) error {
-	if e.Embedder == nil {
-		return nil
-	}
-	// Pending state: while the vector identity is locked, the active embedder is
-	// incompatible with the corpus. Do NOT embed new writes into a foreign vector
-	// space — leave the node pending (no vector). EmbedMissing fills it once a
-	// compatible embedder is active again (see ReconcileVectorIdentity).
-	if e.identityMismatch {
-		return nil
+	if e.Embedder == nil || e.identityMismatch {
+		return e.DB.DeleteVector(node.ID)
 	}
 	text := node.L0Abstract
 	if text == "" {
@@ -546,14 +546,15 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 		}
 		log.Printf("signal: stored %s [%s]", uri, c.Category)
 
-		// Embed if available and not locked. While locked, the node stays Pending
-		// (no vector) rather than being written into an incompatible vector space.
-		if emb := e.embedderIfUnlocked(); emb != nil && node.L0Abstract != "" {
-			stored, err := e.DB.GetNodeByURI(node.URI)
-			if err == nil && stored != nil {
+		// Keep the stored vector in sync; when locked/none, DELETE any stale vector
+		// so a content update can't leave search serving the previous content.
+		if stored, err := e.DB.GetNodeByURI(node.URI); err == nil && stored != nil {
+			if emb := e.embedderIfUnlocked(); emb != nil && stored.L0Abstract != "" {
 				if vec, err := emb.Embed(ctx, stored.L0Abstract); err == nil {
 					e.DB.SaveVector(stored.ID, vec, emb.Model())
 				}
+			} else {
+				e.DB.DeleteVector(stored.ID)
 			}
 		}
 	}

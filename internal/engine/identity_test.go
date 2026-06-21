@@ -328,6 +328,30 @@ func TestRememberFailsClosedWhenLocked(t *testing.T) {
 	}
 }
 
+// TestEmbedNodeClearsStaleVectorWhenLocked pins Codex round-5: when a content
+// update happens while locked, the OLD vector must be dropped (not left in place)
+// so search can't serve a vector for the previous content after the embedder
+// returns. EmbedMissing only fills MISSING vectors, so a survivor would be stale.
+func TestEmbedNodeClearsStaleVectorWhenLocked(t *testing.T) {
+	db := memTestDB(t)
+	id := seedLeaf(t, db, "mem://agent/patterns/a", "updated content")
+	if err := db.SaveVector(id, make([]float64, 8), "active"); err != nil { // vector for OLD content
+		t.Fatal(err)
+	}
+
+	e := New(db, nil)
+	e.SetEmbedder(stubEmbedder{model: "active", dims: 8})
+	e.identityMismatch = true // locked
+
+	node, _ := db.GetNodeByURI("mem://agent/patterns/a")
+	if err := e.EmbedNode(context.Background(), node); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := db.GetVector(id); v != nil {
+		t.Fatalf("locked EmbedNode must clear the stale vector, got %+v", v)
+	}
+}
+
 func TestEmbedMissingFillsTrulyMissing(t *testing.T) {
 	db := memTestDB(t)
 	id := seedLeaf(t, db, "mem://agent/patterns/a", "alpha")
