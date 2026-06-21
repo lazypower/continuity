@@ -1,0 +1,50 @@
+name: Retrieval Fixtures
+
+# Real-embedder retrieval drift canary.
+#
+# The per-PR `ci.yml` already runs TestRetrievalGolden_* against the COMMITTED
+# nomic fixture (hermetic, no Ollama — fast). This scheduled job is the heavier
+# complement: it stands up a REAL Ollama nomic-embed-text, re-mints the fixture
+# from current weights, and runs the same ranked-order goldens against the FRESH
+# vectors. Deliberately uses current nomic (not a pinned digest): a rank flip
+# here means current nomic ranks the corpus differently than the committed
+# baseline — a real embedder regression that would reach users too. When it
+# fails, inspect, then refresh the baseline with `make retrieval-fixtures`.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * 1' # weekly, Monday 07:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  regen-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama and pull the embedding model
+        run: |
+          ollama serve &
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:11434/api/version && break
+            sleep 1
+          done
+          ollama pull nomic-embed-text
+
+      - name: Re-mint the retrieval fixture from current nomic
+        run: go run ./scripts/genretrievalfixtures -out "$RUNNER_TEMP/nomic.json"
+
+      - name: Run retrieval goldens against the fresh fixture
+        run: |
+          CONTINUITY_RETRIEVAL_FIXTURE="$RUNNER_TEMP/nomic.json" \
+            go test -tags noembed -count=1 -run RetrievalGolden ./internal/engine/
