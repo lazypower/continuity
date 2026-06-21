@@ -535,47 +535,18 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 
 		owner := ownerForCategory(c.Category)
 		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
-		gateCat := c.Category // category the content will actually land in
 
-		// Honor merge_target ONLY if it RESOLVES to an existing node (its purpose is
-		// to merge into one). A raw LLM string is never trusted as a URI: a
-		// malformed/variant or hallucinated target won't resolve, so we ignore it and
-		// keep the canonical constructed uri — the write target is always canonical,
-		// never an attacker-shaped string that dodges the gate. Resolves-to-retracted
-		// => skip (merge-into-tombstone). When honored, gate on the target's REAL
-		// category.
-		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
-			target, err := e.DB.GetNodeByURI(c.MergeTarget)
-			switch {
-			case err != nil:
-				// Can't resolve => can't prove safety. Fail closed (skip) rather than
-				// fall back to the declared category and miss a retracted node in the
-				// merge target's category.
-				log.Printf("signal: merge_target lookup failed for %s — skipping candidate (fail-closed): %v", c.MergeTarget, err)
-				continue
-			case target == nil:
-				log.Printf("signal: ignoring merge_target %s — no such node; using %s", c.MergeTarget, uri)
-			case target.IsRetracted():
-				log.Printf("signal: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
-				continue
-			case !target.Mergeable:
-				// Immutable target: UpsertNode won't merge, it creates a suffixed leaf
-				// with the CANDIDATE's category, so gating on target.Category would
-				// check the wrong space. Ignore merge_target; use the constructed uri.
-				log.Printf("signal: ignoring merge_target %s — target is immutable (not a merge); using %s", c.MergeTarget, uri)
-			default:
-				uri = target.URI
-				gateCat = target.Category
-			}
-		}
+		// An LLM-supplied merge_target is intentionally NOT honored (see the matching
+		// note in extractMemories): trusting an LLM-chosen URI was a recurring gate
+		// bypass. The candidate always lands in its declared category, so the gate
+		// keys on c.Category.
 
 		// Retraction-resurrection gate (per-candidate, fail-closed): a signal
-		// candidate matching a retracted memory must not be written. Keys on gateCat
-		// — the category the content actually lands in. Skip only the offending
-		// candidate; on a gate error skip it too rather than write unchecked. (Locked
-		// identity is handled above; embedder is nil here only in `none` mode.)
+		// candidate matching a retracted memory must not be written. Skip only the
+		// offending candidate; on a gate error skip it too rather than write unchecked.
+		// (Locked identity is handled above; embedder is nil here only in `none` mode.)
 		if emb := e.embedderIfUnlocked(); emb != nil && c.L0 != "" {
-			matches, err := e.findRetractedMatches(ctx, c.L0, gateCat, MatchThreshold(emb))
+			matches, err := e.findRetractedMatches(ctx, c.L0, c.Category, MatchThreshold(emb))
 			if err != nil {
 				log.Printf("signal: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
 				continue

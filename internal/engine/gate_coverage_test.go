@@ -134,119 +134,37 @@ func TestSignal_SkipsExactRetractedURICollision(t *testing.T) {
 	assertNoResurrection(t, db, uri, before)
 }
 
-// TestExtraction_GatesEffectiveCategoryOnCrossCategoryMergeTarget pins the
-// merge_target category-mismatch fix: a candidate declared in one category but
-// merge_target'd into a LIVE node of another category must be gated against
-// retracted nodes of the TARGET category. Otherwise content matching a retracted
-// preference, smuggled in as an "events" candidate merged onto a live preference,
-// would overwrite that live node — a semantic resurrection bypass.
-func TestExtraction_GatesEffectiveCategoryOnCrossCategoryMergeTarget(t *testing.T) {
+// TestExtraction_IgnoresMergeTarget pins that an LLM-supplied merge_target is NOT
+// honored: dedup is owned by the system (findSimilarNode), and trusting an
+// LLM-chosen URI was a recurring retracted-PII gate-bypass surface. A candidate's
+// content lands at its own constructed canonical URI in its declared category —
+// never redirected to the merge_target — so the gate always keys on the category
+// the content actually lands in.
+func TestExtraction_IgnoresMergeTarget(t *testing.T) {
 	db := testDB(t)
 	emb, _ := NewHashEmbedder(0)
 
-	// Retracted PREFERENCE carrying the sensitive content.
-	const secret = "social security number nine eight seven six five four"
-	seedRetracted(t, db, emb, "mem://user/preferences/old-secret", "preferences", secret)
-
-	// A LIVE preference the candidate will try to merge onto.
+	// A live node in another category the candidate will (vainly) try to merge onto.
 	live := &store.MemNode{URI: "mem://user/preferences/live-pref", NodeType: "leaf", Category: "preferences",
 		L0Abstract: "favorite editor is vim", L1Overview: "Body content with enough length to pass validation thresholds easily."}
 	if err := db.CreateNode(live); err != nil {
 		t.Fatal(err)
 	}
 
-	// Candidate declares category "events" (no retracted events exist) but
-	// merge_targets the live preference, with L0 == the retracted preference's PII.
-	resp := `[{"category":"events","uri_hint":"innocuous","merge_target":"mem://user/preferences/live-pref","l0":"social security number nine eight seven six five four","l1":"Body content with enough length to pass validation thresholds easily."}]`
+	resp := `[{"category":"events","uri_hint":"deploy-note","merge_target":"mem://user/preferences/live-pref","l0":"deployed the release on friday afternoon","l1":"Body content with enough length to pass validation thresholds easily."}]`
 	mock := &llm.MockClient{Response: &llm.Response{Content: resp, Provider: "mock"}}
 
 	if err := extractMemories(db, mock, emb, "sess", makeTranscript(t)); err != nil {
 		t.Fatalf("extractMemories: %v", err)
 	}
 
-	got, _ := db.GetNodeByURI("mem://user/preferences/live-pref")
-	if got == nil || got.L0Abstract != "favorite editor is vim" {
-		t.Errorf("cross-category merge_target resurrected retracted PII into the live preference: L0=%q", func() string {
-			if got == nil {
-				return "(nil)"
-			}
-			return got.L0Abstract
-		}())
+	// The merge_target node is untouched...
+	if got, _ := db.GetNodeByURI("mem://user/preferences/live-pref"); got == nil || got.L0Abstract != "favorite editor is vim" {
+		t.Error("merge_target node was modified despite merge_target being ignored")
 	}
-}
-
-// TestExtraction_IgnoresUnresolvableMergeTarget pins the round-3 root fix: a raw
-// LLM merge_target is never trusted as a URI. A variant string (here a ?query
-// suffix; casing/#frag/trailing-slash behave the same) that doesn't resolve to a
-// real node must be IGNORED — the write falls back to the canonical constructed
-// uri, where the exact-URI guard then catches the retracted collision. Pre-fix the
-// variant was written verbatim, spawning a live node that dodged both the category
-// gate and the canonical exact-URI guard.
-func TestExtraction_IgnoresUnresolvableMergeTarget(t *testing.T) {
-	db := testDB(t)
-	emb, _ := NewHashEmbedder(0)
-
-	// Retracted MERGEABLE node with NO vector (so only the exact-URI guard can
-	// catch it — the vector gate is blind here, matching Codex's scenario).
-	const canonical = "mem://user/preferences/legacy-pref"
-	n := &store.MemNode{URI: canonical, NodeType: "leaf", Category: "preferences",
-		L0Abstract: "original retracted content", L1Overview: "Body content with enough length to pass validation thresholds easily."}
-	if err := db.CreateNode(n); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.RetractNode(canonical, "forget this", ""); err != nil {
-		t.Fatal(err)
-	}
-	before := snapshotNode(t, db, canonical)
-
-	const variant = canonical + "?bypass=1"
-	resp := `[{"category":"preferences","uri_hint":"legacy-pref","merge_target":"` + variant + `","l0":"RESURRECTED content","l1":"Body content with enough length to pass validation thresholds easily."}]`
-	mock := &llm.MockClient{Response: &llm.Response{Content: resp, Provider: "mock"}}
-
-	if err := extractMemories(db, mock, emb, "sess", makeTranscript(t)); err != nil {
-		t.Fatalf("extractMemories: %v", err)
-	}
-
-	if got, _ := db.GetNodeByURI(variant); got != nil {
-		t.Errorf("variant merge_target was written verbatim, spawning a live node: %s", variant)
-	}
-	// The canonical retracted node must be byte-for-byte intact (exact-URI guard).
-	assertNoResurrection(t, db, canonical, before)
-}
-
-// TestExtraction_IgnoresImmutableMergeTarget pins the round-5 fix: merge_target
-// is honored only for MERGEABLE targets. UpsertNode never merges into an immutable
-// node (it creates a suffixed leaf with the candidate's category), so gating on an
-// immutable target's category would check the wrong space. The merge_target must
-// be ignored, falling back to the candidate's category — where the gate then
-// catches a same-category retracted match.
-func TestExtraction_IgnoresImmutableMergeTarget(t *testing.T) {
-	db := testDB(t)
-	emb, _ := NewHashEmbedder(0)
-
-	// Retracted PREFERENCE (mergeable category) with a vector.
-	const pii = "secret pii content nine eight seven six"
-	seedRetracted(t, db, emb, "mem://user/preferences/old-secret", "preferences", pii)
-
-	// A LIVE IMMUTABLE events node to (ab)use as a merge_target.
-	ev := &store.MemNode{URI: "mem://user/events/some-event", NodeType: "leaf", Category: "events",
-		L0Abstract: "deployed on friday", L1Overview: "Body content with enough length to pass validation thresholds easily."}
-	if err := db.CreateNode(ev); err != nil {
-		t.Fatal(err)
-	}
-
-	// Candidate is a preferences write reproducing the retracted PII, but points
-	// merge_target at the immutable events node to dodge the preferences gate.
-	resp := `[{"category":"preferences","uri_hint":"new-pref","merge_target":"mem://user/events/some-event","l0":"secret pii content nine eight seven six","l1":"Body content with enough length to pass validation thresholds easily."}]`
-	mock := &llm.MockClient{Response: &llm.Response{Content: resp, Provider: "mock"}}
-
-	if err := extractMemories(db, mock, emb, "sess", makeTranscript(t)); err != nil {
-		t.Fatalf("extractMemories: %v", err)
-	}
-
-	// Gate ran on preferences (the real landing category) and skipped — no live node.
-	if n, _ := db.GetNodeByURI("mem://user/preferences/new-pref"); n != nil {
-		t.Errorf("immutable merge_target let a preferences candidate dodge the gate: %+v", n)
+	// ...and the candidate landed at its own constructed canonical URI.
+	if got, _ := db.GetNodeByURI("mem://user/events/deploy-note"); got == nil {
+		t.Error("candidate did not land at its constructed canonical URI; merge_target must be ignored, not redirected")
 	}
 }
 

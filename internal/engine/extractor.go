@@ -175,53 +175,19 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 
 		owner := ownerForCategory(c.Category)
 		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
-		gateCat := c.Category // category the content will actually land in
 
-		// Honor merge_target ONLY if it RESOLVES to an existing node — its sole
-		// purpose is to merge into one. A raw LLM string is never trusted as a URI:
-		// a malformed/variant form (casing, ?query, #frag, trailing /) or a
-		// hallucinated target won't resolve, so we ignore it and fall back to the
-		// canonical constructed uri. This is what makes the gate robust — the write
-		// target is always a canonical URI, never an attacker-shaped string that
-		// dodges category derivation or the exact-URI lookup. If it resolves to a
-		// RETRACTED node, merging would resurrect it: skip the candidate. When
-		// honored, gate on the target's REAL category (not a parsed string).
-		merged := false
-		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
-			target, err := db.GetNodeByURI(c.MergeTarget)
-			switch {
-			case err != nil:
-				// Can't resolve the target => can't prove the write is safe. Fail
-				// closed (skip) rather than silently fall back to the constructed uri,
-				// which would gate on the declared category and miss a retracted node
-				// in the merge target's category.
-				log.Printf("extraction: merge_target lookup failed for %s — skipping candidate (fail-closed): %v", c.MergeTarget, err)
-				continue
-			case target == nil:
-				log.Printf("extraction: ignoring merge_target %s — no such node; using %s", c.MergeTarget, uri)
-			case target.IsRetracted():
-				log.Printf("extraction: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
-				continue
-			case !target.Mergeable:
-				// Merge-into only happens for mergeable targets; for an immutable
-				// target UpsertNode IGNORES the merge and creates a new suffixed leaf
-				// carrying the CANDIDATE's category — so gating on target.Category
-				// would check the wrong space. Ignore the merge_target and fall back
-				// to the constructed uri + declared category, which is exactly where
-				// the content will actually land.
-				log.Printf("extraction: ignoring merge_target %s — target is immutable (not a merge); using %s", c.MergeTarget, uri)
-			default:
-				uri = target.URI
-				gateCat = target.Category
-				merged = true
-			}
-		}
+		// An LLM-supplied merge_target is intentionally NOT honored. Dedup is owned
+		// by the system via findSimilarNode (embedding similarity) below — a path the
+		// gate can reason about — so trusting an LLM-chosen URI was pure redundancy
+		// that kept opening retracted-PII gate bypasses (content landing in a
+		// category/URI the gate hadn't checked). Ignoring it shrinks the trusted
+		// input to zero LLM-controlled URIs: a candidate always lands in its own
+		// declared category, so the gate simply keys on c.Category.
 
-		// Similarity gate: check if a semantically equivalent LIVE node already
-		// exists in the declared category. Skipped when an explicit merge_target was
-		// honored (an explicit instruction wins over the heuristic). The redirect
-		// only ever targets a live node in c.Category, so gateCat is unchanged.
-		if !merged && embedder != nil && c.Category != "" {
+		// Similarity gate: redirect to a semantically equivalent LIVE node in the
+		// same category if one exists (findSimilarNode skips retracted nodes, so it
+		// can never merge INTO a tombstone).
+		if embedder != nil && c.Category != "" {
 			match, sim, err := findSimilarNode(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
 			if err != nil {
 				log.Printf("extraction: similarity check failed: %v", err)
@@ -237,15 +203,13 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 		// (e.g. PII) content silently resurfaces as a fresh live node. findSimilarNode
 		// deliberately skips retracted nodes (so it can't merge INTO one), which is
 		// why this separate semantic gate is required to catch the create-a-new-node
-		// path. It keys on gateCat — the category the content actually lands in (the
-		// merge target's real category for an honored merge, else the declared one) —
-		// so a cross-category merge can't be checked against the wrong vector space.
-		// Skip only the offending candidate — one bad candidate must not drop the
-		// rest of the batch; on a gate error we also skip (fail closed). The embedder
-		// is nil only in `none` mode (gate opted out); the locked case is deferred
-		// upstream in extractSession.
+		// path. The candidate always lands in its declared category, so the gate keys
+		// on c.Category. Skip only the offending candidate — one bad candidate must
+		// not drop the rest of the batch; on a gate error we also skip (fail closed).
+		// The embedder is nil only in `none` mode (gate opted out); the locked case is
+		// deferred upstream in extractSession.
 		if embedder != nil && c.L0 != "" {
-			matches, err := findRetractedMatchesIn(ctx, db, embedder, c.L0, gateCat, MatchThreshold(embedder))
+			matches, err := findRetractedMatchesIn(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
 			if err != nil {
 				log.Printf("extraction: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
 				continue
