@@ -557,6 +557,15 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 			}
 		}
 
+		// Exact retracted-URI guard (mirrors Remember): a uri_hint/merge_target may
+		// point straight at a retracted node the vector gate can't catch. UpsertNode
+		// would overwrite it in place (mergeable) or duplicate it (immutable) —
+		// resurrection by exact targeting. Skip the candidate.
+		if existing, err := e.DB.GetNodeByURI(uri); err == nil && existing != nil && existing.IsRetracted() {
+			log.Printf("signal: skipping %s — target URI is retracted (would resurrect)", uri)
+			continue
+		}
+
 		node := &store.MemNode{
 			URI:           uri,
 			NodeType:      "leaf",

@@ -215,6 +215,18 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 			}
 		}
 
+		// Exact retracted-URI guard (mirrors Remember): an LLM-supplied uri_hint or
+		// merge_target can point straight at a retracted node, which the vector gate
+		// won't catch if that node has no same-identity vector. UpsertNode would then
+		// overwrite a retracted mergeable row in place, or spawn a live timestamp-
+		// suffixed duplicate of retracted immutable content — resurrection by exact
+		// targeting. Skip the candidate (the similarity gate only ever redirects to
+		// LIVE nodes, so this can't be a false positive from that redirect).
+		if existing, err := db.GetNodeByURI(uri); err == nil && existing != nil && existing.IsRetracted() {
+			log.Printf("extraction: skipping %s — target URI is retracted (would resurrect)", uri)
+			continue
+		}
+
 		node := &store.MemNode{
 			URI:           uri,
 			NodeType:      "leaf",

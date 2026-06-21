@@ -76,6 +76,64 @@ func TestExtraction_SkipsRetractedMatch_KeepsRest(t *testing.T) {
 	}
 }
 
+// TestExtraction_SkipsExactRetractedURICollision pins the exact-URI guard: an
+// LLM uri_hint that resolves to a retracted MERGEABLE node, with DIFFERENT content
+// (so the vector gate can't catch it), must not overwrite the retracted row in
+// place. No vector is stored, modelling the "no same-identity vector" case.
+func TestExtraction_SkipsExactRetractedURICollision(t *testing.T) {
+	db := testDB(t)
+	emb, _ := NewHashEmbedder(0)
+
+	const uri = "mem://user/preferences/legacy-pref"
+	n := &store.MemNode{URI: uri, NodeType: "leaf", Category: "preferences",
+		L0Abstract: "original retracted preference content",
+		L1Overview: "Body content with enough length to pass validation thresholds easily."}
+	if err := db.CreateNode(n); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RetractNode(uri, "user asked to forget this", ""); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotNode(t, db, uri)
+
+	resp := `[{"category":"preferences","uri_hint":"legacy-pref","l0":"totally different unrelated wording here","l1":"Body content with enough length to pass validation thresholds easily."}]`
+	mock := &llm.MockClient{Response: &llm.Response{Content: resp, Provider: "mock"}}
+
+	if err := extractMemories(db, mock, emb, "sess", makeTranscript(t)); err != nil {
+		t.Fatalf("extractMemories: %v", err)
+	}
+	// Full-row equality — the retracted mergeable node must be byte-for-byte intact.
+	assertNoResurrection(t, db, uri, before)
+}
+
+// TestSignal_SkipsExactRetractedURICollision is the signal-path equivalent.
+func TestSignal_SkipsExactRetractedURICollision(t *testing.T) {
+	db := testDB(t)
+	emb, _ := NewHashEmbedder(0)
+
+	const uri = "mem://user/preferences/legacy-pref"
+	n := &store.MemNode{URI: uri, NodeType: "leaf", Category: "preferences",
+		L0Abstract: "original retracted preference content",
+		L1Overview: "Body content with enough length to pass validation thresholds easily."}
+	if err := db.CreateNode(n); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RetractNode(uri, "user asked to forget this", ""); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotNode(t, db, uri)
+
+	resp := `[{"category":"preferences","uri_hint":"legacy-pref","l0":"totally different unrelated wording here","l1":"Body content with enough length to pass validation thresholds easily."}]`
+	mock := &llm.MockClient{Response: &llm.Response{Content: resp, Provider: "mock"}}
+
+	eng := New(db, mock)
+	eng.SetEmbedder(emb)
+	if err := eng.ExtractSignal(context.Background(), "sess", "remember this"); err != nil {
+		t.Fatalf("ExtractSignal: %v", err)
+	}
+	assertNoResurrection(t, db, uri, before)
+}
+
 // TestExtraction_DeferredWhenLocked pins finding #2: while the vector identity is
 // locked the gate cannot run, so extraction must write NOTHING (fail closed) and
 // must not mark the session extracted. Proven non-vacuous by showing the same
