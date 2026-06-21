@@ -352,6 +352,27 @@ func TestEmbedNodeClearsStaleVectorWhenLocked(t *testing.T) {
 	}
 }
 
+// TestEmbedNodeClearsStaleVectorWhenNoEmbedder pins Codex round-6: the stale-on-
+// update invariant must also hold with NO embedder configured (not just locked),
+// since Remember now routes every write through EmbedNode unconditionally.
+func TestEmbedNodeClearsStaleVectorWhenNoEmbedder(t *testing.T) {
+	db := memTestDB(t)
+	id := seedLeaf(t, db, "mem://agent/patterns/a", "updated content")
+	if err := db.SaveVector(id, make([]float64, 8), "active"); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(db, nil) // no embedder configured
+
+	node, _ := db.GetNodeByURI("mem://agent/patterns/a")
+	if err := e.EmbedNode(context.Background(), node); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := db.GetVector(id); v != nil {
+		t.Fatalf("no-embedder EmbedNode must clear the stale vector, got %+v", v)
+	}
+}
+
 func TestEmbedMissingFillsTrulyMissing(t *testing.T) {
 	db := memTestDB(t)
 	id := seedLeaf(t, db, "mem://agent/patterns/a", "alpha")

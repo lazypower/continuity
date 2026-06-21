@@ -386,13 +386,13 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 	storedURI := node.URI
 	log.Printf("remember: stored %s [%s] (created=%v)", storedURI, c.Category, created)
 
-	// Embed if available
-	if e.Embedder != nil && node.L0Abstract != "" {
-		stored, err := e.DB.GetNodeByURI(storedURI)
-		if err == nil && stored != nil {
-			if err := e.EmbedNode(ctx, stored); err != nil {
-				log.Printf("remember: embed %s: %v", storedURI, err)
-			}
+	// Reconcile the stored vector with the new content UNCONDITIONALLY: EmbedNode
+	// embeds when possible, or clears a stale vector when no compatible embedder
+	// is available (locked OR none) — so an update never leaves search serving a
+	// vector for the previous content.
+	if stored, err := e.DB.GetNodeByURI(storedURI); err == nil && stored != nil {
+		if err := e.EmbedNode(ctx, stored); err != nil {
+			log.Printf("remember: embed %s: %v", storedURI, err)
 		}
 	}
 
