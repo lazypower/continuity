@@ -258,6 +258,21 @@ CREATE TABLE metrics_daily (
 );
 `,
 	},
+	{
+		Version:     11,
+		Description: "mem_meta: key/value store for corpus-level facts (vector identity)",
+		// Additive table; no user data touched. Holds the corpus's DECLARED
+		// vector identity (model:dims) so the active embedder can be reconciled
+		// against it at startup instead of being chosen by environment alone —
+		// the root cause of the silent re-embed migration. See engine/identity.go.
+		SQL: `
+CREATE TABLE mem_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+`,
+	},
 }
 
 // headVersion is the highest schema version this binary knows how to apply.
@@ -285,7 +300,7 @@ func HeadSchemaVersion() int {
 // Typed error so callers (e.g. a future `continuity doctor` command or a
 // recovery flow) can branch on it without parsing the message string.
 type ErrSchemaTooNew struct {
-	Found    int
+	Found     int
 	Supported int
 }
 

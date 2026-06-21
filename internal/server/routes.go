@@ -234,13 +234,13 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	// deliberate act, not a passive notification."
 	if node.IsRetracted() && !includeRetracted {
 		out := map[string]any{
-			"uri":            node.URI,
-			"category":       node.Category,
-			"node_type":      node.NodeType,
-			"retracted":      true,
-			"tombstoned_at":  *node.TombstonedAt,
-			"created_at":     node.CreatedAt,
-			"updated_at":     node.UpdatedAt,
+			"uri":           node.URI,
+			"category":      node.Category,
+			"node_type":     node.NodeType,
+			"retracted":     true,
+			"tombstoned_at": *node.TombstonedAt,
+			"created_at":    node.CreatedAt,
+			"updated_at":    node.UpdatedAt,
 		}
 		if node.SupersededBy != "" {
 			out["superseded_by"] = node.SupersededBy
@@ -318,9 +318,9 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
 			json.NewEncoder(w).Encode(map[string]any{
-				"status":           "matches_retracted",
-				"matched_uris":     uris,
-				"hint":             "inspect each with `continuity show <uri> --include-retracted` before proceeding; pass --acknowledge-retracted to override",
+				"status":       "matches_retracted",
+				"matched_uris": uris,
+				"hint":         "inspect each with `continuity show <uri> --include-retracted` before proceeding; pass --acknowledge-retracted to override",
 			})
 			return
 		}
@@ -433,6 +433,17 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(map[string]string{"error": "search not available — no embedder configured"})
+		return
+	}
+
+	// Fail closed on a vector-identity mismatch: the active embedder is
+	// incompatible with the corpus's vector space, so any similarity score would
+	// be meaningless (cosine across dimensions is 0). Surface the repair path
+	// instead of silently returning noise.
+	if locked, reason := s.engine.VectorIdentityLocked(); locked {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": reason})
 		return
 	}
 

@@ -159,6 +159,46 @@ func (db *DB) snapshotBeforeRiskyMigration(m migration) (string, error) {
 	return snapPath, nil
 }
 
+// SnapshotNow writes a self-contained, WAL-consistent copy of the database to
+// the snapshot dir and returns its path. It uses VACUUM INTO — the SQLite-blessed
+// atomic copy — for the same WAL-safety reasons documented on
+// snapshotBeforeRiskyMigration (a naïve file copy would drop un-checkpointed
+// writes). Used by explicit, operator-invoked repairs (e.g. doctor
+// --repair-vectors) so a destructive re-embed always has a restore point.
+// Returns ("", nil) for an in-memory DB (nothing to snapshot).
+func (db *DB) SnapshotNow(label string) (string, error) {
+	if db.Path == "" || db.Path == ":memory:" {
+		return "", nil
+	}
+	snapDir := snapshotDirForDB(db.Path)
+	if err := os.MkdirAll(snapDir, 0o700); err != nil {
+		return "", fmt.Errorf("create snapshot dir %s: %w", snapDir, err)
+	}
+
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+			return r
+		default:
+			return '-'
+		}
+	}, label)
+	if safe == "" {
+		safe = "snapshot"
+	}
+
+	timestamp := time.Now().UTC().Format("2006-01-02T15-04-05Z")
+	snapPath := filepath.Join(snapDir, fmt.Sprintf("continuity-%s-%s.db", safe, timestamp))
+
+	if _, err := db.Exec("VACUUM INTO ?", snapPath); err != nil {
+		return "", fmt.Errorf("vacuum into %s: %w", snapPath, err)
+	}
+	if err := os.Chmod(snapPath, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not tighten permissions on snapshot %s: %v\n", snapPath, err)
+	}
+	return snapPath, nil
+}
+
 // recordSnapshotAndPruneOlder is called from migrate() AFTER a risky migration
 // has successfully committed. It does two things atomically: enrolls the new
 // snapshot in the tracking table, and removes any older snapshot records so

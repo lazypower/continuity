@@ -58,6 +58,7 @@ func findSimilarNode(ctx context.Context, db *store.DB, embedder Embedder,
 	if err != nil {
 		return nil, 0, fmt.Errorf("embed candidate: %w", err)
 	}
+	activeID := EmbedderIdentity(embedder)
 
 	vectors, err := db.AllVectors()
 	if err != nil {
@@ -85,6 +86,9 @@ func findSimilarNode(ctx context.Context, db *store.DB, embedder Embedder,
 	bestSim := 0.0
 
 	for _, v := range vectors {
+		if canonicalIdentity(v.Model, v.Dimensions) != activeID {
+			continue // never compare across vector spaces
+		}
 		node, ok := nodeMap[v.NodeID]
 		if !ok || node.NodeType != "leaf" || node.Category != category {
 			continue
@@ -205,19 +209,21 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 		}
 		log.Printf("extraction: stored %s [%s]", uri, c.Category)
 
-		// Embed the new node if embedder is available
-		if embedder != nil && node.L0Abstract != "" {
-			vec, err := embedder.Embed(ctx, node.L0Abstract)
-			if err != nil {
-				log.Printf("extraction: embed %s: %v", uri, err)
-			} else {
-				// Need to look up the node to get its ID (UpsertNode may have merged)
-				stored, err := db.GetNodeByURI(node.URI)
-				if err == nil && stored != nil {
-					if err := db.SaveVector(stored.ID, vec, embedder.Model()); err != nil {
-						log.Printf("extraction: save vector %s: %v", uri, err)
-					}
+		// Keep the stored vector in sync with the (possibly updated) content.
+		// UpsertNode may have merged into an existing node — look it up for its ID.
+		// When no usable embedder is available (locked / none), DELETE any existing
+		// vector instead of skipping: otherwise a content update leaves a stale
+		// vector that search would serve once the embedder returns (EmbedMissing
+		// only fills MISSING vectors). DeleteVector is a no-op for a fresh node.
+		if stored, err := db.GetNodeByURI(node.URI); err == nil && stored != nil {
+			if embedder != nil && node.L0Abstract != "" {
+				if vec, err := embedder.Embed(ctx, node.L0Abstract); err != nil {
+					log.Printf("extraction: embed %s: %v", uri, err)
+				} else if err := db.SaveVector(stored.ID, vec, embedder.Model()); err != nil {
+					log.Printf("extraction: save vector %s: %v", uri, err)
 				}
+			} else if err := db.DeleteVector(stored.ID); err != nil {
+				log.Printf("extraction: clear stale vector %s: %v", uri, err)
 			}
 		}
 	}

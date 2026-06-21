@@ -18,6 +18,21 @@ type Engine struct {
 	LLM      llm.Client
 	Embedder Embedder
 	stopCh   chan struct{}
+
+	// Vector-identity lock. Set by ReconcileVectorIdentity when the active
+	// embedder's identity differs from the corpus's declared identity. While
+	// locked, search must fail closed rather than compare query vectors against
+	// a corpus embedded in a different vector space, and EmbedMissing must not
+	// run (no silent re-embed). Cleared only by an explicit repair.
+	identityMismatch bool
+	identityReason   string
+}
+
+// VectorIdentityLocked reports whether the active embedder is incompatible with
+// the corpus's declared vector identity. When true, reason explains the
+// mismatch and points the operator at repair; callers (search) must fail closed.
+func (e *Engine) VectorIdentityLocked() (bool, string) {
+	return e.identityMismatch, e.identityReason
 }
 
 // New creates a new Engine.
@@ -34,10 +49,17 @@ func (e *Engine) SetEmbedder(emb Embedder) {
 	e.Embedder = emb
 }
 
-// EmbedNode generates and stores an embedding for a single node.
+// EmbedNode brings a node's stored vector in sync with its current content, or
+// removes a stale one. When the active embedder can't produce a vector
+// compatible with the corpus — none configured, or the vector identity is locked
+// — it DELETES any existing vector and leaves the node Pending. This is critical
+// on a content UPDATE: skipping the embed while leaving the old vector in place
+// would make search serve a vector describing the previous content once the
+// embedder returns (EmbedMissing only fills MISSING vectors). DeleteVector is a
+// no-op when none exists, so a fresh node simply stays Pending.
 func (e *Engine) EmbedNode(ctx context.Context, node *store.MemNode) error {
-	if e.Embedder == nil {
-		return nil
+	if e.Embedder == nil || e.identityMismatch {
+		return e.DB.DeleteVector(node.ID)
 	}
 	text := node.L0Abstract
 	if text == "" {
@@ -51,9 +73,18 @@ func (e *Engine) EmbedNode(ctx context.Context, node *store.MemNode) error {
 	return e.DB.SaveVector(node.ID, vec, e.Embedder.Model())
 }
 
-// EmbedMissing embeds all leaf nodes that don't have a vector or whose model differs.
+// EmbedMissing embeds leaf nodes that have NO vector yet, using the active
+// embedder. It deliberately does NOT re-embed nodes whose stored model differs
+// from the active embedder: re-embedding an existing corpus into a new vector
+// space is a corpus migration and must be explicit (snapshot-first repair), not
+// a silent side effect of startup. Callers run this only when the active
+// embedder matches the corpus's declared vector identity (see
+// ReconcileVectorIdentity); while the identity is locked, it must not run.
 func (e *Engine) EmbedMissing(ctx context.Context) (int, error) {
 	if e.Embedder == nil {
+		return 0, nil
+	}
+	if e.identityMismatch {
 		return 0, nil
 	}
 
@@ -68,13 +99,15 @@ func (e *Engine) EmbedMissing(ctx context.Context) (int, error) {
 			continue
 		}
 
-		// Check if vector exists with current model
+		// Fill only truly-missing vectors. A vector that exists under a
+		// different model is STALE, not missing — leave it for explicit repair
+		// rather than silently re-embedding it into the active vector space.
 		existing, err := e.DB.GetVector(leaves[i].ID)
 		if err != nil {
 			log.Printf("embed missing: get vector for %s: %v", leaves[i].URI, err)
 			continue
 		}
-		if existing != nil && existing.Model == e.Embedder.Model() {
+		if existing != nil {
 			continue
 		}
 
@@ -158,8 +191,15 @@ func (e *Engine) Dedup(ctx context.Context, threshold float64) (int, error) {
 		return 0, fmt.Errorf("load vectors: %w", err)
 	}
 
+	// Cluster only within the active identity — never delete a memory based on a
+	// cross-space cosine score against a stale foreign-identity vector (which can
+	// linger even when active==declared, e.g. after an interrupted repair).
+	activeID := EmbedderIdentity(e.Embedder)
 	vecMap := make(map[int64][]float64, len(vectors))
 	for _, v := range vectors {
+		if canonicalIdentity(v.Model, v.Dimensions) != activeID {
+			continue
+		}
 		vecMap[v.NodeID] = v.Embedding
 	}
 
@@ -294,6 +334,15 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 		return "", false, validationErrorf("uri %s is retracted; choose a different slug", requestedURI)
 	}
 
+	// While the vector identity is locked, the retracted-memory safety gate
+	// cannot run (the active embedder is incompatible with the corpus). Fail
+	// CLOSED: refuse an unacknowledged write rather than risk re-introducing
+	// retracted (e.g. PII) content the gate would have caught. An explicit
+	// --acknowledge-retracted still overrides, matching the unlocked flow.
+	if !input.AcknowledgeRetracted && e.identityMismatch {
+		return "", false, validationErrorf("vector identity is locked — the retracted-memory check cannot run; resolve with `continuity doctor` (and --repair-vectors), or re-run with --acknowledge-retracted to write without the check")
+	}
+
 	// Dedup against retracted memories. Retracted memories must still participate
 	// in similarity matching, or retraction-because-PII is silently broken: the
 	// next session writes similar content, hits no match, re-introduces the leak.
@@ -337,13 +386,13 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 	storedURI := node.URI
 	log.Printf("remember: stored %s [%s] (created=%v)", storedURI, c.Category, created)
 
-	// Embed if available
-	if e.Embedder != nil && node.L0Abstract != "" {
-		stored, err := e.DB.GetNodeByURI(storedURI)
-		if err == nil && stored != nil {
-			if err := e.EmbedNode(ctx, stored); err != nil {
-				log.Printf("remember: embed %s: %v", storedURI, err)
-			}
+	// Reconcile the stored vector with the new content UNCONDITIONALLY: EmbedNode
+	// embeds when possible, or clears a stale vector when no compatible embedder
+	// is available (locked OR none) — so an update never leaves search serving a
+	// vector for the previous content.
+	if stored, err := e.DB.GetNodeByURI(storedURI); err == nil && stored != nil {
+		if err := e.EmbedNode(ctx, stored); err != nil {
+			log.Printf("remember: embed %s: %v", storedURI, err)
 		}
 	}
 
@@ -367,6 +416,13 @@ const maxMoments = 10
 // most "covered" by the rest gets evicted.
 // Returns the URI of the evicted moment, or empty string if no eviction needed.
 func (e *Engine) evictRedundantMoment(ctx context.Context) (string, error) {
+	// While the vector identity is locked, do not run vector-based eviction:
+	// comparing moments across vector spaces could delete a real moment on
+	// cross-space noise rather than a genuinely redundant one.
+	if e.identityMismatch {
+		return "", nil
+	}
+
 	moments, err := e.DB.FindByCategory("moments")
 	if err != nil {
 		return "", fmt.Errorf("find moments: %w", err)
@@ -394,11 +450,15 @@ func (e *Engine) evictRedundantMoment(ctx context.Context) (string, error) {
 		node store.MemNode
 		vec  []float64
 	}
+	activeID := EmbedderIdentity(e.Embedder)
 	var pool []momentVec
 	for _, m := range moments {
 		v, err := e.DB.GetVector(m.ID)
 		if err != nil || v == nil {
 			continue
+		}
+		if canonicalIdentity(v.Model, v.Dimensions) != activeID {
+			continue // never compare across vector spaces
 		}
 		pool = append(pool, momentVec{m, v.Embedding})
 	}
@@ -486,13 +546,15 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 		}
 		log.Printf("signal: stored %s [%s]", uri, c.Category)
 
-		// Embed if available
-		if e.Embedder != nil && node.L0Abstract != "" {
-			stored, err := e.DB.GetNodeByURI(node.URI)
-			if err == nil && stored != nil {
-				if vec, err := e.Embedder.Embed(ctx, stored.L0Abstract); err == nil {
-					e.DB.SaveVector(stored.ID, vec, e.Embedder.Model())
+		// Keep the stored vector in sync; when locked/none, DELETE any stale vector
+		// so a content update can't leave search serving the previous content.
+		if stored, err := e.DB.GetNodeByURI(node.URI); err == nil && stored != nil {
+			if emb := e.embedderIfUnlocked(); emb != nil && stored.L0Abstract != "" {
+				if vec, err := emb.Embed(ctx, stored.L0Abstract); err == nil {
+					e.DB.SaveVector(stored.ID, vec, emb.Model())
 				}
+			} else {
+				e.DB.DeleteVector(stored.ID)
 			}
 		}
 	}
@@ -587,7 +649,10 @@ func (e *Engine) extractSession(sessionID, transcriptPath string, force bool) er
 		return nil
 	}
 
-	if err := extractMemories(e.DB, e.LLM, e.Embedder, sessionID, transcriptPath); err != nil {
+	// embedderIfUnlocked: while the vector identity is locked, extract still
+	// creates memory nodes but leaves them Pending (nil embedder => no vector),
+	// rather than writing into an incompatible vector space.
+	if err := extractMemories(e.DB, e.LLM, e.embedderIfUnlocked(), sessionID, transcriptPath); err != nil {
 		return fmt.Errorf("memory extraction: %w", err)
 	}
 

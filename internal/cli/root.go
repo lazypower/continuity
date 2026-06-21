@@ -32,4 +32,5 @@ func init() {
 	rootCmd.AddCommand(uninstallServiceCmd)
 	rootCmd.AddCommand(extractCmd)
 	rootCmd.AddCommand(snapshotCmd)
+	rootCmd.AddCommand(doctorCmd)
 }

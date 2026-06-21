@@ -99,6 +99,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// os.Executable is best-effort; an empty string is acceptable for clients.
 	exe, _ := os.Executable()
 
+	// Advertise the embedder the running server ACTUALLY uses (and whether the
+	// corpus vector identity is locked), so doctor compares against the live
+	// embedder instead of re-resolving a fresh one — the fresh-resolve blind spot.
+	activeEmbedder := ""
+	identityLocked := false
+	if s.engine != nil {
+		activeEmbedder = s.engine.ActiveIdentity()
+		identityLocked, _ = s.engine.VectorIdentityLocked()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		// Existing fields, preserved for backward-compat.
@@ -115,6 +125,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"started_at":     s.started.Unix(),
 		"db_path":        s.db.Path,
 		"exe":            exe,
+
+		// Vector-identity fields: what the live server embeds with, and whether
+		// search is locked due to a corpus/embedder mismatch.
+		"active_embedder":        activeEmbedder,
+		"vector_identity_locked": identityLocked,
 	})
 }
 
