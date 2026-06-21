@@ -255,9 +255,24 @@ func (db *DB) UpsertNode(node *MemNode) error {
 		return nil
 	}
 
-	// Immutable — create as new node with deduplicated URI
+	// Immutable — create as new node with deduplicated URI.
+	baseURI := node.URI
 	node.URI = fmt.Sprintf("%s-%d", node.URI, time.Now().UnixMilli())
-	return db.CreateNode(node)
+	if err := db.CreateNode(node); err != nil {
+		return err
+	}
+	// Close the read→insert race: an INSERT has no WHERE guard like the mergeable
+	// branch, so if the base node was retracted between the IsRetracted() check
+	// above and this insert, the suffixed node would resurrect just-retracted
+	// content. Re-check and compensate (delete + fail closed). The suffixed node is
+	// only ever visible after UpsertNode returns, so this transient insert is safe.
+	if base, err := db.GetNodeByURI(baseURI); err == nil && base != nil && base.IsRetracted() {
+		if delErr := db.DeleteNode(node.ID); delErr != nil {
+			return fmt.Errorf("rollback suffixed resurrection of %s: %w", baseURI, delErr)
+		}
+		return ErrRetractedTarget
+	}
+	return nil
 }
 
 // FindByCategory returns live leaf nodes for a given category, ordered by relevance DESC.

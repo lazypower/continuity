@@ -54,7 +54,6 @@ Rules:
 - l0: One sentence, MAXIMUM 200 CHARACTERS. Injected into every session — brevity is critical. Specific enough to deduplicate against.
 - l1: Structured overview, MAXIMUM 2000 CHARACTERS (~300 words). Concrete and actionable. This is the primary context injection tier — compress aggressively.
 - l2: Full content with all context, MAXIMUM 40000 CHARACTERS. Only retrieved on-demand.
-- merge_target: existing URI if this updates/refines known information
 - Return ONLY a JSON array, no other text
 
 Return a JSON array:
@@ -63,8 +62,7 @@ Return a JSON array:
   "uri_hint": "slug-name",
   "l0": "single sentence abstract",
   "l1": "structured overview (for feedback: <rule>. Why: <reason>. How to apply: <when>.)",
-  "l2": "full content",
-  "merge_target": "mem://... or empty"
+  "l2": "full content"
 }]
 
 If nothing meets the extraction bar, return: []`, InternalSentinel, condensed)
@@ -156,8 +154,7 @@ Return a JSON array:
   "uri_hint": "slug-name",
   "l0": "single sentence, max 200 chars",
   "l1": "structured overview, max 2000 chars (for feedback: <rule>. Why: <reason>. How to apply: <when>.)",
-  "l2": "full content, max 40000 chars",
-  "merge_target": "mem://... or empty"
+  "l2": "full content, max 40000 chars"
 }]`, InternalSentinel, prompt)
 }
 

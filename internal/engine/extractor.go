@@ -18,13 +18,17 @@ import (
 const defaultSimilarityThreshold = 0.65
 
 // memoryCandidate is the JSON structure returned by the extraction LLM.
+//
+// Note: there is intentionally no merge_target field. An LLM-chosen merge URI is
+// not trusted (it was a recurring retracted-PII gate-bypass surface); dedup is
+// owned by the system via findSimilarNode. Any merge_target the LLM emits is
+// simply ignored as an unknown JSON key.
 type memoryCandidate struct {
-	Category    string `json:"category"`
-	URIHint     string `json:"uri_hint"`
-	L0          string `json:"l0"`
-	L1          string `json:"l1"`
-	L2          string `json:"l2"`
-	MergeTarget string `json:"merge_target"`
+	Category string `json:"category"`
+	URIHint  string `json:"uri_hint"`
+	L0       string `json:"l0"`
+	L1       string `json:"l1"`
+	L2       string `json:"l2"`
 }
 
 // ownerForCategory returns the URI owner for a given category.
