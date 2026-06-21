@@ -41,6 +41,21 @@ func ownerForCategory(category string) string {
 	}
 }
 
+// categoryFromURI extracts the category segment from a mem:// URI of the form
+// mem://<owner>/<category>/<slug>. Returns "" if the URI is not in that shape, so
+// callers can fall back to a known category rather than gating on an empty one.
+func categoryFromURI(uri string) string {
+	rest := strings.TrimPrefix(uri, "mem://")
+	if rest == uri {
+		return ""
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) < 3 {
+		return ""
+	}
+	return parts[1]
+}
+
 // validCategories defines the allowed memory categories.
 var validCategories = map[string]bool{
 	"profile": true, "preferences": true, "entities": true,
@@ -181,28 +196,6 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 			uri = c.MergeTarget
 		}
 
-		// Retraction-resurrection gate (per-candidate, fail-closed): an extracted
-		// candidate that matches a retracted memory must NOT be written — otherwise
-		// retracted (e.g. PII) content silently resurfaces as a fresh live node.
-		// findSimilarNode above deliberately skips retracted nodes (so it can never
-		// merge INTO one), which is exactly why this separate gate is required to
-		// catch the create-a-new-node resurrection path. Skip only the offending
-		// candidate — one bad candidate must not drop the rest of the batch. On a
-		// gate error we also skip (fail closed) rather than write unchecked. The
-		// embedder is nil only in `none` mode (operator opted out of the gate) — the
-		// locked case is deferred upstream in extractSession, never reaching here.
-		if embedder != nil && c.L0 != "" {
-			matches, err := findRetractedMatchesIn(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
-			if err != nil {
-				log.Printf("extraction: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
-				continue
-			}
-			if len(matches) > 0 {
-				log.Printf("extraction: skipping %s — matches %d retracted node(s) hash=%s", uri, len(matches), hashMatchedURIs(matches))
-				continue
-			}
-		}
-
 		// Similarity gate: check if a semantically equivalent node already exists
 		if embedder != nil && c.Category != "" {
 			match, sim, err := findSimilarNode(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
@@ -215,13 +208,40 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 			}
 		}
 
+		// Retraction-resurrection gate (per-candidate, fail-closed): a candidate
+		// that matches a retracted memory must NOT be written — otherwise retracted
+		// (e.g. PII) content silently resurfaces as a fresh live node. findSimilarNode
+		// deliberately skips retracted nodes (so it can't merge INTO one), which is
+		// why this separate semantic gate is required to catch the create-a-new-node
+		// path. It runs AFTER URI resolution and keys on the category the content
+		// actually lands in (categoryFromURI of the resolved uri, not the candidate's
+		// declared category): a cross-category merge_target must be checked against
+		// retracted nodes of the TARGET category, or the gate checks the wrong space.
+		// Skip only the offending candidate — one bad candidate must not drop the
+		// rest of the batch; on a gate error we also skip (fail closed). The embedder
+		// is nil only in `none` mode (gate opted out); the locked case is deferred
+		// upstream in extractSession.
+		if embedder != nil && c.L0 != "" {
+			gateCat := categoryFromURI(uri)
+			if gateCat == "" {
+				gateCat = c.Category
+			}
+			matches, err := findRetractedMatchesIn(ctx, db, embedder, c.L0, gateCat, MatchThreshold(embedder))
+			if err != nil {
+				log.Printf("extraction: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
+				continue
+			}
+			if len(matches) > 0 {
+				log.Printf("extraction: skipping %s — matches %d retracted node(s) hash=%s", uri, len(matches), hashMatchedURIs(matches))
+				continue
+			}
+		}
+
 		// Exact retracted-URI guard (mirrors Remember): an LLM-supplied uri_hint or
 		// merge_target can point straight at a retracted node, which the vector gate
-		// won't catch if that node has no same-identity vector. UpsertNode would then
-		// overwrite a retracted mergeable row in place, or spawn a live timestamp-
-		// suffixed duplicate of retracted immutable content — resurrection by exact
-		// targeting. Skip the candidate (the similarity gate only ever redirects to
-		// LIVE nodes, so this can't be a false positive from that redirect).
+		// won't catch if that node has no same-identity vector. UpsertNode enforces
+		// this atomically too (ErrRetractedTarget), but skipping here keeps a clean
+		// per-candidate log and avoids the wasted write attempt.
 		if existing, err := db.GetNodeByURI(uri); err == nil && existing != nil && existing.IsRetracted() {
 			log.Printf("extraction: skipping %s — target URI is retracted (would resurrect)", uri)
 			continue

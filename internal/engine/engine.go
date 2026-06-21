@@ -541,12 +541,18 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 		}
 
 		// Retraction-resurrection gate (per-candidate, fail-closed): a signal
-		// candidate matching a retracted memory must not be written. Skip only the
-		// offending candidate; on a gate error skip it too rather than write
-		// unchecked. (Locked identity is handled above; embedder is nil here only in
-		// `none` mode, where the operator opted out of the gate.)
+		// candidate matching a retracted memory must not be written. Keys on the
+		// category the content actually lands in (categoryFromURI of the resolved
+		// uri, not the declared category) so a cross-category merge_target is checked
+		// against the TARGET category. Skip only the offending candidate; on a gate
+		// error skip it too rather than write unchecked. (Locked identity is handled
+		// above; embedder is nil here only in `none` mode — gate opted out.)
 		if emb := e.embedderIfUnlocked(); emb != nil && c.L0 != "" {
-			matches, err := e.findRetractedMatches(ctx, c.L0, c.Category, MatchThreshold(emb))
+			gateCat := categoryFromURI(uri)
+			if gateCat == "" {
+				gateCat = c.Category
+			}
+			matches, err := e.findRetractedMatches(ctx, c.L0, gateCat, MatchThreshold(emb))
 			if err != nil {
 				log.Printf("signal: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
 				continue

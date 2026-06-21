@@ -134,6 +134,47 @@ func TestSignal_SkipsExactRetractedURICollision(t *testing.T) {
 	assertNoResurrection(t, db, uri, before)
 }
 
+// TestExtraction_GatesEffectiveCategoryOnCrossCategoryMergeTarget pins the
+// merge_target category-mismatch fix: a candidate declared in one category but
+// merge_target'd into a LIVE node of another category must be gated against
+// retracted nodes of the TARGET category. Otherwise content matching a retracted
+// preference, smuggled in as an "events" candidate merged onto a live preference,
+// would overwrite that live node — a semantic resurrection bypass.
+func TestExtraction_GatesEffectiveCategoryOnCrossCategoryMergeTarget(t *testing.T) {
+	db := testDB(t)
+	emb, _ := NewHashEmbedder(0)
+
+	// Retracted PREFERENCE carrying the sensitive content.
+	const secret = "social security number nine eight seven six five four"
+	seedRetracted(t, db, emb, "mem://user/preferences/old-secret", "preferences", secret)
+
+	// A LIVE preference the candidate will try to merge onto.
+	live := &store.MemNode{URI: "mem://user/preferences/live-pref", NodeType: "leaf", Category: "preferences",
+		L0Abstract: "favorite editor is vim", L1Overview: "Body content with enough length to pass validation thresholds easily."}
+	if err := db.CreateNode(live); err != nil {
+		t.Fatal(err)
+	}
+
+	// Candidate declares category "events" (no retracted events exist) but
+	// merge_targets the live preference, with L0 == the retracted preference's PII.
+	resp := `[{"category":"events","uri_hint":"innocuous","merge_target":"mem://user/preferences/live-pref","l0":"social security number nine eight seven six five four","l1":"Body content with enough length to pass validation thresholds easily."}]`
+	mock := &llm.MockClient{Response: &llm.Response{Content: resp, Provider: "mock"}}
+
+	if err := extractMemories(db, mock, emb, "sess", makeTranscript(t)); err != nil {
+		t.Fatalf("extractMemories: %v", err)
+	}
+
+	got, _ := db.GetNodeByURI("mem://user/preferences/live-pref")
+	if got == nil || got.L0Abstract != "favorite editor is vim" {
+		t.Errorf("cross-category merge_target resurrected retracted PII into the live preference: L0=%q", func() string {
+			if got == nil {
+				return "(nil)"
+			}
+			return got.L0Abstract
+		}())
+	}
+}
+
 // TestExtraction_DeferredWhenLocked pins finding #2: while the vector identity is
 // locked the gate cannot run, so extraction must write NOTHING (fail closed) and
 // must not mark the session extracted. Proven non-vacuous by showing the same

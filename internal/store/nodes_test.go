@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -349,4 +350,37 @@ func testDB(t *testing.T) *DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// TestUpsertNode_RefusesRetractedTarget pins the store-level invariant that
+// upsert never resurrects a tombstone — the atomic backstop behind the engine's
+// caller-side guards (closes the check-then-write race with a concurrent
+// retraction). Covers both mergeable (in-place overwrite) and immutable
+// (suffixed-duplicate) shapes.
+func TestUpsertNode_RefusesRetractedTarget(t *testing.T) {
+	db := testDB(t)
+
+	for _, tc := range []struct{ uri, category string }{
+		{"mem://user/preferences/merge-me", "preferences"}, // mergeable
+		{"mem://user/events/immutable-one", "events"},      // immutable
+	} {
+		seedNode(t, db, tc.uri, tc.category, "original content for "+tc.category)
+		if _, err := db.RetractNode(tc.uri, "forget this", ""); err != nil {
+			t.Fatalf("retract %s: %v", tc.uri, err)
+		}
+		before, _ := db.GetNodeByURI(tc.uri)
+
+		err := db.UpsertNode(&MemNode{
+			URI: tc.uri, NodeType: "leaf", Category: tc.category,
+			L0Abstract: "RESURRECTED content", L1Overview: "resurrected body content here.",
+		})
+		if !errors.Is(err, ErrRetractedTarget) {
+			t.Errorf("%s: UpsertNode into retracted target = %v, want ErrRetractedTarget", tc.uri, err)
+		}
+		after, _ := db.GetNodeByURI(tc.uri)
+		if after.L0Abstract != before.L0Abstract || !after.IsRetracted() {
+			t.Errorf("%s: retracted node mutated by upsert: before L0=%q retracted=%v, after L0=%q retracted=%v",
+				tc.uri, before.L0Abstract, before.IsRetracted(), after.L0Abstract, after.IsRetracted())
+		}
+	}
 }
