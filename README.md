@@ -269,13 +269,14 @@ If it reports **degraded** (identity mismatch, stale vectors, or a locked server
 
 ```bash
 continuity doctor --repair-vectors          # dry-run: print the plan, change nothing
-continuity doctor --repair-vectors --apply  # snapshot first, then re-embed the whole
-                                            # corpus (retracted nodes included) to the
-                                            # active embedder, and rebind the identity
+continuity doctor --repair-vectors --apply  # snapshot first, then re-embed every
+                                            # stale/missing/foreign vector (retracted
+                                            # nodes included) to the active embedder,
+                                            # and rebind the corpus identity
 continuity restart                          # restart so the server clears the lock
 ```
 
-Repair rewrites only derived vectors and the identity marker — never memory content — and takes a migration safety snapshot first regardless.
+Repair rewrites only derived vectors and the identity marker — never memory content — and takes an explicit `pre-repair-vectors` snapshot first regardless.
 
 **`continuity search --explain`** shows the score decomposition (similarity, relevance) per result — useful for understanding why something ranked where it did, or confirming the active embedder is actually scoring.
 
