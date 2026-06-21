@@ -4,8 +4,6 @@ import (
 	"context"
 	"math"
 	"testing"
-
-	"github.com/lazypower/continuity/internal/store"
 )
 
 func TestTokenize(t *testing.T) {
@@ -15,7 +13,7 @@ func TestTokenize(t *testing.T) {
 	}{
 		{"Hello World", 2},
 		{"Go developer, prefers minimal dependencies.", 5},
-		{"a b c", 0},       // single chars skipped
+		{"a b c", 0}, // single chars skipped
 		{"SQLite WAL mode", 3},
 		{"", 0},
 	}
@@ -87,129 +85,99 @@ func TestCosineSimilarity(t *testing.T) {
 	}
 }
 
-func TestTFIDFEmbedder(t *testing.T) {
-	db := testDB(t)
-
-	// Seed some nodes
-	db.CreateNode(&store.MemNode{
-		URI: "mem://user/profile/go-dev", NodeType: "leaf", Category: "profile",
-		L0Abstract: "Go developer who prefers minimal dependencies",
-	})
-	db.CreateNode(&store.MemNode{
-		URI: "mem://user/profile/sqlite", NodeType: "leaf", Category: "profile",
-		L0Abstract: "Uses SQLite with WAL mode for concurrent reads",
-	})
-	db.CreateNode(&store.MemNode{
-		URI: "mem://agent/patterns/error-handling", NodeType: "leaf", Category: "patterns",
-		L0Abstract: "Pattern: graceful error handling with Go error wrapping",
-	})
-
-	embedder, err := NewTFIDFEmbedder(db, 512)
+func TestHashEmbedder(t *testing.T) {
+	emb, err := NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 
-	if embedder.Model() != "tfidf" {
-		t.Errorf("model = %q, want tfidf", embedder.Model())
+	if emb.Model() != "hashtf" {
+		t.Errorf("model = %q, want hashtf", emb.Model())
+	}
+	if emb.Dimensions() != defaultHashDims {
+		t.Errorf("dims = %d, want %d", emb.Dimensions(), defaultHashDims)
 	}
 
 	ctx := context.Background()
 
-	// Embed a query related to Go
-	vec, err := embedder.Embed(ctx, "Go developer minimal dependencies")
+	vec, err := emb.Embed(ctx, "Go developer minimal dependencies")
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
-	if len(vec) != embedder.Dimensions() {
-		t.Errorf("vec length = %d, want %d", len(vec), embedder.Dimensions())
+	if len(vec) != emb.Dimensions() {
+		t.Errorf("vec length = %d, want %d", len(vec), emb.Dimensions())
 	}
 
-	// Embed original node text — should have high similarity
-	nodeVec, _ := embedder.Embed(ctx, "Go developer who prefers minimal dependencies")
-	sim := CosineSimilarity(vec, nodeVec)
+	// Overlapping keywords → high cosine.
+	related, _ := emb.Embed(ctx, "Go developer who prefers minimal dependencies")
+	sim := CosineSimilarity(vec, related)
 	if sim < 0.5 {
-		t.Errorf("similar text cosine = %f, want > 0.5", sim)
+		t.Errorf("related cosine = %f, want > 0.5", sim)
 	}
 
-	// Embed unrelated text — should have lower similarity
-	unrelatedVec, _ := embedder.Embed(ctx, "Python machine learning tensorflow")
-	unrelatedSim := CosineSimilarity(vec, unrelatedVec)
-	if unrelatedSim >= sim {
-		t.Errorf("unrelated similarity %f should be less than related %f", unrelatedSim, sim)
+	// Disjoint keywords → lower cosine.
+	unrelated, _ := emb.Embed(ctx, "Python machine learning tensorflow")
+	if us := CosineSimilarity(vec, unrelated); us >= sim {
+		t.Errorf("unrelated similarity %f should be less than related %f", us, sim)
 	}
 }
 
-func TestTFIDFEmbedderEmpty(t *testing.T) {
-	db := testDB(t)
-
-	embedder, err := NewTFIDFEmbedder(db, 512)
+// TestHashEmbedderEmpty: text with no tokenizable terms embeds to an all-zero
+// vector of the fixed dimension (and must not panic).
+func TestHashEmbedderEmpty(t *testing.T) {
+	emb, err := NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 
-	// Should still work with no data
-	vec, err := embedder.Embed(context.Background(), "test query")
+	vec, err := emb.Embed(context.Background(), "  ?? !! ")
 	if err != nil {
 		t.Fatalf("Embed: %v", err)
 	}
-	if len(vec) != embedder.Dimensions() {
-		t.Errorf("vec length = %d, want %d", len(vec), embedder.Dimensions())
+	if len(vec) != emb.Dimensions() {
+		t.Errorf("vec length = %d, want %d", len(vec), emb.Dimensions())
+	}
+	for i, v := range vec {
+		if v != 0 {
+			t.Fatalf("token-less text must embed to all-zero; vec[%d]=%f", i, v)
+		}
 	}
 }
 
-// TestNewTFIDFEmbedder_IncludesRetractedInCorpus pins the issue #22 fix.
-// Pre-fix: NewTFIDFEmbedder called db.ListLeaves() which excludes retracted
-// nodes, so the IDF table lost terms that lived only on the retracted node.
-// Stored vectors (computed when that node was live) then lived in a different
-// vector space than fresh embeddings, silently degrading findRetractedMatches
-// recall. The fix loads from ListLeavesIncludingRetracted; this test asserts
-// the retracted node's unique vocabulary survives in the rebuilt IDF.
-func TestNewTFIDFEmbedder_IncludesRetractedInCorpus(t *testing.T) {
-	db := testDB(t)
+// TestHashEmbedderCorpusIndependent is the core regression test for the
+// fixed-dimension feature-hashing fix. The legacy corpus-derived TF-IDF rebuilt
+// its vocabulary (and thus its coordinate system) from the live corpus, so two
+// embedders constructed at different corpus sizes embedded the SAME text into
+// DIFFERENT vector spaces — silently defeating the retraction-resurrection gate,
+// which compares a fresh candidate vector against stored vectors. The hashed
+// embedder's coordinate system is fixed, so the same text always embeds to the
+// same vector regardless of corpus, restarts, or — proven here — rare vocabulary
+// no corpus has ever seen.
+func TestHashEmbedderCorpusIndependent(t *testing.T) {
+	ctx := context.Background()
+	a, _ := NewHashEmbedder(0)
+	b, _ := NewHashEmbedder(0)
 
-	// Seed two leaves with deliberately disjoint distinctive vocabulary so we
-	// can tell whether the retracted node's terms are present in the IDF.
-	if err := db.CreateNode(&store.MemNode{
-		URI: "mem://user/events/live", NodeType: "leaf", Category: "events",
-		L0Abstract: "ordinary common shared common words appear here",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.CreateNode(&store.MemNode{
-		URI: "mem://user/events/will-retract", NodeType: "leaf", Category: "events",
-		L0Abstract: "zebraqua quixotic glyphwerks distinctive unusual",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	const text = "zebraqua quixotic glyphwerks distinctive unusual"
+	va, _ := a.Embed(ctx, text)
+	vb, _ := b.Embed(ctx, text)
 
-	// Retract one node. Pre-fix, "zebraqua/quixotic/glyphwerks/distinctive/unusual"
-	// would vanish from the IDF.
-	if _, err := db.RetractNode("mem://user/events/will-retract", "test", ""); err != nil {
-		t.Fatal(err)
+	if len(va) != len(vb) {
+		t.Fatalf("dimension mismatch between independent embedders: %d vs %d", len(va), len(vb))
 	}
-
-	emb, err := NewTFIDFEmbedder(db, 512)
-	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
-	}
-
-	for _, term := range []string{"zebraqua", "quixotic", "glyphwerks", "distinctive", "unusual"} {
-		if _, ok := emb.idf[term]; !ok {
-			t.Errorf("IDF vocab missing retracted-only term %q after rebuild — corpus drift not contained", term)
+	for i := range va {
+		if va[i] != vb[i] {
+			t.Fatalf("independent embedders disagree at bucket %d (%f vs %f) — coordinate system is not stable", i, va[i], vb[i])
 		}
 	}
 
-	// Functional check: embedding a string of retracted-only terms must yield
-	// a non-zero vector. Pre-fix this would be all-zero (every term is OOV).
-	vec, err := emb.Embed(context.Background(), "zebraqua quixotic glyphwerks")
-	if err != nil {
-		t.Fatalf("Embed: %v", err)
-	}
+	// No OOV: rare vocabulary no corpus has ever indexed must still produce a
+	// non-zero vector. Corpus-TF-IDF would drop every such term as out-of-vocab.
 	var sumSquares float64
-	for _, x := range vec {
+	for _, x := range va {
 		sumSquares += x * x
 	}
 	if sumSquares == 0 {
-		t.Error("embedding of retracted-only vocabulary is all-zero — IDF table lost the terms")
+		t.Error("rare vocabulary embedded to all-zero — feature hashing must never have OOV")
 	}
 }

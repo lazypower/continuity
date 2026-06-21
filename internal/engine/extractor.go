@@ -183,7 +183,7 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 
 		// Similarity gate: check if a semantically equivalent node already exists
 		if embedder != nil && c.Category != "" {
-			match, sim, err := findSimilarNode(ctx, db, embedder, c.L0, c.Category, defaultSimilarityThreshold)
+			match, sim, err := findSimilarNode(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
 			if err != nil {
 				log.Printf("extraction: similarity check failed: %v", err)
 				// Continue with normal upsert on error — don't block extraction

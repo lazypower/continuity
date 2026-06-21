@@ -94,7 +94,7 @@ func scoreByURI(res []engine.SearchResult) map[string]float64 {
 
 // TestRetrievalGolden_Nomic_TopicalQueries pins that a real semantic embedder
 // surfaces the on-topic memory first, by a margin — including the "devbox" case
-// that TF-IDF mis-ranked (devbox preference must beat go-sandbox-runtime).
+// the lexical fallback mis-ranks (devbox preference must beat go-sandbox-runtime).
 func TestRetrievalGolden_Nomic_TopicalQueries(t *testing.T) {
 	db, emb := loadGoldenDB(t)
 	ctx := context.Background()
@@ -134,12 +134,12 @@ func TestRetrievalGolden_Nomic_TopicalQueries(t *testing.T) {
 	}
 }
 
-// TestRetrievalGolden_TFIDF_SelfRetrieval exercises the REAL TF-IDF fallback path
-// hermetically (pure Go, no fixture, no Ollama): build the embedder from the
-// corpus, embed every node, and confirm each retrieves itself at rank 1. TF-IDF
-// ranking quality is weak (it's best-effort), so this asserts the path WORKS, not
+// TestRetrievalGolden_HashLexical_SelfRetrieval exercises the REAL hashed lexical
+// fallback path hermetically (pure Go, no fixture, no Ollama): embed every node,
+// then confirm each retrieves itself at rank 1. Lexical ranking quality is weak
+// by design (keyword overlap, not semantic), so this asserts the path WORKS, not
 // that it ranks topical queries well — that's the nomic tier's job.
-func TestRetrievalGolden_TFIDF_SelfRetrieval(t *testing.T) {
+func TestRetrievalGolden_HashLexical_SelfRetrieval(t *testing.T) {
 	db, err := store.OpenMemory()
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)
@@ -153,10 +153,10 @@ func TestRetrievalGolden_TFIDF_SelfRetrieval(t *testing.T) {
 		}
 	}
 
-	// Build TF-IDF from the seeded corpus, then embed each node with it.
-	emb, err := engine.NewTFIDFEmbedder(db, 512)
+	// Construct the hashed lexical embedder (no corpus needed), embed each node.
+	emb, err := engine.NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 	ctx := context.Background()
 	for _, e := range goldretrieval.Corpus() {
@@ -180,7 +180,7 @@ func TestRetrievalGolden_TFIDF_SelfRetrieval(t *testing.T) {
 			got = res[0].Node.URI
 		}
 		if got != e.URI {
-			t.Errorf("tfidf self-retrieval %s: top = %s, want self", e.URI, got)
+			t.Errorf("hash-lexical self-retrieval %s: top = %s, want self", e.URI, got)
 		}
 	}
 }

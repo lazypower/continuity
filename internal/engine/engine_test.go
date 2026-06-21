@@ -546,9 +546,9 @@ func TestRememberHonorsExplicitSlug(t *testing.T) {
 	mock := &llm.MockClient{Response: &llm.Response{Content: "[]"}}
 	eng := New(db, mock)
 
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 	eng.SetEmbedder(embedder)
 
@@ -611,9 +611,9 @@ func TestMomentPoolEviction(t *testing.T) {
 	mock := &llm.MockClient{Response: &llm.Response{Content: "[]"}}
 	eng := New(db, mock)
 
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 	eng.SetEmbedder(embedder)
 
@@ -677,7 +677,7 @@ func TestMomentPoolNoEvictionUnderCap(t *testing.T) {
 	mock := &llm.MockClient{Response: &llm.Response{Content: "[]"}}
 	eng := New(db, mock)
 
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, _ := NewHashEmbedder(0)
 	eng.SetEmbedder(embedder)
 
 	ctx := context.Background()

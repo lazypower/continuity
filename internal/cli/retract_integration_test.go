@@ -222,8 +222,8 @@ func TestRetract_PIIScenario_FullLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Build embedder + embed (TFIDF needs corpus to exist before construction).
-	embedder, _ := engine.NewTFIDFEmbedder(db, 512)
+	// Set the hashed embedder + embed (it needs no corpus to construct).
+	embedder, _ := engine.NewHashEmbedder(0)
 	eng.SetEmbedder(embedder)
 	n, _ := db.GetNodeByURI(uri)
 	if err := eng.EmbedNode(context.Background(), n); err != nil {

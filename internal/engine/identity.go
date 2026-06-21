@@ -8,19 +8,15 @@ import (
 )
 
 // canonicalIdentity maps a (model, dimensions) pair to a corpus-binding vector
-// identity. Vectors are only comparable within the same identity.
-//
-// TF-IDF is special-cased to model-only: its output dimension is corpus-derived
-// (the vocabulary size, which grows as memories are added), so binding the
-// dimension would self-lock the fallback on normal corpus growth — tfidf:1 on a
-// fresh DB, tfidf:N after a few writes. The dimension carries no identity signal
-// for a corpus-derived embedder, so it is dropped. Stable embedders (real
-// models) bind model:dims, which catches the cross-model and cross-dimension
-// switches that are the actual failure mode.
+// identity. Vectors are only comparable within the same identity, so every
+// embedder — including the hashed lexical fallback — binds model:dims. The
+// fallback's dimension is now fixed (HashEmbedder, defaultHashDims), so binding
+// it no longer self-locks on corpus growth the way the old corpus-derived TF-IDF
+// would have. This also means an existing corpus written by the legacy "tfidf"
+// embedder no longer matches the new "hashtf:N" identity: it locks on upgrade
+// and is repaired by re-embedding (`continuity doctor --repair-vectors --apply`),
+// which is the intended migration path.
 func canonicalIdentity(model string, dims int) string {
-	if model == "tfidf" {
-		return "tfidf"
-	}
 	return fmt.Sprintf("%s:%d", model, dims)
 }
 

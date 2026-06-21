@@ -31,8 +31,8 @@ func TestHashURI_StableAndOpaque(t *testing.T) {
 	}
 }
 
-// seedAndEmbed inserts a leaf node and embeds it, building the embedder from
-// the post-seed corpus so TFIDF actually has signal. Returns the URI written.
+// seedAndEmbed inserts a leaf node and embeds it with the hashed lexical
+// embedder. Returns the URI written.
 func seedAndEmbed(t *testing.T, eng *Engine, category, name, summary, body string) string {
 	t.Helper()
 	uri, _, err := eng.Remember(context.Background(), RememberInput{
@@ -60,8 +60,8 @@ func TestFindRetractedMatches_FindsRetractedSkipsLive(t *testing.T) {
 		"Captured user's full home address by mistake during a session",
 		"Retracted memory body content with enough length to pass validation.")
 
-	// Build embedder AFTER seeding so the TFIDF corpus is populated. Re-embed.
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	// Set the hashed embedder and re-embed (it needs no corpus to construct).
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestFindRetractedMatches_RespectsCategory(t *testing.T) {
 		"shared and overlapping vocabulary across categories test",
 		"Body content with enough length to pass validation thresholds.")
 
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, _ := NewHashEmbedder(0)
 	eng.SetEmbedder(embedder)
 	n, _ := db.GetNodeByURI(uri)
 	if err := eng.EmbedNode(ctx, n); err != nil {
@@ -182,8 +182,8 @@ func TestRemember_SurfacesRetractedMatchAsError(t *testing.T) {
 		"operator's mother's maiden name discussed in context",
 		"Body content with enough length to pass validation thresholds easily.")
 
-	// Build the embedder after seeding so TFIDF has corpus, then re-embed.
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	// Set the hashed embedder, then re-embed (it needs no corpus to construct).
+	embedder, _ := NewHashEmbedder(0)
 	eng.SetEmbedder(embedder)
 	n, _ := db.GetNodeByURI(retracted)
 	if err := eng.EmbedNode(ctx, n); err != nil {
@@ -234,7 +234,7 @@ func TestRemember_AcknowledgeRetractedBypassesGate(t *testing.T) {
 		"pattern shape that future writes will collide with",
 		"Body content with enough length to pass validation thresholds easily.")
 
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, _ := NewHashEmbedder(0)
 	eng.SetEmbedder(embedder)
 	n, _ := db.GetNodeByURI(retracted)
 	if err := eng.EmbedNode(ctx, n); err != nil {
@@ -285,22 +285,22 @@ func TestRetractedMatchError_NoCategoryOrTagInline(t *testing.T) {
 }
 
 // TestFindRetractedMatches_TFIDFCorpusCoherent is the asserted regression
-// test for issue #22. Reproduces the production scenario:
+// test for the retraction-resurrection gate across an embedder rebuild.
+// Reproduces the production scenario:
 //
-//  1. Process A seeds + embeds N leaves under TFIDF Embedder A.
+//  1. Process A seeds + embeds N leaves under hashed Embedder A.
 //  2. Process A retracts one leaf.
-//  3. Process B starts and builds TFIDF Embedder B from the current corpus
-//     (the realistic restart path; the in-process embedder doesn't rebuild).
-//  4. A fresh write semantically identical to the retracted memory comes in.
-//     The gate must still fire — the candidate's fresh embedding (from
-//     Embedder B) must still match the stored vector (computed under A).
+//  3. Process B starts and constructs a fresh hashed Embedder B (the realistic
+//     restart path; the in-process embedder doesn't carry over).
+//  4. A fresh write that paraphrases the retracted memory comes in. The gate
+//     must still fire — the candidate's fresh embedding (from Embedder B) must
+//     still match the stored vector (computed under A).
 //
-// Pre-fix, Embedder B's IDF table differed from Embedder A's because the
-// retracted leaf's vocabulary contributed to A but not to B — vectors lived
-// in different spaces, cosine similarity degraded, and the smoke test in
-// smoke_test.go could only `logf` rather than assert. With the fix
-// (corpus = ListLeavesIncludingRetracted), both IDFs are identical and the
-// gate fires deterministically.
+// Under the legacy corpus-derived TF-IDF this was fragile: Embedder B's
+// vocabulary (and coordinate system) differed from A's because the corpus had
+// changed, so vectors lived in different spaces and cosine degraded. The hashed
+// embedder has a fixed coordinate system independent of corpus, so A and B embed
+// identically and the gate fires deterministically.
 func TestFindRetractedMatches_TFIDFCorpusCoherent(t *testing.T) {
 	db := testDB(t)
 	mock := &llm.MockClient{Response: &llm.Response{Content: "[]"}}
@@ -315,7 +315,7 @@ func TestFindRetractedMatches_TFIDFCorpusCoherent(t *testing.T) {
 		"User captured their personal home street address by accident in chat",
 		"Body content with enough length to pass validation thresholds easily.")
 
-	embedderA, err := NewTFIDFEmbedder(db, 512)
+	embedderA, err := NewHashEmbedder(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,10 +338,10 @@ func TestFindRetractedMatches_TFIDFCorpusCoherent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Step 3: simulate a process restart by building Embedder B fresh from
-	// the post-retraction corpus. Pre-fix, this used ListLeaves() and the
-	// retracted node's vocabulary dropped out, shifting IDF weights.
-	embedderB, err := NewTFIDFEmbedder(db, 512)
+	// Step 3: simulate a process restart by constructing Embedder B fresh.
+	// The hashed embedder takes no corpus, so B is identical to A regardless of
+	// the retraction — that is the property this test guards.
+	embedderB, err := NewHashEmbedder(0)
 	if err != nil {
 		t.Fatal(err)
 	}

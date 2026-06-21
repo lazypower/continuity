@@ -373,7 +373,7 @@ func runDedup(cmd *cobra.Command, args []string) error {
 		emb = engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768)
 		fmt.Printf("Embedder: ollama (%s)\n", embeddingModel)
 	} else {
-		emb, err = engine.NewTFIDFEmbedder(db, 512)
+		emb, err = engine.NewHashEmbedder(0)
 		if err != nil {
 			return fmt.Errorf("init tfidf embedder: %w", err)
 		}

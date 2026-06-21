@@ -269,12 +269,12 @@ func resolveActiveEmbedder(db *store.DB, cfg config.Config) (engine.Embedder, er
 	case "ollama":
 		return engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768), nil
 	case "tfidf":
-		return engine.NewTFIDFEmbedder(db, 512)
-	default: // auto: probe Ollama, fall back to TF-IDF
+		return engine.NewHashEmbedder(0)
+	default: // auto: probe Ollama, fall back to the hashed lexical embedder
 		if engine.ProbeOllama(ollamaURL, embeddingModel) {
 			return engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768), nil
 		}
-		return engine.NewTFIDFEmbedder(db, 512)
+		return engine.NewHashEmbedder(0)
 	}
 }
 

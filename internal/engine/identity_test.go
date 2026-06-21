@@ -60,7 +60,7 @@ func TestEmbedderIdentity(t *testing.T) {
 func TestReconcileFreshCorpusInitializes(t *testing.T) {
 	db := memTestDB(t)
 	e := New(db, nil)
-	e.SetEmbedder(stubEmbedder{model: "tfidf", dims: 512})
+	e.SetEmbedder(stubEmbedder{model: "hashtf", dims: 2048})
 
 	st, err := e.ReconcileVectorIdentity(context.Background())
 	if err != nil {
@@ -69,39 +69,42 @@ func TestReconcileFreshCorpusInitializes(t *testing.T) {
 	if !st.Match {
 		t.Fatalf("fresh corpus should match: %+v", st)
 	}
-	if id, ok, _ := db.VectorIdentity(); !ok || id != "tfidf" {
-		t.Fatalf("identity not initialized (tfidf is canonical model-only): %q ok=%v", id, ok)
+	if id, ok, _ := db.VectorIdentity(); !ok || id != "hashtf:2048" {
+		t.Fatalf("identity not initialized to active embedder: %q ok=%v", id, ok)
 	}
 	if locked, _ := e.VectorIdentityLocked(); locked {
 		t.Fatal("fresh corpus must not lock")
 	}
 }
 
-// TestReconcileTFIDFStableAcrossDimChange pins Codex finding #1: TF-IDF's
-// corpus-derived dimension must not self-lock the fallback. Stored tfidf at one
-// dim + active tfidf at another must MATCH (canonical identity is model-only).
-func TestReconcileTFIDFStableAcrossDimChange(t *testing.T) {
+// TestReconcileLegacyTFIDFCorpusLocks pins the migration trigger for the
+// stable-dimension fix: an existing corpus written by the legacy corpus-derived
+// "tfidf" embedder must NOT silently match the new fixed-dimension hashed
+// fallback ("hashtf:N"). The identities differ, so reconciliation locks (search
+// fails closed) and the operator repairs via `doctor --repair-vectors --apply`,
+// which re-embeds the corpus — retracted nodes included — into the stable space.
+// This is the inverse of the now-removed model-only special case: a legacy tfidf
+// vector at any dimension must trip the lock, not pass it.
+func TestReconcileLegacyTFIDFCorpusLocks(t *testing.T) {
 	db := memTestDB(t)
 	id := seedLeaf(t, db, "mem://agent/patterns/a", "alpha")
+	// Legacy vector: model "tfidf", a corpus-derived dimension.
 	if err := db.SaveVector(id, make([]float64, 300), "tfidf"); err != nil {
 		t.Fatal(err)
 	}
 
 	e := New(db, nil)
-	e.SetEmbedder(stubEmbedder{model: "tfidf", dims: 400}) // different dim, same embedder
+	e.SetEmbedder(stubEmbedder{model: "hashtf", dims: 2048})
 
 	st, err := e.ReconcileVectorIdentity(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !st.Match {
-		t.Fatalf("tfidf must not self-lock on dimension change: %+v", st)
+	if st.Match {
+		t.Fatalf("legacy tfidf corpus must not match the hashed fallback: %+v", st)
 	}
-	if locked, _ := e.VectorIdentityLocked(); locked {
-		t.Fatal("tfidf dim change must not lock")
-	}
-	if got, _, _ := db.VectorIdentity(); got != "tfidf" {
-		t.Fatalf("tfidf identity must be model-only, got %q", got)
+	if locked, reason := e.VectorIdentityLocked(); !locked || reason == "" {
+		t.Fatalf("legacy tfidf corpus must lock with a reason: locked=%v", locked)
 	}
 }
 

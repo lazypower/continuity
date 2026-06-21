@@ -65,7 +65,7 @@ func seedInvariantWorld(t *testing.T) *Server {
 	}
 
 	// Embed everything so dedup-against-retracted has signal to find.
-	embedder, err := engine.NewTFIDFEmbedder(db, 512)
+	embedder, err := engine.NewHashEmbedder(0)
 	if err != nil {
 		t.Fatalf("embedder: %v", err)
 	}
