@@ -161,17 +161,30 @@ func (h *HashEmbedder) Dimensions() int { return h.dims }
 // collisions unbiased; L2 normalization makes cosine length-independent.
 func (h *HashEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
 	vec := make([]float64, h.dims)
-	tokens := tokenize(text)
-	if len(tokens) == 0 {
-		return vec, nil
-	}
 
 	tf := make(map[string]int)
-	for _, tok := range tokens {
+	for _, tok := range tokenize(text) {
 		if _, stop := lexicalStopwords[tok]; stop {
 			continue // see lexicalStopwords: static stand-in for IDF down-weighting
 		}
 		tf[tok]++
+	}
+
+	// Degenerate input: no content tokens survived — the text is token-less,
+	// single-char-only after splitting (e.g. "x-y"), or entirely stopwords
+	// (e.g. "to-be"). A silent zero vector here is a false negative: the memory
+	// could not match ITSELF in search or the retraction-resurrection gate, the
+	// exact failure this embedder exists to prevent. Fall back to one coarse
+	// token over the text's alphanumerics so any real content embeds non-zero
+	// and self-consistently; only genuinely content-free text (pure punctuation)
+	// stays the zero vector.
+	if len(tf) == 0 {
+		if norm := alnumLower(text); norm != "" {
+			bucket, sign := hashFeature(norm, h.dims)
+			vec[bucket] = sign
+			normalize(vec)
+		}
+		return vec, nil
 	}
 
 	for term, count := range tf {
@@ -182,6 +195,19 @@ func (h *HashEmbedder) Embed(_ context.Context, text string) ([]float64, error) 
 
 	normalize(vec)
 	return vec, nil
+}
+
+// alnumLower returns text lowercased with every non-alphanumeric rune removed.
+// Used only for the degenerate-input fallback in Embed, to guarantee that any
+// text with alphanumeric content yields a non-zero, self-consistent vector.
+func alnumLower(text string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(text) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // lexicalStopwords is a fixed, corpus-independent set of high-frequency English

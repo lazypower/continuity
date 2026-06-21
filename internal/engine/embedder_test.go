@@ -147,6 +147,40 @@ func TestHashEmbedderEmpty(t *testing.T) {
 	}
 }
 
+// TestHashEmbedderDegenerateContentNonZero pins the round-2 fix: text that has
+// alphanumeric content but whose tokens are all stopwords ("to-be") or all
+// single-char after splitting ("x-y") must NOT embed to an all-zero vector —
+// otherwise the memory cannot match itself in search or the retraction gate.
+// Pure-punctuation text (no alphanumerics) legitimately stays zero.
+func TestHashEmbedderDegenerateContentNonZero(t *testing.T) {
+	ctx := context.Background()
+	emb, _ := NewHashEmbedder(0)
+
+	for _, in := range []string{"to-be", "on_off", "x-y", "2-f-a"} {
+		v, _ := emb.Embed(ctx, in)
+		var sumSq float64
+		for _, x := range v {
+			sumSq += x * x
+		}
+		if sumSq == 0 {
+			t.Errorf("degenerate-but-nonempty input %q embedded to all-zero — cannot match itself", in)
+		}
+		// Self-consistency: the same text must embed identically (so a re-write of
+		// retracted degenerate content still collides with itself).
+		if v2, _ := emb.Embed(ctx, in); CosineSimilarity(v, v2) < 0.999 {
+			t.Errorf("input %q does not self-match", in)
+		}
+	}
+
+	// Genuinely content-free text stays the zero vector.
+	z, _ := emb.Embed(ctx, "  ?? -- __ ")
+	for _, x := range z {
+		if x != 0 {
+			t.Fatalf("content-free text must embed to all-zero")
+		}
+	}
+}
+
 // TestHashEmbedderReformattedDigitsCollide pins the retraction-gate normalization
 // fix (Codex finding): the same PII written with different digit-group separators
 // must still land in the same buckets, so a reformatted re-write trips the gate.
