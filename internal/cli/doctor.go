@@ -124,7 +124,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	}
 
 	if doctorRepair {
-		return runDoctorRepair(db, emb, doctorApply)
+		return runDoctorRepair(db, emb, doctorApply, fetchServerIdentity())
 	}
 
 	leaves, err := db.ListLeaves()
@@ -153,7 +153,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 // --apply is passed. Repair rewrites only derived vectors (mem_vectors) and the
 // identity marker — never memory content — but a restore point is taken anyway,
 // per data-safety-is-paramount.
-func runDoctorRepair(db *store.DB, emb engine.Embedder, apply bool) error {
+func runDoctorRepair(db *store.DB, emb engine.Embedder, apply bool, srv serverIdentity) error {
 	if emb == nil {
 		return fmt.Errorf("no active embedder; cannot repair (start Ollama with nomic-embed-text, or allow the TF-IDF fallback)")
 	}
@@ -190,15 +190,19 @@ func runDoctorRepair(db *store.DB, emb engine.Embedder, apply bool) error {
 		return nil
 	}
 
-	// Refuse to repair under a live server that is running a DIFFERENT, unlocked
-	// embedder: it would keep writing its own-identity vectors against the corpus
-	// we just rebound, re-mixing it. Require the server stopped, locked, or in
-	// agreement before rewriting.
-	if srv := fetchServerIdentity(); srv.Reachable && !srv.Locked &&
-		srv.ActiveEmbedder != "" && srv.ActiveEmbedder != activeID {
-		return fmt.Errorf("the running server is embedding with %s (not locked) but repair targets %s; "+
-			"stop the server (or let it lock) before --apply, then `continuity restart` after — otherwise it "+
-			"would keep writing %s vectors into the repaired corpus", srv.ActiveEmbedder, activeID, srv.ActiveEmbedder)
+	// Refuse to repair under a live server unless it is STOPPED, LOCKED, or
+	// reports the SAME identity we're repairing to. A reachable, unlocked server
+	// that reports a different — or unknown (empty, e.g. an old pre-vector-identity
+	// binary still running mid-upgrade) — identity would keep writing its own
+	// vectors and re-mix the corpus right after the snapshot-first repair.
+	if srv.Reachable && !srv.Locked && srv.ActiveEmbedder != activeID {
+		reported := srv.ActiveEmbedder
+		if reported == "" {
+			reported = "unknown (a pre-vector-identity server still running?)"
+		}
+		return fmt.Errorf("a live server is reachable and unlocked, embedding as %s, but repair targets %s; "+
+			"stop the server (or upgrade+restart it so it locks or agrees) before --apply, then `continuity restart` "+
+			"after — otherwise it would keep writing into the repaired corpus", reported, activeID)
 	}
 
 	snap, err := db.SnapshotNow("pre-repair-vectors")

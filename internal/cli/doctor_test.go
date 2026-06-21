@@ -44,7 +44,7 @@ func TestDoctorRepairDryRunMakesNoChanges(t *testing.T) {
 	db, id := repairTestDB(t)
 	emb := repairStubEmbedder{model: "new-model", dims: 64}
 
-	if err := runDoctorRepair(db, emb, false); err != nil { // dry-run
+	if err := runDoctorRepair(db, emb, false, serverIdentity{}); err != nil { // dry-run, no server
 		t.Fatal(err)
 	}
 	v, _ := db.GetVector(id)
@@ -56,11 +56,36 @@ func TestDoctorRepairDryRunMakesNoChanges(t *testing.T) {
 	}
 }
 
+// TestDoctorRepairRefusesUnderLiveServer pins Codex round-4: --apply must refuse
+// when a reachable, unlocked server reports a different (or unknown/empty, e.g.
+// an old binary mid-upgrade) identity than the repair target.
+func TestDoctorRepairRefusesUnderLiveServer(t *testing.T) {
+	db, id := repairTestDB(t)
+	emb := repairStubEmbedder{model: "new-model", dims: 64}
+
+	// Different identity:
+	if err := runDoctorRepair(db, emb, true, serverIdentity{Reachable: true, ActiveEmbedder: "other:768"}); err == nil {
+		t.Fatal("apply must refuse under a live server with a different identity")
+	}
+	// Unknown/empty identity (old pre-vector-identity server):
+	if err := runDoctorRepair(db, emb, true, serverIdentity{Reachable: true, ActiveEmbedder: ""}); err == nil {
+		t.Fatal("apply must refuse under a reachable server reporting an unknown identity")
+	}
+	// Nothing should have been written.
+	if v, _ := db.GetVector(id); v == nil || v.Model != "old-model" {
+		t.Fatalf("refused repair must not write; got %+v", v)
+	}
+	// A LOCKED server is safe (not writing):
+	if err := runDoctorRepair(db, emb, true, serverIdentity{Reachable: true, Locked: true}); err != nil {
+		t.Fatalf("apply under a locked server should proceed: %v", err)
+	}
+}
+
 func TestDoctorRepairApplyReembedsAndRebinds(t *testing.T) {
 	db, id := repairTestDB(t)
 	emb := repairStubEmbedder{model: "new-model", dims: 64}
 
-	if err := runDoctorRepair(db, emb, true); err != nil { // apply
+	if err := runDoctorRepair(db, emb, true, serverIdentity{}); err != nil { // apply, no live server
 		t.Fatal(err)
 	}
 	v, _ := db.GetVector(id)
