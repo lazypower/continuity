@@ -1,4 +1,4 @@
-import type { TreeResponse, SearchResponse, ProfileResponse, HealthResponse } from './types';
+import type { TreeResponse, SearchResponse, ProfileResponse, HealthResponse, MetricsResponse } from './types';
 
 const BASE = '/api';
 
@@ -33,4 +33,8 @@ export function fetchSearch(
 
 export function fetchProfile(): Promise<ProfileResponse> {
   return get('/profile');
+}
+
+export function fetchMetrics(): Promise<MetricsResponse> {
+  return get('/metrics');
 }

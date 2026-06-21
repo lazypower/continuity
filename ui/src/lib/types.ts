@@ -59,7 +59,9 @@ export interface HealthResponse {
   db: boolean;
 }
 
-export type Category = 'profile' | 'preferences' | 'feedback' | 'entities' | 'events' | 'patterns' | 'cases' | 'reference';
+export type Category =
+  | 'profile' | 'preferences' | 'feedback' | 'entities' | 'events'
+  | 'patterns' | 'cases' | 'reference' | 'moments' | 'session';
 
 export const categoryColors: Record<Category, string> = {
   profile: 'var(--color-profile)',
@@ -70,4 +72,82 @@ export const categoryColors: Record<Category, string> = {
   patterns: 'var(--color-patterns)',
   cases: 'var(--color-cases)',
   reference: 'var(--color-reference)',
+  moments: 'var(--color-accent)',
+  session: 'var(--text-secondary)',
 };
+
+// ── Memory Health metrics (GET /api/metrics) ─────────────────────────────────
+
+export interface MetricNode {
+  uri: string;
+  category: string;
+  l0_abstract: string;
+  relevance: number;
+  access_count: number;
+  last_access?: number;
+  created_at: number;
+  age_days: number;
+}
+
+export interface CategoryShare {
+  category: string;
+  count: number;
+  share: number;
+}
+
+export interface HistBin {
+  lo: number;
+  hi: number;
+  count: number;
+}
+
+export interface DailyPoint {
+  date: string; // 'YYYY-MM-DD'
+  captures: number;
+  retrievals: number;
+  active_total: number;
+  fresh: number;
+  fading: number;
+  stale: number;
+  has_snapshot: boolean;
+}
+
+export interface MetricsResponse {
+  generated_at: number;
+  summary: {
+    active_total: number;
+    retracted_total: number;
+    fresh: number;
+    fading: number;
+    stale: number;
+    never_retrieved: number;
+    retraction_rate: number;
+    recent_retractions: number;
+  };
+  categories: CategoryShare[];
+  histogram: HistBin[];
+  needs_attention: {
+    stale_high_retrieval: MetricNode[] | null;
+    never_retrieved_old: MetricNode[] | null;
+    near_decay_cliff: MetricNode[] | null;
+    orphaned_tombstones: MetricNode[] | null;
+  };
+  critical: MetricNode[] | null;
+  daily: DailyPoint[] | null;
+}
+
+// Freshness band thresholds — must match internal/store/metrics.go.
+export const FRESH_THRESHOLD = 0.7;
+export const STALE_THRESHOLD = 0.4;
+
+export function bandColor(relevance: number): string {
+  if (relevance >= FRESH_THRESHOLD) return 'var(--color-preferences)'; // emerald = healthy
+  if (relevance < STALE_THRESHOLD) return 'var(--color-cases)'; // rose = stale
+  return 'var(--color-events)'; // amber = fading
+}
+
+export function bandLabel(relevance: number): string {
+  if (relevance >= FRESH_THRESHOLD) return 'fresh';
+  if (relevance < STALE_THRESHOLD) return 'stale';
+  return 'fading';
+}

@@ -536,6 +536,19 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(out)
 }
 
+// handleMetrics returns the read-only Memory Health payload. Decay is computed
+// live from timestamps; this endpoint never mutates the store (no DecayAllNodes).
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	m, err := s.db.ComputeMetrics()
+	if err != nil {
+		log.Printf("metrics: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(m)
+}
+
 func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 	relProfile, err := s.db.GetNodeByURI("mem://user/profile/communication")
 	if err != nil {

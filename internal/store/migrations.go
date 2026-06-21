@@ -236,6 +236,28 @@ CREATE INDEX idx_nodes_category  ON mem_nodes(category);
 CREATE INDEX idx_nodes_relevance ON mem_nodes(relevance DESC);
 `,
 	},
+	{
+		Version:     10,
+		Description: "metrics_daily: daily health snapshot for Memory Health trend lines",
+		// Additive table; no user data touched. total_access is the cumulative
+		// SUM(access_count) snapshotted daily — day-over-day diffs yield retrievals
+		// per day without logging per-touch events or mutating hot paths.
+		SQL: `
+CREATE TABLE metrics_daily (
+    date            TEXT PRIMARY KEY,            -- 'YYYY-MM-DD' (UTC)
+    active_total    INTEGER NOT NULL DEFAULT 0,
+    retracted_total INTEGER NOT NULL DEFAULT 0,
+    fresh           INTEGER NOT NULL DEFAULT 0,
+    fading          INTEGER NOT NULL DEFAULT 0,
+    stale           INTEGER NOT NULL DEFAULT 0,
+    never_retrieved INTEGER NOT NULL DEFAULT 0,
+    total_access    INTEGER NOT NULL DEFAULT 0,  -- SUM(access_count); daily retrievals = diff vs prior day
+    captures        INTEGER NOT NULL DEFAULT 0,  -- memories created that day
+    category_counts TEXT,                        -- JSON {category: count}
+    updated_at      INTEGER NOT NULL
+);
+`,
+	},
 }
 
 // headVersion is the highest schema version this binary knows how to apply.

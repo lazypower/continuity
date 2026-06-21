@@ -3,6 +3,7 @@
   import ThemeToggle from './ThemeToggle.svelte';
 
   const tabs: { id: Tab; label: string; icon: string }[] = [
+    { id: 'health', label: 'Health', icon: '\u2665' },
     { id: 'tree', label: 'Tree', icon: '\u25C8' },
     { id: 'search', label: 'Search', icon: '\u26B2' },
     { id: 'profile', label: 'Profile', icon: '\u2666' },

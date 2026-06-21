@@ -69,6 +69,7 @@ func (s *Server) routes() {
 		r.Get("/profile", s.handleProfile)
 		r.Get("/tree", s.handleTree)
 		r.Get("/timeline", s.handleTimeline)
+		r.Get("/metrics", s.handleMetrics)
 
 		// Stub routes — return 501 until implemented
 		r.Get("/sessions", stub("sessions"))
