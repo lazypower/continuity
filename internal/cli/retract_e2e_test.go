@@ -26,10 +26,11 @@ import (
 //   - The `show <uri> --include-retracted` reveal path.
 //   - The `remember --acknowledge-retracted` bypass path.
 //
-// Why TFIDF: the test runs in a clean-room CI environment that has no Ollama.
-// Forcing CONTINUITY_EMBEDDER=tfidf removes the probe's environment dependency,
-// and exercising the TFIDF code path in CI is itself the point — we ship it as
-// a fallback and have not been testing it end-to-end.
+// Why the lexical fallback: the test runs in a clean-room CI environment that
+// has no Ollama. Forcing CONTINUITY_EMBEDDER=tfidf selects the hashed lexical
+// fallback and removes the probe's environment dependency; exercising that
+// fallback path end-to-end in CI is itself the point — we ship it and must keep
+// it honest.
 //
 // Why subprocess: in-process httptest tests share state and goroutine context
 // with the test harness, which hides exit-code semantics, stderr-vs-stdout
@@ -45,13 +46,13 @@ func TestRetract_SubprocessE2E_TFIDF(t *testing.T) {
 	workDir := t.TempDir()
 	dbPath := filepath.Join(workDir, "test.db")
 
-	// Seed the DB with enough varied text that TFIDF builds a real vocabulary
-	// covering the tokens our test queries use (operator, home, address,
-	// discussion, captured, accident). Without this, NewTFIDFEmbedder produces
-	// a 1-dim vector and every cosine similarity collapses to 0, so the
-	// dedup-against-retracted gate cannot fire and the test would silently
-	// fail to exercise its target invariant.
-	seedTFIDFCorpus(t, dbPath)
+	// Seed the DB with varied distractor memories before the test runs. The
+	// hashed embedder needs no corpus to function (fixed dimension, no
+	// vocabulary), so this is no longer required for the embedder to work — it
+	// represents the production state where the user already has a populated DB,
+	// and it proves the gate matches the SPECIFIC retracted node rather than
+	// firing on any neighbor.
+	seedDistractorCorpus(t, dbPath)
 
 	serverURL, procEnv := testharness.HermeticEnv(t, workDir, dbPath, 0)
 
@@ -174,12 +175,13 @@ func TestRetract_SubprocessE2E_TFIDF(t *testing.T) {
 		ExpectStdoutContains(t, "mem://user/events/second-attempt-similar")
 }
 
-// seedTFIDFCorpus opens the SQLite DB directly and writes enough varied L0
-// abstracts that NewTFIDFEmbedder has a real vocabulary covering the tokens
-// the retract test queries use. Seeding here (not via the CLI) is intentional:
-// it represents the production state where the user already has a populated DB
-// when they invoke retract.
-func seedTFIDFCorpus(t *testing.T, dbPath string) {
+// seedDistractorCorpus opens the SQLite DB directly and writes varied L0
+// abstracts that act as near-neighbors to the retract test's queries. Seeding
+// here (not via the CLI) is intentional: it represents the production state
+// where the user already has a populated DB when they invoke retract, and the
+// distractors prove the dedup-against-retracted gate matches the specific
+// retracted node rather than any nearby memory.
+func seedDistractorCorpus(t *testing.T, dbPath string) {
 	t.Helper()
 	db, err := store.Open(dbPath)
 	if err != nil {

@@ -5,14 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/lazypower/continuity/internal/store"
+	"unicode"
 )
 
 // Embedder generates vector embeddings for text.
@@ -40,7 +40,7 @@ func NewOllamaEmbedder(url, model string, dims int) *OllamaEmbedder {
 	}
 }
 
-func (o *OllamaEmbedder) Model() string  { return "ollama:" + o.model }
+func (o *OllamaEmbedder) Model() string   { return "ollama:" + o.model }
 func (o *OllamaEmbedder) Dimensions() int { return o.dims }
 
 // Embed sends text to Ollama's embed endpoint and returns the embedding vector.
@@ -104,166 +104,202 @@ func ProbeOllama(url, model string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// TFIDFEmbedder generates TF-IDF bag-of-words embeddings as a fallback.
+// HashEmbedder is a fixed-dimension feature-hashed lexical embedder used as the
+// Ollama-free fallback.
 //
-// Best-effort by construction: the corpus IS the model. Every retraction or
-// new write that introduces vocabulary not yet in the IDF table shifts the
-// vector space. We minimize the most load-bearing variant of that drift —
-// retraction-induced drift — by including retracted nodes in the corpus
-// (see NewTFIDFEmbedder). Ollama users have a static pre-trained model and
-// don't have this problem; the README's "Embedding backends" section
-// recommends Ollama for any setup that needs strong dedup-against-retracted
-// recall.
-type TFIDFEmbedder struct {
-	vocab []string           // ordered vocabulary (top terms by doc frequency)
-	idf   map[string]float64 // inverse document frequency per term
-	dims  int
+// Each term is hashed to a fixed bucket (hash(term) mod dims), so the coordinate
+// system is constant forever — independent of corpus size, age, vocabulary, or
+// process restarts. That is exactly what the retraction-resurrection gate, the
+// dedup pass, and search all assume: two vectors are only comparable if they
+// share a coordinate system. The predecessor (corpus-derived TF-IDF) rebuilt its
+// vocabulary from the live corpus on every construction, so its axes drifted as
+// memories were added or retracted; a fresh embedder and the stored vectors then
+// lived in different spaces and cosine collapsed to noise (or 0 on a dimension
+// mismatch), silently defeating the PII-resurrection guard.
+//
+// This is a STABLE LEXICAL safety net, not a semantic embedder: similarity is
+// keyword overlap, not meaning. The trade is deliberate — we lower the ambition
+// (no semantic recall, no IDF term-discrimination) to buy total stability. The
+// README's "Embedding backends" section recommends Ollama for setups that need
+// semantic recall. Properties this guarantees that corpus-TF-IDF did not:
+//   - no OOV: every term hashes somewhere, so rare/new terms always contribute
+//     (corpus-TF-IDF dropped any term outside its top-N vocabulary);
+//   - works on a fresh/empty DB from the first write (no startup corpus needed);
+//   - deterministic across restarts and across machines.
+//
+// Collisions (distinct terms sharing a bucket) are the cost; they are tuned away
+// by dims. Buckets accumulate UNSIGNED weights: the textbook signed-hashing trick
+// (a per-term ±1) keeps collisions unbiased in expectation, but it lets two
+// colliding terms with opposite signs cancel — which can zero out the whole
+// vector for short inputs (e.g. "oh aaa"), and a zero vector cannot match itself
+// in the retraction gate. For a lexical SAFETY net the cardinal sin is a silent
+// false negative, so we accept the small additive collision bias (which only ever
+// nudges similarity UP, toward firing the gate) in exchange for the guarantee
+// that any surviving content token yields a non-zero vector.
+type HashEmbedder struct {
+	dims int
 }
 
-// NewTFIDFEmbedder builds a TF-IDF embedder from existing L0 abstracts.
+// defaultHashDims is the fixed feature-hash dimension. 2048 keeps collisions
+// negligible for personal-scale corpora while keeping vectors cheap (they are
+// sparse — only buckets for terms actually present are non-zero).
+const defaultHashDims = 2048
+
+// NewHashEmbedder builds a feature-hashed lexical embedder. dims <= 0 selects
+// the default (defaultHashDims). It takes no corpus: the embedding of a given
+// text is a pure function of the text and dims, which is the whole point.
 //
-// The corpus deliberately INCLUDES retracted leaves (issue #22). Excluding
-// them would cause the IDF vocabulary to drift between process restarts that
-// straddle a retraction: previously-stored vectors were embedded against a
-// corpus that contained the now-retracted node's terms, while fresh
-// embeddings would be computed against a corpus that no longer does. Cosine
-// similarity between the two becomes incoherent, silently degrading
-// findRetractedMatches recall and defeating the PII-re-introduction guard.
-// Including retracted nodes keeps the vector space stable across retractions.
-func NewTFIDFEmbedder(db *store.DB, maxTerms int) (*TFIDFEmbedder, error) {
-	if maxTerms <= 0 {
-		maxTerms = 512
+// The error return is always nil today — construction is infallible because
+// there is no corpus to read. It exists so the fallback slots into the
+// (Embedder, error) construction factory (resolveActiveEmbedder) uniformly with
+// the other backends, and leaves room for future config validation without a
+// signature change.
+func NewHashEmbedder(dims int) (*HashEmbedder, error) {
+	if dims <= 0 {
+		dims = defaultHashDims
 	}
-
-	leaves, err := db.ListLeavesIncludingRetracted()
-	if err != nil {
-		return nil, fmt.Errorf("list leaves for tfidf: %w", err)
-	}
-
-	// Collect documents (L0 abstracts)
-	var docs []string
-	for _, n := range leaves {
-		if n.L0Abstract != "" {
-			docs = append(docs, n.L0Abstract)
-		}
-	}
-
-	// Build document frequency
-	df := make(map[string]int)
-	for _, doc := range docs {
-		seen := make(map[string]bool)
-		for _, term := range tokenize(doc) {
-			if !seen[term] {
-				df[term]++
-				seen[term] = true
-			}
-		}
-	}
-
-	// Sort terms by document frequency (descending), take top maxTerms.
-	//
-	// Tie-break alphabetically (issue #22): Go map iteration is randomized
-	// and sort.Slice isn't stable, so without an explicit tiebreaker the same
-	// corpus produces vocabularies in different orders across constructions.
-	// That puts identical terms at different vector positions, making cosine
-	// similarity between vectors from two NewTFIDFEmbedder() calls effectively
-	// random — even when the corpus didn't change. The asymmetric loss falls
-	// hardest on dedup-against-retracted, which relies on the vector space
-	// being stable across process restarts.
-	type termFreq struct {
-		term string
-		freq int
-	}
-	var terms []termFreq
-	for t, f := range df {
-		terms = append(terms, termFreq{t, f})
-	}
-	sort.Slice(terms, func(i, j int) bool {
-		if terms[i].freq != terms[j].freq {
-			return terms[i].freq > terms[j].freq
-		}
-		return terms[i].term < terms[j].term
-	})
-
-	dims := maxTerms
-	if len(terms) < dims {
-		dims = len(terms)
-	}
-	if dims == 0 {
-		dims = 1 // minimum dimension to avoid zero-length vectors
-	}
-
-	vocab := make([]string, dims)
-	idf := make(map[string]float64)
-	numDocs := float64(len(docs))
-	if numDocs == 0 {
-		numDocs = 1
-	}
-
-	for i := 0; i < dims && i < len(terms); i++ {
-		vocab[i] = terms[i].term
-		// IDF = log(N / df) + 1 (smoothed)
-		idf[vocab[i]] = math.Log(numDocs/float64(terms[i].freq)) + 1.0
-	}
-
-	return &TFIDFEmbedder{
-		vocab: vocab,
-		idf:   idf,
-		dims:  dims,
-	}, nil
+	return &HashEmbedder{dims: dims}, nil
 }
 
-func (t *TFIDFEmbedder) Model() string  { return "tfidf" }
-func (t *TFIDFEmbedder) Dimensions() int { return t.dims }
+func (h *HashEmbedder) Model() string   { return "hashtf" }
+func (h *HashEmbedder) Dimensions() int { return h.dims }
 
-// Embed generates a normalized TF-IDF vector for the given text.
-func (t *TFIDFEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
-	tokens := tokenize(text)
-	if len(tokens) == 0 {
-		return make([]float64, t.dims), nil
-	}
+// Embed generates a normalized hashed-TF vector for the given text. Sublinear
+// term frequency (1 + log(count)) damps repetition; unsigned feature hashing
+// guarantees any content token contributes a positive weight (no cancellation to
+// zero); L2 normalization makes cosine length-independent.
+func (h *HashEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
+	vec := make([]float64, h.dims)
 
-	// Count term frequencies
 	tf := make(map[string]int)
-	for _, tok := range tokens {
+	for _, tok := range tokenize(text) {
+		if _, stop := lexicalStopwords[tok]; stop {
+			continue // see lexicalStopwords: static stand-in for IDF down-weighting
+		}
 		tf[tok]++
 	}
 
-	// Build TF-IDF vector
-	vec := make([]float64, t.dims)
-	maxTF := 0
-	for _, c := range tf {
-		if c > maxTF {
-			maxTF = c
+	// Degenerate input: no content tokens survived — the text is token-less,
+	// single-char-only after splitting (e.g. "x-y"), or entirely stopwords
+	// (e.g. "to-be"). A silent zero vector here is a false negative: the memory
+	// could not match ITSELF in search or the retraction-resurrection gate, the
+	// exact failure this embedder exists to prevent. Fall back to one coarse
+	// token over the text's alphanumerics so any real content embeds non-zero
+	// and self-consistently; only genuinely content-free text (pure punctuation)
+	// stays the zero vector.
+	if len(tf) == 0 {
+		if norm := alnumLower(text); norm != "" {
+			vec[hashBucket(norm, h.dims)] = 1
+			normalize(vec)
 		}
+		return vec, nil
 	}
 
-	for i, term := range t.vocab {
-		count := tf[term]
-		if count == 0 {
-			continue
-		}
-		// Augmented TF to prevent bias towards longer documents
-		augTF := 0.5 + 0.5*float64(count)/float64(maxTF)
-		idf := t.idf[term]
-		if idf == 0 {
-			idf = 1.0
-		}
-		vec[i] = augTF * idf
+	// Accumulate in sorted term order so the vector is bit-for-bit deterministic.
+	// Float addition isn't associative, so randomized map iteration could vary the
+	// low bits when distinct terms collide into the same bucket — harmless for
+	// threshold comparisons, but it breaks the "same text → identical vector"
+	// invariant that cross-restart gate comparisons (and our tests) rely on.
+	terms := make([]string, 0, len(tf))
+	for term := range tf {
+		terms = append(terms, term)
+	}
+	sort.Strings(terms)
+	for _, term := range terms {
+		weight := 1.0 + math.Log(float64(tf[term])) // sublinear TF
+		vec[hashBucket(term, h.dims)] += weight
 	}
 
-	// L2 normalize
 	normalize(vec)
 	return vec, nil
 }
 
-// tokenize splits text into lowercase tokens, stripping punctuation.
+// alnumLower returns text lowercased with every non-alphanumeric rune removed
+// (Unicode-aware, matching tokenize). Used only for the degenerate-input fallback
+// in Embed, to guarantee that any text with alphanumeric content yields a
+// non-zero, self-consistent vector.
+func alnumLower(text string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(text) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// lexicalStopwords is a fixed, corpus-independent set of high-frequency English
+// function words dropped before hashing. The legacy TF-IDF embedder leaned on
+// IDF to down-weight ubiquitous words so that distinctive content terms drove
+// similarity; dropping IDF (for coordinate stability) removed that, which both
+// muddied paraphrase recall (the retraction gate's whole job) and let unrelated
+// texts share spurious "the/in/by" overlap. A static stopword list restores the
+// discrimination deterministically — no corpus, so no drift. It is intentionally
+// conservative: only unambiguous function words, never content words.
+var lexicalStopwords = func() map[string]struct{} {
+	words := []string{
+		"the", "a", "an", "and", "or", "but", "if", "then", "so", "as", "of",
+		"to", "in", "on", "at", "by", "for", "with", "from", "into", "onto",
+		"over", "under", "about", "after", "before", "up", "out", "down", "off",
+		"is", "are", "was", "were", "be", "been", "being", "am",
+		"do", "does", "did", "has", "have", "had", "having",
+		"will", "would", "can", "could", "should", "shall", "may", "might", "must",
+		"this", "that", "these", "those", "it", "its", "they", "them", "their",
+		"he", "she", "his", "her", "him", "we", "us", "our", "you", "your",
+		"i", "me", "my", "not", "no", "nor", "yes", "all", "any", "some", "each",
+		"there", "here", "what", "which", "who", "whom", "whose", "when", "where",
+		"why", "how", "than", "too", "very", "just", "also", "only", "more", "most",
+	}
+	m := make(map[string]struct{}, len(words))
+	for _, w := range words {
+		m[w] = struct{}{}
+	}
+	return m
+}()
+
+// lexicalMatchThreshold is the cosine bar for the hashed lexical fallback in the
+// dedup / retraction-resurrection gates. It is lower than defaultSimilarityThreshold
+// (used for semantic embedders) because keyword-overlap cosine for a genuine
+// paraphrase is inherently lower than semantic cosine — a semantic-calibrated
+// 0.65 would silently miss paraphrased retracted PII. Stopword removal keeps
+// unrelated-text cosine well below this, preserving separation.
+const lexicalMatchThreshold = 0.5
+
+// MatchThreshold returns the cosine threshold for treating two embeddings as the
+// "same" memory in the dedup and retraction-resurrection gates. The hashed
+// lexical fallback gets a lower, separately-calibrated bar; semantic and unknown
+// embedders use the default.
+func MatchThreshold(emb Embedder) float64 {
+	if emb != nil && emb.Model() == "hashtf" {
+		return lexicalMatchThreshold
+	}
+	return defaultSimilarityThreshold
+}
+
+// hashBucket maps a term to its bucket in [0, dims) via a 64-bit FNV-1a hash.
+func hashBucket(term string, dims int) int {
+	hsh := fnv.New64a()
+	_, _ = hsh.Write([]byte(term))
+	return int(hsh.Sum64() % uint64(dims))
+}
+
+// tokenize splits text into lowercase alphanumeric tokens, treating every other
+// rune — including '-' and '_' — as a separator. "Alphanumeric" is Unicode-aware
+// (unicode.IsLetter/IsDigit), so non-ASCII memories tokenize to content rather
+// than silently dropping to an all-zero, unmatchable vector.
+//
+// Splitting on '-'/'_' (rather than keeping them inside tokens) is load-bearing
+// for the retraction-resurrection gate: the same PII reformatted differently
+// must still collide. Otherwise "phone 555-123-4567" tokenizes to one opaque
+// token while "phone 555 123 4567" tokenizes to three, the two share almost no
+// buckets, and the gate misses the exact same number. As a bonus, compound terms
+// like "wal-mode" now match their spaced form "wal mode".
 func tokenize(text string) []string {
 	text = strings.ToLower(text)
 	var tokens []string
 	var current strings.Builder
 	for _, r := range text {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
 			current.WriteRune(r)
 		} else {
 			if current.Len() > 1 { // skip single-char tokens

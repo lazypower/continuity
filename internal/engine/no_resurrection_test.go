@@ -115,9 +115,9 @@ func TestNoResurrection_FindSimilarNodeDoesNotReturnRetracted(t *testing.T) {
 	if err := db.CreateNode(n); err != nil {
 		t.Fatal(err)
 	}
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 	vec, err := embedder.Embed(ctx, n.L0Abstract)
 	if err != nil {
@@ -162,9 +162,9 @@ func TestNoResurrection_ExtractMemoriesDoesNotMutateRetracted(t *testing.T) {
 	if err := db.CreateNode(n); err != nil {
 		t.Fatal(err)
 	}
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 	vec, err := embedder.Embed(ctx, n.L0Abstract)
 	if err != nil {
@@ -216,9 +216,9 @@ func TestNoResurrection_RememberDoesNotMutateRetracted(t *testing.T) {
 	uri := seedAndEmbed(t, eng, "preferences", "doomed-pref",
 		"original preference content for testing the no-resurrection guard",
 		"ORIGINAL body content with enough length to pass validation thresholds.")
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 	eng.SetEmbedder(embedder)
 	n, err := db.GetNodeByURI(uri)

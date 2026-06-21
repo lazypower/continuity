@@ -349,7 +349,7 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 	// Reasons are NOT exposed inline — agent fetches them deliberately via
 	// `continuity show <uri> --include-retracted`. See issue #12 / RFC.
 	if !input.AcknowledgeRetracted && e.Embedder != nil && c.L0 != "" {
-		matches, err := e.findRetractedMatches(ctx, c.L0, c.Category, defaultSimilarityThreshold)
+		matches, err := e.findRetractedMatches(ctx, c.L0, c.Category, MatchThreshold(e.Embedder))
 		if err != nil {
 			log.Printf("remember: retracted-match check failed: %v", err)
 		} else if len(matches) > 0 {

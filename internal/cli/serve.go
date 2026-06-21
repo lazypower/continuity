@@ -31,12 +31,13 @@ const (
 	envServeEmbedder = "CONTINUITY_EMBEDDER" // "tfidf" | "ollama" | "none" | "" (auto)
 )
 
-// tfidfBestEffortNotice is surfaced once at startup whenever TFIDF is the active
-// embedder (forced or fallback). TFIDF is best-effort by construction — the
-// corpus IS the model — so operators should know the tradeoff they're running
-// with, plus a one-line pointer to the upgrade path. The README's "Embedding
-// backends" section spells out the two shipped paths (Ollama / TFIDF). Issue #22.
-const tfidfBestEffortNotice = "  ! tfidf: retraction-dedup recall is best-effort; install Ollama (nomic-embed-text) for stronger guarantees — see README \"Embedding backends\""
+// tfidfLexicalNotice is surfaced once at startup whenever the hashed lexical
+// fallback is the active embedder (forced or fallback). The fallback is a
+// fixed-dimension feature-hashed embedder: stable and reliable for the
+// retraction/dedup gates, but LEXICAL (keyword overlap), not semantic — so
+// operators should know to install Ollama if they need semantic recall. The
+// README's "Embedding backends" section spells out the two shipped paths.
+const tfidfLexicalNotice = "  ! tfidf: hashed lexical fallback (keyword overlap, not semantic); install Ollama (nomic-embed-text) for semantic recall — see README \"Embedding backends\""
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -111,20 +112,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Fprintf(os.Stderr, "  embedder: ollama (%s)\n", embeddingModel)
 		case "tfidf":
-			emb, tfidfErr := engine.NewTFIDFEmbedder(db, 512)
+			emb, tfidfErr := engine.NewHashEmbedder(0)
 			if tfidfErr != nil {
 				fmt.Fprintf(os.Stderr, "warning: tfidf embedder init failed: %v\n", tfidfErr)
 			} else {
 				if eng != nil {
 					eng.SetEmbedder(emb)
 				}
-				fmt.Fprintf(os.Stderr, "  embedder: tfidf (forced)\n")
-				fmt.Fprintln(os.Stderr, tfidfBestEffortNotice)
+				fmt.Fprintf(os.Stderr, "  embedder: tfidf (hashed lexical, forced)\n")
+				fmt.Fprintln(os.Stderr, tfidfLexicalNotice)
 			}
 		case "none":
 			fmt.Fprintln(os.Stderr, "  embedder: none (forced; dedup-against-retracted gate inactive)")
 		default:
-			// auto: probe Ollama, fall back to TFIDF
+			// auto: probe Ollama, fall back to the hashed lexical embedder
 			if engine.ProbeOllama(ollamaURL, embeddingModel) {
 				emb := engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768)
 				if eng != nil {
@@ -132,15 +133,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 				}
 				fmt.Fprintf(os.Stderr, "  embedder: ollama (%s)\n", embeddingModel)
 			} else {
-				emb, tfidfErr := engine.NewTFIDFEmbedder(db, 512)
+				emb, tfidfErr := engine.NewHashEmbedder(0)
 				if tfidfErr != nil {
 					fmt.Fprintf(os.Stderr, "warning: tfidf embedder init failed: %v\n", tfidfErr)
 				} else {
 					if eng != nil {
 						eng.SetEmbedder(emb)
 					}
-					fmt.Fprintf(os.Stderr, "  embedder: tfidf (fallback)\n")
-					fmt.Fprintln(os.Stderr, tfidfBestEffortNotice)
+					fmt.Fprintf(os.Stderr, "  embedder: tfidf (hashed lexical, fallback)\n")
+					fmt.Fprintln(os.Stderr, tfidfLexicalNotice)
 				}
 			}
 		}

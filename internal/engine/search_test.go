@@ -50,9 +50,9 @@ func TestFindBasic(t *testing.T) {
 	db := testDB(t)
 	nodes := seedTestNodes(t, db)
 
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 	embedTestNodes(t, db, embedder, nodes)
 
@@ -83,9 +83,9 @@ func TestFindWithCategory(t *testing.T) {
 	db := testDB(t)
 	nodes := seedTestNodes(t, db)
 
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
-		t.Fatalf("NewTFIDFEmbedder: %v", err)
+		t.Fatalf("NewHashEmbedder: %v", err)
 	}
 	embedTestNodes(t, db, embedder, nodes)
 
@@ -116,7 +116,7 @@ func TestFindNoEmbedder(t *testing.T) {
 func TestFindEmptyDB(t *testing.T) {
 	db := testDB(t)
 
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, _ := NewHashEmbedder(0)
 	ctx := context.Background()
 	results, err := Find(ctx, db, embedder, "test query", SearchOpts{})
 	if err != nil {
@@ -131,7 +131,7 @@ func TestSearchWithMockLLM(t *testing.T) {
 	db := testDB(t)
 	nodes := seedTestNodes(t, db)
 
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, _ := NewHashEmbedder(0)
 	embedTestNodes(t, db, embedder, nodes)
 
 	mockLLM := &llm.MockClient{
@@ -160,7 +160,7 @@ func TestSearchFallsBackToFind(t *testing.T) {
 	db := testDB(t)
 	nodes := seedTestNodes(t, db)
 
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, _ := NewHashEmbedder(0)
 	embedTestNodes(t, db, embedder, nodes)
 
 	// nil LLM client — should fall back to Find
@@ -217,7 +217,7 @@ func TestFindMomentsBoost(t *testing.T) {
 	db.CreateNode(moment)
 	db.CreateNode(event)
 
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, _ := NewHashEmbedder(0)
 	embedTestNodes(t, db, embedder, []*store.MemNode{moment, event})
 
 	ctx := context.Background()

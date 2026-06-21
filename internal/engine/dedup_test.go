@@ -52,7 +52,7 @@ func TestFindSimilarNode(t *testing.T) {
 	}
 
 	// Build embedder from this DB
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestFindSimilarNode(t *testing.T) {
 func TestFindSimilarNodeEmptyDB(t *testing.T) {
 	db := testDB(t)
 
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, _ := NewHashEmbedder(0)
 	ctx := context.Background()
 
 	match, sim, err := findSimilarNode(ctx, db, embedder, "test query", "profile", 0.85)
@@ -134,7 +134,7 @@ func TestExtractMemoriesSimilarityGate(t *testing.T) {
 	}
 
 	// Build embedder and embed the existing node
-	embedder, _ := NewTFIDFEmbedder(db, 512)
+	embedder, _ := NewHashEmbedder(0)
 	ctx := context.Background()
 	vec, _ := embedder.Embed(ctx, existing.L0Abstract)
 	db.SaveVector(existing.ID, vec, embedder.Model())
@@ -212,7 +212,7 @@ func TestDedup(t *testing.T) {
 	nodes := seedDuplicateNodes(t, db)
 
 	// Build embedder and embed all nodes
-	embedder, err := NewTFIDFEmbedder(db, 512)
+	embedder, err := NewHashEmbedder(0)
 	if err != nil {
 		t.Fatal(err)
 	}

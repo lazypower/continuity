@@ -111,7 +111,7 @@ func TestSmoke_MigrationAndRetractAgainstRealDB(t *testing.T) {
 			t.Skip("victim has no L0")
 		}
 		eng := engine.New(db, nil)
-		embedder, err := engine.NewTFIDFEmbedder(db, 512)
+		embedder, err := engine.NewHashEmbedder(0)
 		if err != nil {
 			t.Fatalf("embedder: %v", err)
 		}
@@ -126,14 +126,17 @@ func TestSmoke_MigrationAndRetractAgainstRealDB(t *testing.T) {
 		if isMatch, _ := engine.IsRetractedMatch(err); isMatch {
 			return
 		}
-		// If the gate didn't fire, log it but don't fail. Issue #22 closed the
-		// retraction-induced corpus-shift component of TFIDF drift (the
-		// embedder is now built from ListLeavesIncludingRetracted, so the
-		// vector space stays coherent across retractions). But corpus growth
-		// between the prior embedding and this rebuild still produces residual
-		// drift — that's the broader TFIDF limitation we accept as best-effort
-		// rather than chase. The asserted regression test for the fix lives at
-		// internal/engine/retract_test.go::TestFindRetractedMatches_TFIDFCorpusCoherent.
-		t.Logf("dedup gate did not fire (err=%v); residual TFIDF drift on real data — install Ollama for stronger guarantees", err)
+		// If the gate didn't fire, log it but don't fail. This smoke test runs
+		// against the operator's REAL DB, whose stored victim vector may have been
+		// written by a different (pre-migration) embedder — e.g. the legacy
+		// corpus-derived "tfidf" — than the hashed lexical embedder we embed the
+		// candidate with here. findRetractedMatches deliberately skips vectors
+		// under a foreign identity, so against an un-repaired corpus the gate
+		// can't fire until `doctor --repair-vectors --apply` re-embeds it. The
+		// hashed embedder itself has a fixed coordinate system (no drift); the
+		// asserted, hermetic regression for the gate lives at
+		// internal/engine/retract_test.go::TestFindRetractedMatches_TFIDFCorpusCoherent
+		// and ::TestHashEmbedderCorpusIndependent.
+		t.Logf("dedup gate did not fire (err=%v); the real DB's vectors may predate the hashed embedder — run `continuity doctor --repair-vectors --apply`, or install Ollama", err)
 	})
 }

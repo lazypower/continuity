@@ -231,15 +231,15 @@ func TestRememberRouteRetractedMatchStillSequestered(t *testing.T) {
 	const l0 = "operator's mother's maiden name discussed in context"
 	uri, _, err := srv.engine.Remember(ctx, engine.RememberInput{
 		Category: "events", Name: "old-pii-event",
-		Summary: l0,
-		Body:    "Memory body content with more than enough length to pass validation thresholds.",
+		Summary:              l0,
+		Body:                 "Memory body content with more than enough length to pass validation thresholds.",
 		AcknowledgeRetracted: true,
 	})
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	embedder, err := engine.NewTFIDFEmbedder(srv.db, 512)
+	embedder, err := engine.NewHashEmbedder(0)
 	if err != nil {
 		t.Fatalf("embedder: %v", err)
 	}
