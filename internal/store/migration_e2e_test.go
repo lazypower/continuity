@@ -183,8 +183,10 @@ func fetchMemoryByURI(t *testing.T, serverURL, uri string) map[string]any {
 	return out
 }
 
-// assertSchemaV9 reopens the DB and asserts SchemaVersion() returns the
-// current head version (9). Inline so call sites read top-down.
+// assertSchemaV9 reopens the DB and asserts SchemaVersion() returns the current
+// head version. (Named for v9, the rebuild this suite was written around; it
+// tracks head so additive migrations don't break it.) Inline so call sites read
+// top-down.
 func assertSchemaV9(t *testing.T, dbPath string) {
 	t.Helper()
 	db, err := Open(dbPath)
@@ -196,8 +198,8 @@ func assertSchemaV9(t *testing.T, dbPath string) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 9 {
-		t.Errorf("schema_version = %d, want 9 (have %d migrations)", v, len(migrations))
+	if v != headVersion() {
+		t.Errorf("schema_version = %d, want head %d (have %d migrations)", v, headVersion(), len(migrations))
 	}
 }
 

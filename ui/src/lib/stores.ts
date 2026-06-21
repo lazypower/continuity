@@ -1,8 +1,8 @@
 import { writable } from 'svelte/store';
 
-export type Tab = 'tree' | 'search' | 'profile';
+export type Tab = 'health' | 'tree' | 'search' | 'profile';
 
-export const activeTab = writable<Tab>('tree');
+export const activeTab = writable<Tab>('health');
 
 // Default to dark mode (matches the brand), respect saved preference
 function getInitialDarkMode(): boolean {

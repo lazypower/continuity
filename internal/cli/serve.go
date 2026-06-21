@@ -198,6 +198,28 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Daily metrics rollup: snapshot health buckets + cumulative access on a
+	// timer so the Memory Health trend lines accrue. Read-only against memories;
+	// it only writes the metrics_daily ledger. Stops on shutdown.
+	rollupStop := make(chan struct{})
+	go func() {
+		if err := db.RollupDailySnapshot(); err != nil {
+			fmt.Fprintf(os.Stderr, "metrics rollup (startup): %v\n", err)
+		}
+		t := time.NewTicker(1 * time.Hour)
+		defer t.Stop()
+		for {
+			select {
+			case <-rollupStop:
+				return
+			case <-t.C:
+				if err := db.RollupDailySnapshot(); err != nil {
+					fmt.Fprintf(os.Stderr, "metrics rollup: %v\n", err)
+				}
+			}
+		}
+	}()
+
 	// Graceful shutdown
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
@@ -212,6 +234,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}()
 
 	<-done
+	close(rollupStop)
 	fmt.Fprintln(os.Stderr, "\nshutting down...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

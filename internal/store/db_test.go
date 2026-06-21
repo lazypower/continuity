@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -33,8 +34,8 @@ func TestSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 9 {
-		t.Errorf("SchemaVersion = %d, want 9", v)
+	if v != headVersion() {
+		t.Errorf("SchemaVersion = %d, want head %d", v, headVersion())
 	}
 }
 
@@ -188,10 +189,10 @@ func TestMigrate_RejectsFutureSchemaVersion(t *testing.T) {
 	// rather than the exact text so phrasing tweaks remain frictionless.
 	msg := err.Error()
 	for _, substr := range []string{
-		"9999",                // the version we found
-		"max 9",               // the version we support (head is 9 today)
-		"upgrade continuity",  // explicit remediation
-		"restore a backup",    // alternative remediation
+		"9999",                               // the version we found
+		fmt.Sprintf("max %d", headVersion()), // the version we support
+		"upgrade continuity",                 // explicit remediation
+		"restore a backup",                   // alternative remediation
 	} {
 		if !strings.Contains(msg, substr) {
 			t.Errorf("error message missing %q\nfull message: %s", substr, msg)
@@ -241,8 +242,8 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if v != 9 {
-		t.Errorf("SchemaVersion after re-migrate = %d, want 9", v)
+	if v != headVersion() {
+		t.Errorf("SchemaVersion after re-migrate = %d, want head %d", v, headVersion())
 	}
 }
 
