@@ -175,6 +175,45 @@ func TestExtraction_GatesEffectiveCategoryOnCrossCategoryMergeTarget(t *testing.
 	}
 }
 
+// TestExtraction_IgnoresUnresolvableMergeTarget pins the round-3 root fix: a raw
+// LLM merge_target is never trusted as a URI. A variant string (here a ?query
+// suffix; casing/#frag/trailing-slash behave the same) that doesn't resolve to a
+// real node must be IGNORED — the write falls back to the canonical constructed
+// uri, where the exact-URI guard then catches the retracted collision. Pre-fix the
+// variant was written verbatim, spawning a live node that dodged both the category
+// gate and the canonical exact-URI guard.
+func TestExtraction_IgnoresUnresolvableMergeTarget(t *testing.T) {
+	db := testDB(t)
+	emb, _ := NewHashEmbedder(0)
+
+	// Retracted MERGEABLE node with NO vector (so only the exact-URI guard can
+	// catch it — the vector gate is blind here, matching Codex's scenario).
+	const canonical = "mem://user/preferences/legacy-pref"
+	n := &store.MemNode{URI: canonical, NodeType: "leaf", Category: "preferences",
+		L0Abstract: "original retracted content", L1Overview: "Body content with enough length to pass validation thresholds easily."}
+	if err := db.CreateNode(n); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RetractNode(canonical, "forget this", ""); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotNode(t, db, canonical)
+
+	const variant = canonical + "?bypass=1"
+	resp := `[{"category":"preferences","uri_hint":"legacy-pref","merge_target":"` + variant + `","l0":"RESURRECTED content","l1":"Body content with enough length to pass validation thresholds easily."}]`
+	mock := &llm.MockClient{Response: &llm.Response{Content: resp, Provider: "mock"}}
+
+	if err := extractMemories(db, mock, emb, "sess", makeTranscript(t)); err != nil {
+		t.Fatalf("extractMemories: %v", err)
+	}
+
+	if got, _ := db.GetNodeByURI(variant); got != nil {
+		t.Errorf("variant merge_target was written verbatim, spawning a live node: %s", variant)
+	}
+	// The canonical retracted node must be byte-for-byte intact (exact-URI guard).
+	assertNoResurrection(t, db, canonical, before)
+}
+
 // TestExtraction_DeferredWhenLocked pins finding #2: while the vector identity is
 // locked the gate cannot run, so extraction must write NOTHING (fail closed) and
 // must not mark the session extracted. Proven non-vacuous by showing the same

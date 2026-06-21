@@ -41,21 +41,6 @@ func ownerForCategory(category string) string {
 	}
 }
 
-// categoryFromURI extracts the category segment from a mem:// URI of the form
-// mem://<owner>/<category>/<slug>. Returns "" if the URI is not in that shape, so
-// callers can fall back to a known category rather than gating on an empty one.
-func categoryFromURI(uri string) string {
-	rest := strings.TrimPrefix(uri, "mem://")
-	if rest == uri {
-		return ""
-	}
-	parts := strings.Split(rest, "/")
-	if len(parts) < 3 {
-		return ""
-	}
-	return parts[1]
-}
-
 // validCategories defines the allowed memory categories.
 var validCategories = map[string]bool{
 	"profile": true, "preferences": true, "entities": true,
@@ -190,14 +175,37 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 
 		owner := ownerForCategory(c.Category)
 		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
+		gateCat := c.Category // category the content will actually land in
 
-		// If merge_target is specified and valid, use it
+		// Honor merge_target ONLY if it RESOLVES to an existing node — its sole
+		// purpose is to merge into one. A raw LLM string is never trusted as a URI:
+		// a malformed/variant form (casing, ?query, #frag, trailing /) or a
+		// hallucinated target won't resolve, so we ignore it and fall back to the
+		// canonical constructed uri. This is what makes the gate robust — the write
+		// target is always a canonical URI, never an attacker-shaped string that
+		// dodges category derivation or the exact-URI lookup. If it resolves to a
+		// RETRACTED node, merging would resurrect it: skip the candidate. When
+		// honored, gate on the target's REAL category (not a parsed string).
+		merged := false
 		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
-			uri = c.MergeTarget
+			if target, err := db.GetNodeByURI(c.MergeTarget); err == nil && target != nil {
+				if target.IsRetracted() {
+					log.Printf("extraction: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
+					continue
+				}
+				uri = target.URI
+				gateCat = target.Category
+				merged = true
+			} else {
+				log.Printf("extraction: ignoring merge_target %s — no such node; using %s", c.MergeTarget, uri)
+			}
 		}
 
-		// Similarity gate: check if a semantically equivalent node already exists
-		if embedder != nil && c.Category != "" {
+		// Similarity gate: check if a semantically equivalent LIVE node already
+		// exists in the declared category. Skipped when an explicit merge_target was
+		// honored (an explicit instruction wins over the heuristic). The redirect
+		// only ever targets a live node in c.Category, so gateCat is unchanged.
+		if !merged && embedder != nil && c.Category != "" {
 			match, sim, err := findSimilarNode(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
 			if err != nil {
 				log.Printf("extraction: similarity check failed: %v", err)
@@ -213,19 +221,14 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 		// (e.g. PII) content silently resurfaces as a fresh live node. findSimilarNode
 		// deliberately skips retracted nodes (so it can't merge INTO one), which is
 		// why this separate semantic gate is required to catch the create-a-new-node
-		// path. It runs AFTER URI resolution and keys on the category the content
-		// actually lands in (categoryFromURI of the resolved uri, not the candidate's
-		// declared category): a cross-category merge_target must be checked against
-		// retracted nodes of the TARGET category, or the gate checks the wrong space.
+		// path. It keys on gateCat — the category the content actually lands in (the
+		// merge target's real category for an honored merge, else the declared one) —
+		// so a cross-category merge can't be checked against the wrong vector space.
 		// Skip only the offending candidate — one bad candidate must not drop the
 		// rest of the batch; on a gate error we also skip (fail closed). The embedder
 		// is nil only in `none` mode (gate opted out); the locked case is deferred
 		// upstream in extractSession.
 		if embedder != nil && c.L0 != "" {
-			gateCat := categoryFromURI(uri)
-			if gateCat == "" {
-				gateCat = c.Category
-			}
 			matches, err := findRetractedMatchesIn(ctx, db, embedder, c.L0, gateCat, MatchThreshold(embedder))
 			if err != nil {
 				log.Printf("extraction: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
@@ -237,11 +240,10 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 			}
 		}
 
-		// Exact retracted-URI guard (mirrors Remember): an LLM-supplied uri_hint or
-		// merge_target can point straight at a retracted node, which the vector gate
-		// won't catch if that node has no same-identity vector. UpsertNode enforces
-		// this atomically too (ErrRetractedTarget), but skipping here keeps a clean
-		// per-candidate log and avoids the wasted write attempt.
+		// Exact retracted-URI guard (mirrors Remember): the constructed uri_hint can
+		// still collide with a retracted canonical node that has no same-identity
+		// vector. UpsertNode enforces this atomically too (ErrRetractedTarget), but
+		// skipping here keeps a clean per-candidate log and avoids a wasted write.
 		if existing, err := db.GetNodeByURI(uri); err == nil && existing != nil && existing.IsRetracted() {
 			log.Printf("extraction: skipping %s — target URI is retracted (would resurrect)", uri)
 			continue

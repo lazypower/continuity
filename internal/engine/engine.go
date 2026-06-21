@@ -535,23 +535,34 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 
 		owner := ownerForCategory(c.Category)
 		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
+		gateCat := c.Category // category the content will actually land in
 
+		// Honor merge_target ONLY if it RESOLVES to an existing node (its purpose is
+		// to merge into one). A raw LLM string is never trusted as a URI: a
+		// malformed/variant or hallucinated target won't resolve, so we ignore it and
+		// keep the canonical constructed uri — the write target is always canonical,
+		// never an attacker-shaped string that dodges the gate. Resolves-to-retracted
+		// => skip (merge-into-tombstone). When honored, gate on the target's REAL
+		// category.
 		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
-			uri = c.MergeTarget
+			if target, err := e.DB.GetNodeByURI(c.MergeTarget); err == nil && target != nil {
+				if target.IsRetracted() {
+					log.Printf("signal: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
+					continue
+				}
+				uri = target.URI
+				gateCat = target.Category
+			} else {
+				log.Printf("signal: ignoring merge_target %s — no such node; using %s", c.MergeTarget, uri)
+			}
 		}
 
 		// Retraction-resurrection gate (per-candidate, fail-closed): a signal
-		// candidate matching a retracted memory must not be written. Keys on the
-		// category the content actually lands in (categoryFromURI of the resolved
-		// uri, not the declared category) so a cross-category merge_target is checked
-		// against the TARGET category. Skip only the offending candidate; on a gate
-		// error skip it too rather than write unchecked. (Locked identity is handled
-		// above; embedder is nil here only in `none` mode — gate opted out.)
+		// candidate matching a retracted memory must not be written. Keys on gateCat
+		// — the category the content actually lands in. Skip only the offending
+		// candidate; on a gate error skip it too rather than write unchecked. (Locked
+		// identity is handled above; embedder is nil here only in `none` mode.)
 		if emb := e.embedderIfUnlocked(); emb != nil && c.L0 != "" {
-			gateCat := categoryFromURI(uri)
-			if gateCat == "" {
-				gateCat = c.Category
-			}
 			matches, err := e.findRetractedMatches(ctx, c.L0, gateCat, MatchThreshold(emb))
 			if err != nil {
 				log.Printf("signal: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
@@ -563,10 +574,9 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 			}
 		}
 
-		// Exact retracted-URI guard (mirrors Remember): a uri_hint/merge_target may
-		// point straight at a retracted node the vector gate can't catch. UpsertNode
-		// would overwrite it in place (mergeable) or duplicate it (immutable) —
-		// resurrection by exact targeting. Skip the candidate.
+		// Exact retracted-URI guard (mirrors Remember): the constructed uri_hint can
+		// still collide with a retracted canonical node the vector gate can't catch
+		// (no same-identity vector). UpsertNode also enforces this atomically.
 		if existing, err := e.DB.GetNodeByURI(uri); err == nil && existing != nil && existing.IsRetracted() {
 			log.Printf("signal: skipping %s — target URI is retracted (would resurrect)", uri)
 			continue
