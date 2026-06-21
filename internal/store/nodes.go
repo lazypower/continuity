@@ -266,9 +266,15 @@ func (db *DB) UpsertNode(node *MemNode) error {
 	// above and this insert, the suffixed node would resurrect just-retracted
 	// content. Re-check and compensate (delete + fail closed). The suffixed node is
 	// only ever visible after UpsertNode returns, so this transient insert is safe.
-	if base, err := db.GetNodeByURI(baseURI); err == nil && base != nil && base.IsRetracted() {
+	base, rerr := db.GetNodeByURI(baseURI)
+	if rerr != nil || (base != nil && base.IsRetracted()) {
+		// Either the base is retracted, OR we can't prove it isn't (re-read failed).
+		// Both fail closed: undo the insert so no unproven live node survives.
 		if delErr := db.DeleteNode(node.ID); delErr != nil {
-			return fmt.Errorf("rollback suffixed resurrection of %s: %w", baseURI, delErr)
+			return fmt.Errorf("rollback suffixed node for %s: %w", baseURI, delErr)
+		}
+		if rerr != nil {
+			return fmt.Errorf("verify base %s after insert: %w", baseURI, rerr)
 		}
 		return ErrRetractedTarget
 	}
