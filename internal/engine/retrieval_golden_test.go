@@ -32,6 +32,14 @@ func retrievalFixturePath() string {
 //
 //	make retrieval-fixtures   # needs Ollama + nomic-embed-text
 
+// The nomic tier must actually be generated with nomic-embed-text at 768-d — a
+// fixture minted with a different model would replay under its own matching
+// identity and stay green while no longer proving the intended ranking.
+const (
+	expectNomicModel = "ollama:nomic-embed-text"
+	expectNomicDims  = 768
+)
+
 func loadGoldenDB(t *testing.T) (*store.DB, *goldretrieval.ReplayEmbedder) {
 	t.Helper()
 	fx, err := goldretrieval.Load(retrievalFixturePath())
@@ -42,6 +50,12 @@ func loadGoldenDB(t *testing.T) (*store.DB, *goldretrieval.ReplayEmbedder) {
 	// recorded vectors, the fixture no longer describes the definition under test.
 	if fx.Fingerprint != goldretrieval.CorpusFingerprint() {
 		t.Fatalf("retrieval fixture is stale — corpus/queries changed without regenerating; run `make retrieval-fixtures`")
+	}
+	// Bind the fixture to the intended embedder identity, so it can't be quietly
+	// regenerated with a non-nomic model and still pass.
+	if fx.Model != expectNomicModel || fx.Dims != expectNomicDims {
+		t.Fatalf("nomic golden was generated with %s/%d, want %s/%d — regenerate with nomic-embed-text",
+			fx.Model, fx.Dims, expectNomicModel, expectNomicDims)
 	}
 
 	db, err := store.OpenMemory()
