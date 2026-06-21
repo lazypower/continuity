@@ -383,12 +383,23 @@ func runDedup(cmd *cobra.Command, args []string) error {
 	eng := engine.New(db, nil)
 	eng.SetEmbedder(emb)
 
+	// Reconcile against the corpus's vector identity and FAIL CLOSED on a
+	// mismatch: dedup is destructive (it deletes nodes by cosine clustering and
+	// re-embeds), so running it against an incompatible vector space could
+	// cross-space-cluster and write foreign-identity vectors.
+	ctx := context.Background()
+	if _, err := eng.ReconcileVectorIdentity(ctx); err != nil {
+		return fmt.Errorf("reconcile vector identity: %w", err)
+	}
+	if locked, reason := eng.VectorIdentityLocked(); locked {
+		return fmt.Errorf("dedup refused — %s", reason)
+	}
+
 	if dedupDryRun {
 		fmt.Println("\n[dry-run] Would deduplicate — rerun without --dry-run to apply")
 		return nil
 	}
 
-	ctx := context.Background()
 	removed, err := eng.Dedup(ctx, dedupThreshold)
 	if err != nil {
 		return fmt.Errorf("dedup: %w", err)

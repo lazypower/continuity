@@ -78,7 +78,10 @@ func hashURI(uri string) string {
 // The reason content of matched nodes is intentionally NOT consulted or returned —
 // callers receive URIs only and must use --include-retracted to fetch reasons.
 func (e *Engine) findRetractedMatches(ctx context.Context, candidateText, category string, threshold float64) ([]store.MemNode, error) {
-	if e.Embedder == nil || candidateText == "" {
+	// A locked identity means the active embedder is incompatible with the
+	// corpus, so this gate can't run meaningfully — treat it exactly like
+	// "no embedder configured" (skip) rather than comparing across vector spaces.
+	if e.Embedder == nil || candidateText == "" || e.identityMismatch {
 		return nil, nil
 	}
 
@@ -86,6 +89,7 @@ func (e *Engine) findRetractedMatches(ctx context.Context, candidateText, catego
 	if err != nil {
 		return nil, fmt.Errorf("embed candidate: %w", err)
 	}
+	activeID := EmbedderIdentity(e.Embedder)
 
 	vectors, err := e.DB.AllVectors()
 	if err != nil {
@@ -110,6 +114,9 @@ func (e *Engine) findRetractedMatches(ctx context.Context, candidateText, catego
 
 	var matches []store.MemNode
 	for _, v := range vectors {
+		if canonicalIdentity(v.Model, v.Dimensions) != activeID {
+			continue // never compare across vector spaces
+		}
 		node, ok := nodeMap[v.NodeID]
 		if !ok || node.NodeType != "leaf" || node.Category != category {
 			continue

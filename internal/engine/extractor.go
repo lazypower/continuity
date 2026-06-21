@@ -58,6 +58,7 @@ func findSimilarNode(ctx context.Context, db *store.DB, embedder Embedder,
 	if err != nil {
 		return nil, 0, fmt.Errorf("embed candidate: %w", err)
 	}
+	activeID := EmbedderIdentity(embedder)
 
 	vectors, err := db.AllVectors()
 	if err != nil {
@@ -85,6 +86,9 @@ func findSimilarNode(ctx context.Context, db *store.DB, embedder Embedder,
 	bestSim := 0.0
 
 	for _, v := range vectors {
+		if canonicalIdentity(v.Model, v.Dimensions) != activeID {
+			continue // never compare across vector spaces
+		}
 		node, ok := nodeMap[v.NodeID]
 		if !ok || node.NodeType != "leaf" || node.Category != category {
 			continue

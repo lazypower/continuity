@@ -279,6 +279,24 @@ func TestEmbedNodePendingWhileLocked(t *testing.T) {
 	}
 }
 
+// TestFindRetractedMatchesSkipsWhenLocked pins Codex round-2 finding: the
+// retracted-resurrection safety gate must not compare across vector spaces while
+// the identity is locked — it skips (like no embedder) rather than scanning.
+func TestFindRetractedMatchesSkipsWhenLocked(t *testing.T) {
+	db := memTestDB(t)
+	e := New(db, nil)
+	e.SetEmbedder(stubEmbedder{model: "active", dims: 8})
+	e.identityMismatch = true // locked
+
+	matches, err := e.findRetractedMatches(context.Background(), "some candidate text", "patterns", 0.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches != nil {
+		t.Fatalf("locked retract gate must return no matches, got %d", len(matches))
+	}
+}
+
 func TestEmbedMissingFillsTrulyMissing(t *testing.T) {
 	db := memTestDB(t)
 	id := seedLeaf(t, db, "mem://agent/patterns/a", "alpha")
