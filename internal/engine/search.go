@@ -85,9 +85,21 @@ func Find(ctx context.Context, db *store.DB, embedder Embedder, query string, op
 		nodeMap[n.ID] = n
 	}
 
+	// Only score vectors that share the active embedder's identity. After the
+	// identity lock passes, the corpus may still contain a few stale rows from a
+	// prior embedder (e.g. an interrupted migration); comparing the query vector
+	// against those is a cross-space comparison that yields meaningless scores
+	// (or, on matching dimensions, plausible-looking noise). Skip them.
+	activeID := EmbedderIdentity(embedder)
+	skippedForeign := 0
+
 	// Score each vector
 	var results []SearchResult
 	for _, v := range vectors {
+		if canonicalIdentity(v.Model, v.Dimensions) != activeID {
+			skippedForeign++
+			continue
+		}
 		node, ok := nodeMap[v.NodeID]
 		if !ok {
 			continue
@@ -117,6 +129,10 @@ func Find(ctx context.Context, db *store.DB, embedder Embedder, query string, op
 				Similarity: similarity,
 			})
 		}
+	}
+
+	if skippedForeign > 0 {
+		log.Printf("search: skipped %d stored vector(s) not matching active identity %s (run `continuity doctor`)", skippedForeign, activeID)
 	}
 
 	// Sort by score descending

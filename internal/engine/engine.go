@@ -519,12 +519,13 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 		}
 		log.Printf("signal: stored %s [%s]", uri, c.Category)
 
-		// Embed if available
-		if e.Embedder != nil && node.L0Abstract != "" {
+		// Embed if available and not locked. While locked, the node stays Pending
+		// (no vector) rather than being written into an incompatible vector space.
+		if emb := e.embedderIfUnlocked(); emb != nil && node.L0Abstract != "" {
 			stored, err := e.DB.GetNodeByURI(node.URI)
 			if err == nil && stored != nil {
-				if vec, err := e.Embedder.Embed(ctx, stored.L0Abstract); err == nil {
-					e.DB.SaveVector(stored.ID, vec, e.Embedder.Model())
+				if vec, err := emb.Embed(ctx, stored.L0Abstract); err == nil {
+					e.DB.SaveVector(stored.ID, vec, emb.Model())
 				}
 			}
 		}
@@ -620,7 +621,10 @@ func (e *Engine) extractSession(sessionID, transcriptPath string, force bool) er
 		return nil
 	}
 
-	if err := extractMemories(e.DB, e.LLM, e.Embedder, sessionID, transcriptPath); err != nil {
+	// embedderIfUnlocked: while the vector identity is locked, extract still
+	// creates memory nodes but leaves them Pending (nil embedder => no vector),
+	// rather than writing into an incompatible vector space.
+	if err := extractMemories(e.DB, e.LLM, e.embedderIfUnlocked(), sessionID, transcriptPath); err != nil {
 		return fmt.Errorf("memory extraction: %w", err)
 	}
 

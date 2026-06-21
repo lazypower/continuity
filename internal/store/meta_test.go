@@ -51,7 +51,7 @@ func TestVectorModelCounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if counts["ollama:nomic-embed-text:768"] != 1 {
+	if len(counts) != 1 || counts[0].Model != "ollama:nomic-embed-text" || counts[0].Dimensions != 768 || counts[0].Count != 1 {
 		t.Fatalf("counts = %+v", counts)
 	}
 }

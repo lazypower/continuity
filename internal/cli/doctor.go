@@ -159,7 +159,11 @@ func runDoctorRepair(db *store.DB, emb engine.Embedder, apply bool) error {
 	}
 	activeID := engine.EmbedderIdentity(emb)
 
-	leaves, err := db.ListLeaves()
+	// Include RETRACTED leaves: their vectors are still used by the
+	// dedup-against-retracted gate, so leaving them in an old vector space after
+	// rebinding the corpus identity would blind that gate (different dimension)
+	// or feed it cross-space noise (same dimension).
+	leaves, err := db.ListLeavesIncludingRetracted()
 	if err != nil {
 		return fmt.Errorf("list leaves: %w", err)
 	}
@@ -194,15 +198,30 @@ func runDoctorRepair(db *store.DB, emb engine.Embedder, apply bool) error {
 		fmt.Printf("Snapshot: %s\n", snap)
 	}
 
+	// Phase 1: embed everything FIRST, writing nothing. An embedding failure
+	// (e.g. Ollama drops) then leaves the corpus completely untouched rather than
+	// half-migrated.
 	ctx := context.Background()
-	done := 0
+	type pendingWrite struct {
+		id  int64
+		vec []float64
+	}
+	writes := make([]pendingWrite, 0, len(todo))
 	for i := range todo {
 		vec, err := emb.Embed(ctx, todo[i].L0Abstract)
 		if err != nil {
-			return fmt.Errorf("embed %s: %w (repaired %d before failing; snapshot preserved)", todo[i].URI, err, done)
+			return fmt.Errorf("embed %s: %w (no vectors were written; snapshot at %s)", todo[i].URI, err, snap)
 		}
-		if err := db.SaveVector(todo[i].ID, vec, emb.Model()); err != nil {
-			return fmt.Errorf("save vector %s: %w", todo[i].URI, err)
+		writes = append(writes, pendingWrite{todo[i].ID, vec})
+	}
+
+	// Phase 2: commit the new vectors, then rebind the identity last so a
+	// mid-write failure never leaves the identity pointing at a space the
+	// vectors don't fully occupy.
+	done := 0
+	for _, w := range writes {
+		if err := db.SaveVector(w.id, w.vec, emb.Model()); err != nil {
+			return fmt.Errorf("save vector (wrote %d/%d; snapshot at %s): %w", done, len(writes), snap, err)
 		}
 		done++
 	}

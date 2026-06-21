@@ -49,24 +49,32 @@ func (db *DB) SetVectorIdentity(identity string) error {
 	return db.SetMeta(MetaVectorIdentity, identity)
 }
 
-// VectorModelCounts returns the count of stored vectors grouped by their
-// "model:dimensions" identity string. It reads only metadata columns (no
-// embedding blobs), so it is cheap to call at startup for reconciliation.
-func (db *DB) VectorModelCounts() (map[string]int, error) {
+// VectorModelCount is one (model, dimensions) bucket of the stored corpus.
+type VectorModelCount struct {
+	Model      string
+	Dimensions int
+	Count      int
+}
+
+// VectorModelCounts returns stored vectors grouped by (model, dimensions). It
+// reads only metadata columns (no embedding blobs), so it is cheap to call at
+// startup for reconciliation. Callers canonicalize (model, dimensions) into a
+// vector identity — kept out of the store layer because the canonicalization
+// rules (e.g. corpus-derived embedders) live in the engine.
+func (db *DB) VectorModelCounts() ([]VectorModelCount, error) {
 	rows, err := db.Query(`SELECT model, dimensions, COUNT(*) FROM mem_vectors GROUP BY model, dimensions`)
 	if err != nil {
 		return nil, fmt.Errorf("vector model counts: %w", err)
 	}
 	defer rows.Close()
 
-	counts := map[string]int{}
+	var out []VectorModelCount
 	for rows.Next() {
-		var model string
-		var dims, n int
-		if err := rows.Scan(&model, &dims, &n); err != nil {
+		var c VectorModelCount
+		if err := rows.Scan(&c.Model, &c.Dimensions, &c.Count); err != nil {
 			return nil, fmt.Errorf("scan vector model count: %w", err)
 		}
-		counts[fmt.Sprintf("%s:%d", model, dims)] = n
+		out = append(out, c)
 	}
-	return counts, rows.Err()
+	return out, rows.Err()
 }

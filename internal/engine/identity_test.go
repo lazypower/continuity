@@ -69,11 +69,97 @@ func TestReconcileFreshCorpusInitializes(t *testing.T) {
 	if !st.Match {
 		t.Fatalf("fresh corpus should match: %+v", st)
 	}
-	if id, ok, _ := db.VectorIdentity(); !ok || id != "tfidf:512" {
-		t.Fatalf("identity not initialized: %q ok=%v", id, ok)
+	if id, ok, _ := db.VectorIdentity(); !ok || id != "tfidf" {
+		t.Fatalf("identity not initialized (tfidf is canonical model-only): %q ok=%v", id, ok)
 	}
 	if locked, _ := e.VectorIdentityLocked(); locked {
 		t.Fatal("fresh corpus must not lock")
+	}
+}
+
+// TestReconcileTFIDFStableAcrossDimChange pins Codex finding #1: TF-IDF's
+// corpus-derived dimension must not self-lock the fallback. Stored tfidf at one
+// dim + active tfidf at another must MATCH (canonical identity is model-only).
+func TestReconcileTFIDFStableAcrossDimChange(t *testing.T) {
+	db := memTestDB(t)
+	id := seedLeaf(t, db, "mem://agent/patterns/a", "alpha")
+	if err := db.SaveVector(id, make([]float64, 300), "tfidf"); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(db, nil)
+	e.SetEmbedder(stubEmbedder{model: "tfidf", dims: 400}) // different dim, same embedder
+
+	st, err := e.ReconcileVectorIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Match {
+		t.Fatalf("tfidf must not self-lock on dimension change: %+v", st)
+	}
+	if locked, _ := e.VectorIdentityLocked(); locked {
+		t.Fatal("tfidf dim change must not lock")
+	}
+	if got, _, _ := db.VectorIdentity(); got != "tfidf" {
+		t.Fatalf("tfidf identity must be model-only, got %q", got)
+	}
+}
+
+// TestReconcileMixedCorpusLocks pins Codex finding #4: a pre-identity corpus with
+// MULTIPLE stored identities must fail closed, not silently bless a majority.
+func TestReconcileMixedCorpusLocks(t *testing.T) {
+	db := memTestDB(t)
+	a := seedLeaf(t, db, "mem://agent/patterns/a", "alpha")
+	b := seedLeaf(t, db, "mem://agent/patterns/b", "beta")
+	if err := db.SaveVector(a, make([]float64, 768), "ollama:nomic-embed-text"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveVector(b, make([]float64, 512), "old-model"); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(db, nil)
+	e.SetEmbedder(stubEmbedder{model: "ollama:nomic-embed-text", dims: 768})
+
+	st, err := e.ReconcileVectorIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Match {
+		t.Fatal("mixed corpus must not match")
+	}
+	if locked, reason := e.VectorIdentityLocked(); !locked || reason == "" {
+		t.Fatalf("mixed corpus must lock with a reason: locked=%v", locked)
+	}
+	if _, ok, _ := db.VectorIdentity(); ok {
+		t.Fatal("mixed corpus must not auto-bind any identity")
+	}
+}
+
+// TestFindSkipsForeignIdentityVectors pins Codex finding #5: even after the lock
+// passes, a stored vector under a foreign identity must not be scored — here a
+// foreign vector identical to the query (cosine 1.0) must still be skipped.
+func TestFindSkipsForeignIdentityVectors(t *testing.T) {
+	db := memTestDB(t)
+	good := seedLeaf(t, db, "mem://agent/patterns/good", "hello world")
+	bad := seedLeaf(t, db, "mem://agent/patterns/bad", "hello world")
+
+	emb := stubEmbedder{model: "active", dims: 8}
+	vec, _ := emb.Embed(context.Background(), "hello world")
+	if err := db.SaveVector(good, vec, "active"); err != nil {
+		t.Fatal(err)
+	}
+	// Same vector, FOREIGN model — high cosine, but must be excluded from scoring.
+	if err := db.SaveVector(bad, vec, "foreign"); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Find(context.Background(), db, emb, "hello world", SearchOpts{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 || res[0].Node.URI != "mem://agent/patterns/good" {
+		t.Fatalf("expected only the active-identity node, got %+v", res)
 	}
 }
 
