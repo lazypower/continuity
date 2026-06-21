@@ -209,7 +209,9 @@ func TestHashEmbedderUnicodeContentNonZero(t *testing.T) {
 	ctx := context.Background()
 	emb, _ := NewHashEmbedder(0)
 
-	for _, in := range []string{"café résumé", "你好世界", "Москва"} {
+	// Includes non-decimal Unicode numbers (Ⅻ = Nl, ② = No) — covered by
+	// unicode.IsNumber, not unicode.IsDigit.
+	for _, in := range []string{"café résumé", "你好世界", "Москва", "Ⅻ", "②"} {
 		v, _ := emb.Embed(ctx, in)
 		var sumSq float64
 		for _, x := range v {
@@ -217,6 +219,26 @@ func TestHashEmbedderUnicodeContentNonZero(t *testing.T) {
 		}
 		if sumSq == 0 {
 			t.Errorf("unicode content %q embedded to all-zero", in)
+		}
+	}
+}
+
+// TestHashEmbedderDeterministic pins bit-for-bit determinism: the same text must
+// embed to the identical vector across repeated calls, regardless of Go's
+// randomized map iteration order (terms are accumulated in sorted order). The
+// cross-restart retraction gate relies on this.
+func TestHashEmbedderDeterministic(t *testing.T) {
+	ctx := context.Background()
+	emb, _ := NewHashEmbedder(0)
+	const text = "operator home address discussion captured during a long conversation thread with many tokens"
+
+	ref, _ := emb.Embed(ctx, text)
+	for i := 0; i < 20; i++ {
+		v, _ := emb.Embed(ctx, text)
+		for j := range ref {
+			if v[j] != ref[j] {
+				t.Fatalf("non-deterministic embedding at bucket %d on iteration %d: %v vs %v", j, i, v[j], ref[j])
+			}
 		}
 	}
 }

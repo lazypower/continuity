@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -194,8 +195,18 @@ func (h *HashEmbedder) Embed(_ context.Context, text string) ([]float64, error) 
 		return vec, nil
 	}
 
-	for term, count := range tf {
-		weight := 1.0 + math.Log(float64(count)) // sublinear TF
+	// Accumulate in sorted term order so the vector is bit-for-bit deterministic.
+	// Float addition isn't associative, so randomized map iteration could vary the
+	// low bits when distinct terms collide into the same bucket — harmless for
+	// threshold comparisons, but it breaks the "same text → identical vector"
+	// invariant that cross-restart gate comparisons (and our tests) rely on.
+	terms := make([]string, 0, len(tf))
+	for term := range tf {
+		terms = append(terms, term)
+	}
+	sort.Strings(terms)
+	for _, term := range terms {
+		weight := 1.0 + math.Log(float64(tf[term])) // sublinear TF
 		vec[hashBucket(term, h.dims)] += weight
 	}
 
@@ -210,7 +221,7 @@ func (h *HashEmbedder) Embed(_ context.Context, text string) ([]float64, error) 
 func alnumLower(text string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(text) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
 			b.WriteRune(r)
 		}
 	}
@@ -288,7 +299,7 @@ func tokenize(text string) []string {
 	var tokens []string
 	var current strings.Builder
 	for _, r := range text {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
 			current.WriteRune(r)
 		} else {
 			if current.Len() > 1 { // skip single-char tokens
