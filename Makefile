@@ -12,7 +12,16 @@ LDFLAGS := -X $(BUILDINFO_PKG).Version=$(VERSION) \
 
 PLATFORMS := darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64
 
-.PHONY: build test vet clean run ui dist migration-fixtures
+.PHONY: build test vet clean run ui dist migration-fixtures retrieval-fixtures
+
+# Regenerate the retrieval golden fixture from a REAL Ollama nomic-embed-text.
+# Embeds the curated corpus + queries (internal/goldretrieval) and writes
+# internal/engine/testdata/retrieval/nomic.json. Requires: `ollama serve` with
+# nomic-embed-text pulled. The committed fixture feeds the hermetic PR-gate test
+# (TestRetrievalGolden_Nomic_*); rerun on the drift schedule or after changing
+# the corpus — a rank flip afterward is a real embedder regression.
+retrieval-fixtures:
+	go run ./scripts/genretrievalfixtures
 
 # Regenerate the migration golden fixtures from REAL released binaries.
 # Downloads one published binary per distinct shipped schema (v5/v7/v8), boots
