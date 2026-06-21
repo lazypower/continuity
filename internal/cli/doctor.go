@@ -545,7 +545,9 @@ func printDoctorReport(rep doctorReport) {
 	}
 	if !rep.Healthy {
 		fmt.Println()
-		fmt.Println("  Repair is a separate, explicit step (snapshot-first, coming next):")
-		fmt.Println("    continuity doctor --repair-vectors")
+		fmt.Println("  Repair is a separate, explicit step (snapshot-first):")
+		fmt.Println("    continuity doctor --repair-vectors          # dry-run: show the plan")
+		fmt.Println("    continuity doctor --repair-vectors --apply  # snapshot, then re-embed")
+		fmt.Println("    continuity restart                          # clear the identity lock")
 	}
 }
