@@ -351,15 +351,17 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 	if !input.AcknowledgeRetracted && e.Embedder != nil && c.L0 != "" {
 		matches, err := e.findRetractedMatches(ctx, c.L0, c.Category, MatchThreshold(e.Embedder))
 		if err != nil {
-			log.Printf("remember: retracted-match check failed: %v", err)
-		} else if len(matches) > 0 {
+			// Fail CLOSED: if the gate can't complete we cannot prove the write is
+			// safe, so refuse it rather than risk re-introducing retracted content.
+			// --acknowledge-retracted still overrides (this block is gated on it).
+			return "", false, fmt.Errorf("retracted-memory check failed (failing closed; re-run with --acknowledge-retracted to bypass): %w", err)
+		}
+		if len(matches) > 0 {
 			uris := make([]string, len(matches))
-			hashes := make([]string, len(matches))
 			for i, m := range matches {
 				uris[i] = m.URI
-				hashes[i] = hashURI(m.URI)
 			}
-			log.Printf("dedup-retracted: candidate matches %d retracted node(s) hash=%s", len(matches), strings.Join(hashes, ","))
+			log.Printf("dedup-retracted: candidate matches %d retracted node(s) hash=%s", len(matches), hashMatchedURIs(matches))
 			return "", false, &RetractedMatchError{MatchedURIs: uris}
 		}
 	}
@@ -505,6 +507,14 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 		return fmt.Errorf("LLM not configured")
 	}
 
+	// Fail closed while the vector identity is locked: the retraction gate can't
+	// run, so a signal write could silently re-introduce retracted content. Defer
+	// rather than write unchecked; the operator repairs via `continuity doctor`.
+	if e.identityMismatch {
+		log.Printf("signal: deferring — vector identity locked; run `continuity doctor --repair-vectors`")
+		return nil
+	}
+
 	resp, err := e.LLM.Complete(ctx, llm.SignalExtractionPrompt(prompt))
 	if err != nil {
 		return fmt.Errorf("signal extraction LLM: %w", err)
@@ -526,8 +536,33 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 		owner := ownerForCategory(c.Category)
 		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
 
-		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
-			uri = c.MergeTarget
+		// An LLM-supplied merge_target is intentionally NOT honored (see the matching
+		// note in extractMemories): trusting an LLM-chosen URI was a recurring gate
+		// bypass. The candidate always lands in its declared category, so the gate
+		// keys on c.Category.
+
+		// Retraction-resurrection gate (per-candidate, fail-closed): a signal
+		// candidate matching a retracted memory must not be written. Skip only the
+		// offending candidate; on a gate error skip it too rather than write unchecked.
+		// (Locked identity is handled above; embedder is nil here only in `none` mode.)
+		if emb := e.embedderIfUnlocked(); emb != nil && c.L0 != "" {
+			matches, err := e.findRetractedMatches(ctx, c.L0, c.Category, MatchThreshold(emb))
+			if err != nil {
+				log.Printf("signal: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
+				continue
+			}
+			if len(matches) > 0 {
+				log.Printf("signal: skipping %s — matches %d retracted node(s) hash=%s", uri, len(matches), hashMatchedURIs(matches))
+				continue
+			}
+		}
+
+		// Exact retracted-URI guard (mirrors Remember): the constructed uri_hint can
+		// still collide with a retracted canonical node the vector gate can't catch
+		// (no same-identity vector). UpsertNode also enforces this atomically.
+		if existing, err := e.DB.GetNodeByURI(uri); err == nil && existing != nil && existing.IsRetracted() {
+			log.Printf("signal: skipping %s — target URI is retracted (would resurrect)", uri)
+			continue
 		}
 
 		node := &store.MemNode{
@@ -649,9 +684,19 @@ func (e *Engine) extractSession(sessionID, transcriptPath string, force bool) er
 		return nil
 	}
 
-	// embedderIfUnlocked: while the vector identity is locked, extract still
-	// creates memory nodes but leaves them Pending (nil embedder => no vector),
-	// rather than writing into an incompatible vector space.
+	// Fail closed while the vector identity is locked: the active embedder is
+	// incompatible with the corpus, so the retraction-resurrection gate cannot
+	// run, and extraction would write new memory nodes that could silently
+	// re-introduce retracted (e.g. PII) content the gate would have caught. Defer
+	// the whole session WITHOUT marking it extracted, so the next Stop/SessionEnd
+	// re-extracts once the operator repairs (`continuity doctor --repair-vectors`).
+	if e.identityMismatch {
+		log.Printf("extraction: deferring %s — vector identity locked; run `continuity doctor --repair-vectors` (not marking extracted)", sessionID)
+		return nil
+	}
+
+	// embedderIfUnlocked: with the identity NOT locked, this is the active embedder
+	// (or nil only in `none` mode, where the operator opted out of the gate).
 	if err := extractMemories(e.DB, e.LLM, e.embedderIfUnlocked(), sessionID, transcriptPath); err != nil {
 		return fmt.Errorf("memory extraction: %w", err)
 	}

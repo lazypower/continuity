@@ -18,13 +18,17 @@ import (
 const defaultSimilarityThreshold = 0.65
 
 // memoryCandidate is the JSON structure returned by the extraction LLM.
+//
+// Note: there is intentionally no merge_target field. An LLM-chosen merge URI is
+// not trusted (it was a recurring retracted-PII gate-bypass surface); dedup is
+// owned by the system via findSimilarNode. Any merge_target the LLM emits is
+// simply ignored as an unknown JSON key.
 type memoryCandidate struct {
-	Category    string `json:"category"`
-	URIHint     string `json:"uri_hint"`
-	L0          string `json:"l0"`
-	L1          string `json:"l1"`
-	L2          string `json:"l2"`
-	MergeTarget string `json:"merge_target"`
+	Category string `json:"category"`
+	URIHint  string `json:"uri_hint"`
+	L0       string `json:"l0"`
+	L1       string `json:"l1"`
+	L2       string `json:"l2"`
 }
 
 // ownerForCategory returns the URI owner for a given category.
@@ -176,12 +180,17 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 		owner := ownerForCategory(c.Category)
 		uri := fmt.Sprintf("mem://%s/%s/%s", owner, c.Category, c.URIHint)
 
-		// If merge_target is specified and valid, use it
-		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
-			uri = c.MergeTarget
-		}
+		// An LLM-supplied merge_target is intentionally NOT honored. Dedup is owned
+		// by the system via findSimilarNode (embedding similarity) below — a path the
+		// gate can reason about — so trusting an LLM-chosen URI was pure redundancy
+		// that kept opening retracted-PII gate bypasses (content landing in a
+		// category/URI the gate hadn't checked). Ignoring it shrinks the trusted
+		// input to zero LLM-controlled URIs: a candidate always lands in its own
+		// declared category, so the gate simply keys on c.Category.
 
-		// Similarity gate: check if a semantically equivalent node already exists
+		// Similarity gate: redirect to a semantically equivalent LIVE node in the
+		// same category if one exists (findSimilarNode skips retracted nodes, so it
+		// can never merge INTO a tombstone).
 		if embedder != nil && c.Category != "" {
 			match, sim, err := findSimilarNode(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
 			if err != nil {
@@ -191,6 +200,37 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 				log.Printf("extraction: merging %s → %s (similarity: %.3f)", uri, match.URI, sim)
 				uri = match.URI // Redirect to existing node's URI
 			}
+		}
+
+		// Retraction-resurrection gate (per-candidate, fail-closed): a candidate
+		// that matches a retracted memory must NOT be written — otherwise retracted
+		// (e.g. PII) content silently resurfaces as a fresh live node. findSimilarNode
+		// deliberately skips retracted nodes (so it can't merge INTO one), which is
+		// why this separate semantic gate is required to catch the create-a-new-node
+		// path. The candidate always lands in its declared category, so the gate keys
+		// on c.Category. Skip only the offending candidate — one bad candidate must
+		// not drop the rest of the batch; on a gate error we also skip (fail closed).
+		// The embedder is nil only in `none` mode (gate opted out); the locked case is
+		// deferred upstream in extractSession.
+		if embedder != nil && c.L0 != "" {
+			matches, err := findRetractedMatchesIn(ctx, db, embedder, c.L0, c.Category, MatchThreshold(embedder))
+			if err != nil {
+				log.Printf("extraction: retracted-check failed for %s — skipping candidate (fail-closed): %v", uri, err)
+				continue
+			}
+			if len(matches) > 0 {
+				log.Printf("extraction: skipping %s — matches %d retracted node(s) hash=%s", uri, len(matches), hashMatchedURIs(matches))
+				continue
+			}
+		}
+
+		// Exact retracted-URI guard (mirrors Remember): the constructed uri_hint can
+		// still collide with a retracted canonical node that has no same-identity
+		// vector. UpsertNode enforces this atomically too (ErrRetractedTarget), but
+		// skipping here keeps a clean per-candidate log and avoids a wasted write.
+		if existing, err := db.GetNodeByURI(uri); err == nil && existing != nil && existing.IsRetracted() {
+			log.Printf("extraction: skipping %s — target URI is retracted (would resurrect)", uri)
+			continue
 		}
 
 		node := &store.MemNode{

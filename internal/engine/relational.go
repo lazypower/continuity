@@ -113,6 +113,13 @@ func extractRelational(db *store.DB, client llm.Client, sessionID, transcriptPat
 		SourceSession: sessionID,
 	}
 
+	// No retraction-resurrection gate here, by construction: relational only ever
+	// writes the single fixed relationalURI (mem://user/profile/communication),
+	// which is system-owned and un-retractable (store.systemOwnedURIs; see
+	// TestRetractNode_RefusesSystemOwnedURIs). So this write can never overwrite a
+	// tombstone — and UpsertNode now refuses retracted targets atomically anyway
+	// (ErrRetractedTarget). It also never creates arbitrary nodes, and its L0 is a
+	// constant, so there is no per-candidate content for the L0-based gate to act on.
 	if err := db.UpsertNode(profileNode); err != nil {
 		return err
 	}

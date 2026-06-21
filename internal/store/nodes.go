@@ -2,10 +2,19 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// ErrRetractedTarget is returned by UpsertNode when the target URI resolves to a
+// retracted (tombstoned) node. Upsert must never resurrect a tombstone — neither
+// by overwriting a mergeable row in place nor by spawning a live duplicate. This
+// is the atomic store-level backstop behind the callers' pre-checks: it closes
+// the check-then-write race where a concurrent retraction lands between a
+// caller's guard and the write.
+var ErrRetractedTarget = errors.New("refusing to upsert into a retracted node")
 
 // textNearIdentical returns true if two strings are >95% similar by character overlap.
 // Uses a simple normalized edit-distance-like metric: shared bigram ratio.
@@ -212,22 +221,64 @@ func (db *DB) UpsertNode(node *MemNode) error {
 		return db.CreateNode(node)
 	}
 
+	// Never resurrect a tombstone. Callers (Remember / extraction / signal)
+	// pre-check and skip, but enforce it here too so the write can't slip past a
+	// concurrent retraction.
+	if existing.IsRetracted() {
+		return ErrRetractedTarget
+	}
+
 	if existing.Mergeable {
 		// Skip if new content is near-identical to existing (avoid churn)
 		if textNearIdentical(existing.L1Overview, node.L1Overview) &&
 			textNearIdentical(existing.L0Abstract, node.L0Abstract) {
 			return nil
 		}
-		existing.L0Abstract = node.L0Abstract
-		existing.L1Overview = node.L1Overview
-		existing.L2Content = node.L2Content
-		existing.SourceSession = node.SourceSession
-		return db.UpdateNode(existing)
+		// Tombstone-guarded in-place update: if the row is retracted between the
+		// read above and this write, 0 rows change — report the refusal rather
+		// than silently overwriting (resurrecting) the tombstone. Same columns as
+		// UpdateNode, preserving merged_from.
+		now := time.Now().UnixMilli()
+		res, err := db.Exec(`
+			UPDATE mem_nodes SET l0_abstract = ?, l1_overview = ?, l2_content = ?,
+				merged_from = ?, source_session = ?, updated_at = ?
+			WHERE id = ? AND tombstoned_at IS NULL
+		`, node.L0Abstract, node.L1Overview, node.L2Content,
+			existing.MergedFrom, node.SourceSession, now, existing.ID)
+		if err != nil {
+			return fmt.Errorf("update node: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrRetractedTarget // raced retraction between read and write
+		}
+		node.URI = existing.URI
+		return nil
 	}
 
-	// Immutable — create as new node with deduplicated URI
+	// Immutable — create as new node with deduplicated URI.
+	baseURI := node.URI
 	node.URI = fmt.Sprintf("%s-%d", node.URI, time.Now().UnixMilli())
-	return db.CreateNode(node)
+	if err := db.CreateNode(node); err != nil {
+		return err
+	}
+	// Close the read→insert race: an INSERT has no WHERE guard like the mergeable
+	// branch, so if the base node was retracted between the IsRetracted() check
+	// above and this insert, the suffixed node would resurrect just-retracted
+	// content. Re-check and compensate (delete + fail closed). The suffixed node is
+	// only ever visible after UpsertNode returns, so this transient insert is safe.
+	base, rerr := db.GetNodeByURI(baseURI)
+	if rerr != nil || (base != nil && base.IsRetracted()) {
+		// Either the base is retracted, OR we can't prove it isn't (re-read failed).
+		// Both fail closed: undo the insert so no unproven live node survives.
+		if delErr := db.DeleteNode(node.ID); delErr != nil {
+			return fmt.Errorf("rollback suffixed node for %s: %w", baseURI, delErr)
+		}
+		if rerr != nil {
+			return fmt.Errorf("verify base %s after insert: %w", baseURI, rerr)
+		}
+		return ErrRetractedTarget
+	}
+	return nil
 }
 
 // FindByCategory returns live leaf nodes for a given category, ordered by relevance DESC.
