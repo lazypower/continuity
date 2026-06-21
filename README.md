@@ -59,7 +59,7 @@ continuity serve
 # continuity serving on 127.0.0.1:37777
 #   db: ~/.continuity/continuity.db
 #   llm: claude-cli (haiku)
-#   embedder: tfidf (fallback)
+#   embedder: tfidf (hashed lexical, fallback)
 ```
 
 **Or: enable autostart** so the server launches automatically when Claude Code needs it:
@@ -240,13 +240,45 @@ ollama pull nomic-embed-text
 
 Free, runs locally, embeddings come from a fixed pre-trained model so the vector space is consistent across writes and across process restarts. This is the path Continuity is developed and tested against. Use this if dedup-against-retracted recall matters — and it matters for any user who has used `retract` to remove PII.
 
-**2. Built-in TFIDF — fallback, best-effort.**
+**2. Built-in hashed lexical embedder — fallback, stable.**
 
-Zero external dependencies. Used automatically when Ollama is unreachable, so a fresh install always has *something*. The cost: TFIDF rebuilds its vocabulary from the local corpus on each startup, so the vector space drifts as the corpus grows or changes. The retraction-induced component of that drift is contained (issue #22 — the IDF table includes retracted nodes so cosine similarity stays coherent across a retraction). The corpus-growth component is not. The hard gate at `sim ≥ 0.65` still fires for direct rewrites; near-duplicates that would have been caught under Ollama may slip through.
+Zero external dependencies. Used automatically when Ollama is unreachable, so a fresh install works from the first write. It hashes each term into a **fixed-dimension** space (`hash(term) mod 2048`), so its coordinate system is constant forever — independent of corpus size, age, or process restarts. That stability is what the retraction-resurrection gate, dedup, and search all rely on: two vectors are only comparable in the same space, and this one never drifts. (It replaced an earlier corpus-derived TF-IDF whose axes *did* drift as the corpus grew, which silently degraded the gate — see `continuity doctor`.)
 
-This path is shipped and tested — but it is not the path Continuity is developed against day-to-day. Use it if you can't run a daemon and are okay with degraded retraction-gate recall.
+The tradeoff is deliberate: it's a **stable lexical safety net**, not a semantic embedder. Similarity is keyword overlap, not meaning — so it reliably catches a retracted memory being re-written verbatim or near-verbatim (including reformatted PII like `555-123-4567` vs `555 123 4567`), but it won't catch a genuine paraphrase the way a semantic model would.
 
-**Picking a path.** If you care about the retraction gate, install Ollama. If you're running Continuity casually and the worst case of a soft duplicate slipping through is "I have to dedup manually later," the built-in TFIDF fallback is fine.
+**Picking a path.** Install Ollama if you want semantic recall — it's the path Continuity is developed against, and it catches paraphrased duplicates the lexical net can't. The built-in fallback is a sound default when you can't run a daemon: the retraction gate works, search works, nothing drifts; you trade semantic recall for zero dependencies.
+
+**Forcing a backend.** `CONTINUITY_EMBEDDER` overrides the auto-probe: `ollama`, `tfidf` (the hashed lexical fallback), `none` (no embedder — disables semantic search *and* the retraction gate), or `auto` (default: Ollama if reachable, else the fallback).
+
+## Operator CLI + Health
+
+A corpus is **bound to a vector identity** — the `model:dimensions` of whatever embedder first wrote it (e.g. `ollama:nomic-embed-text:768` or `hashtf:2048`). Vectors are only comparable within one identity, so the server refuses to compare across spaces: if the active embedder doesn't match the corpus, **search fails closed** — it returns an error (HTTP `503`) rather than scoring across incompatible vector spaces and handing back garbage.
+
+The common way to hit this: run Ollama-free for a while (corpus bound to `hashtf:2048`), then install Ollama. The next start probes Ollama, the active embedder becomes `ollama:...:768`, it no longer matches the corpus — and search locks until you re-embed. This is intended (it never silently corrupts the index), but you have to know the recovery.
+
+**`continuity doctor`** diagnoses without touching your memories — it never re-embeds, writes vectors, or bumps access metrics (like any command, opening the database may apply a pending migration, snapshot-first):
+
+```bash
+continuity doctor          # active embedder vs corpus identity, vector
+                           # distribution, missing/stale/mixed-dim vectors,
+                           # and a self-retrieval smoke test
+continuity doctor --json   # same report as JSON
+```
+
+If it reports **degraded** (identity mismatch, stale vectors, or a locked server), repair is a separate, explicit, snapshot-first step:
+
+```bash
+continuity doctor --repair-vectors          # dry-run: print the plan, change nothing
+continuity doctor --repair-vectors --apply  # snapshot first, then re-embed every
+                                            # stale/missing/foreign vector (retracted
+                                            # nodes included) to the active embedder,
+                                            # and rebind the corpus identity
+continuity restart                          # restart so the server clears the lock
+```
+
+Repair rewrites only derived vectors and the identity marker — never memory content — and takes an explicit `pre-repair-vectors` snapshot first regardless.
+
+**`continuity search --explain`** shows the score decomposition (similarity, relevance) per result — useful for understanding why something ranked where it did, or confirming the active embedder is actually scoring.
 
 ## CLI
 
@@ -256,16 +288,20 @@ continuity init [--autostart] Set up Claude Code integration + optional autostar
 continuity timeline [--days N] [--project X]  Session clusters, gaps, and rhythm
 continuity install-service    Install as system service (launchd/systemd)
 continuity uninstall-service  Remove system service
+continuity restart            Restart the running service (reloads embedder/config)
 continuity hook <evt>         Handle Claude Code hook events
-continuity search             Search memories by query
-continuity remember    Store a memory directly (no LLM needed)
-continuity retract     Retract a memory you wrote (tombstone or supersession)
-continuity profile     Show relational profile
-continuity tree        Browse the memory tree
-continuity dedup       Deduplicate similar memory nodes
+continuity search [query]     Search memories (--explain shows score decomposition)
+continuity remember           Store a memory directly (no LLM needed)
+continuity retract <uri>      Retract a memory you wrote (tombstone or supersession)
+continuity show <uri>         Show one memory (--include-retracted reveals tombstones)
+continuity profile            Show relational profile
+continuity tree [uri]         Browse the memory tree
+continuity extract [session]  Re-run extraction for a session (--force re-processes)
+continuity doctor             Diagnose embedder/vector-index health (see below)
+continuity dedup              Deduplicate similar memory nodes
 continuity snapshot list      List retained migration safety snapshots
 continuity snapshot prune     Remove retained migration safety snapshots
-continuity version     Print version information
+continuity version            Print version information
 ```
 
 ### Memory accountability
@@ -368,7 +404,7 @@ continuity-go/
 └── RFC.md                     Full design document
 ```
 
-~7,500 lines of Go + Svelte. No generated code. No frameworks beyond cobra and chi.
+More test code than program (397 tests). Three dependencies. One pure-Go static binary, no CGO.
 
 ## Why This Exists
 
