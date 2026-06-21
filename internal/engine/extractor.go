@@ -188,16 +188,24 @@ func extractMemories(db *store.DB, client llm.Client, embedder Embedder, session
 		// honored, gate on the target's REAL category (not a parsed string).
 		merged := false
 		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
-			if target, err := db.GetNodeByURI(c.MergeTarget); err == nil && target != nil {
-				if target.IsRetracted() {
-					log.Printf("extraction: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
-					continue
-				}
+			target, err := db.GetNodeByURI(c.MergeTarget)
+			switch {
+			case err != nil:
+				// Can't resolve the target => can't prove the write is safe. Fail
+				// closed (skip) rather than silently fall back to the constructed uri,
+				// which would gate on the declared category and miss a retracted node
+				// in the merge target's category.
+				log.Printf("extraction: merge_target lookup failed for %s — skipping candidate (fail-closed): %v", c.MergeTarget, err)
+				continue
+			case target == nil:
+				log.Printf("extraction: ignoring merge_target %s — no such node; using %s", c.MergeTarget, uri)
+			case target.IsRetracted():
+				log.Printf("extraction: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
+				continue
+			default:
 				uri = target.URI
 				gateCat = target.Category
 				merged = true
-			} else {
-				log.Printf("extraction: ignoring merge_target %s — no such node; using %s", c.MergeTarget, uri)
 			}
 		}
 

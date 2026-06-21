@@ -545,15 +545,22 @@ func (e *Engine) ExtractSignal(ctx context.Context, sessionID, prompt string) er
 		// => skip (merge-into-tombstone). When honored, gate on the target's REAL
 		// category.
 		if c.MergeTarget != "" && strings.HasPrefix(c.MergeTarget, "mem://") {
-			if target, err := e.DB.GetNodeByURI(c.MergeTarget); err == nil && target != nil {
-				if target.IsRetracted() {
-					log.Printf("signal: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
-					continue
-				}
+			target, err := e.DB.GetNodeByURI(c.MergeTarget)
+			switch {
+			case err != nil:
+				// Can't resolve => can't prove safety. Fail closed (skip) rather than
+				// fall back to the declared category and miss a retracted node in the
+				// merge target's category.
+				log.Printf("signal: merge_target lookup failed for %s — skipping candidate (fail-closed): %v", c.MergeTarget, err)
+				continue
+			case target == nil:
+				log.Printf("signal: ignoring merge_target %s — no such node; using %s", c.MergeTarget, uri)
+			case target.IsRetracted():
+				log.Printf("signal: skipping %s — merge_target %s is retracted (would resurrect)", uri, c.MergeTarget)
+				continue
+			default:
 				uri = target.URI
 				gateCat = target.Category
-			} else {
-				log.Printf("signal: ignoring merge_target %s — no such node; using %s", c.MergeTarget, uri)
 			}
 		}
 
