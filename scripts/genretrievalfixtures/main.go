@@ -71,6 +71,15 @@ func run(url, model string, dims int, out string) error {
 		fx.QueryVecs[a.Query] = v
 	}
 
+	// Stamp the ACTUAL dimension the model returned (and assert it's uniform),
+	// not the CLI flag — so a regressed embedder dimension can't be papered over
+	// by the flag value and replayed green.
+	dim, err := uniformDim(&fx)
+	if err != nil {
+		return err
+	}
+	fx.Dims = dim
+
 	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 		return fmt.Errorf("create fixture dir: %w", err)
 	}
@@ -80,4 +89,31 @@ func run(url, model string, dims int, out string) error {
 	fmt.Printf("wrote %s (%s, %d-d): %d corpus vectors, %d query vectors\n",
 		out, fx.Model, fx.Dims, len(fx.CorpusVecs), len(fx.QueryVecs))
 	return nil
+}
+
+// uniformDim returns the common length of every recorded vector, or an error if
+// they disagree (a regressed/mixed embedder) or none were produced.
+func uniformDim(fx *goldretrieval.Fixture) (int, error) {
+	dim := -1
+	check := func(label string, vecs map[string][]float64) error {
+		for k, v := range vecs {
+			if dim == -1 {
+				dim = len(v)
+			}
+			if len(v) != dim {
+				return fmt.Errorf("inconsistent vector dimension: %s %q is %d-d, expected %d-d", label, k, len(v), dim)
+			}
+		}
+		return nil
+	}
+	if err := check("corpus", fx.CorpusVecs); err != nil {
+		return 0, err
+	}
+	if err := check("query", fx.QueryVecs); err != nil {
+		return 0, err
+	}
+	if dim <= 0 {
+		return 0, fmt.Errorf("no vectors were embedded")
+	}
+	return dim, nil
 }
