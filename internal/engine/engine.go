@@ -18,6 +18,21 @@ type Engine struct {
 	LLM      llm.Client
 	Embedder Embedder
 	stopCh   chan struct{}
+
+	// Vector-identity lock. Set by ReconcileVectorIdentity when the active
+	// embedder's identity differs from the corpus's declared identity. While
+	// locked, search must fail closed rather than compare query vectors against
+	// a corpus embedded in a different vector space, and EmbedMissing must not
+	// run (no silent re-embed). Cleared only by an explicit repair.
+	identityMismatch bool
+	identityReason   string
+}
+
+// VectorIdentityLocked reports whether the active embedder is incompatible with
+// the corpus's declared vector identity. When true, reason explains the
+// mismatch and points the operator at repair; callers (search) must fail closed.
+func (e *Engine) VectorIdentityLocked() (bool, string) {
+	return e.identityMismatch, e.identityReason
 }
 
 // New creates a new Engine.
@@ -39,6 +54,13 @@ func (e *Engine) EmbedNode(ctx context.Context, node *store.MemNode) error {
 	if e.Embedder == nil {
 		return nil
 	}
+	// Pending state: while the vector identity is locked, the active embedder is
+	// incompatible with the corpus. Do NOT embed new writes into a foreign vector
+	// space — leave the node pending (no vector). EmbedMissing fills it once a
+	// compatible embedder is active again (see ReconcileVectorIdentity).
+	if e.identityMismatch {
+		return nil
+	}
 	text := node.L0Abstract
 	if text == "" {
 		return nil
@@ -51,9 +73,18 @@ func (e *Engine) EmbedNode(ctx context.Context, node *store.MemNode) error {
 	return e.DB.SaveVector(node.ID, vec, e.Embedder.Model())
 }
 
-// EmbedMissing embeds all leaf nodes that don't have a vector or whose model differs.
+// EmbedMissing embeds leaf nodes that have NO vector yet, using the active
+// embedder. It deliberately does NOT re-embed nodes whose stored model differs
+// from the active embedder: re-embedding an existing corpus into a new vector
+// space is a corpus migration and must be explicit (snapshot-first repair), not
+// a silent side effect of startup. Callers run this only when the active
+// embedder matches the corpus's declared vector identity (see
+// ReconcileVectorIdentity); while the identity is locked, it must not run.
 func (e *Engine) EmbedMissing(ctx context.Context) (int, error) {
 	if e.Embedder == nil {
+		return 0, nil
+	}
+	if e.identityMismatch {
 		return 0, nil
 	}
 
@@ -68,13 +99,15 @@ func (e *Engine) EmbedMissing(ctx context.Context) (int, error) {
 			continue
 		}
 
-		// Check if vector exists with current model
+		// Fill only truly-missing vectors. A vector that exists under a
+		// different model is STALE, not missing — leave it for explicit repair
+		// rather than silently re-embedding it into the active vector space.
 		existing, err := e.DB.GetVector(leaves[i].ID)
 		if err != nil {
 			log.Printf("embed missing: get vector for %s: %v", leaves[i].URI, err)
 			continue
 		}
-		if existing != nil && existing.Model == e.Embedder.Model() {
+		if existing != nil {
 			continue
 		}
 

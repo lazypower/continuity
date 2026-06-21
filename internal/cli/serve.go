@@ -145,17 +145,29 @@ func runServe(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// Embed any nodes missing vectors
+		// Reconcile the active embedder against the corpus's declared vector
+		// identity BEFORE embedding anything. On mismatch we lock (search fails
+		// closed) and do NOT re-embed — that migration must be explicit. Only on
+		// a match do we fill truly-missing vectors.
 		if eng != nil && eng.Embedder != nil {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-				defer cancel()
-				if n, err := eng.EmbedMissing(ctx); err != nil {
-					fmt.Fprintf(os.Stderr, "embed missing: %v\n", err)
-				} else if n > 0 {
-					fmt.Fprintf(os.Stderr, "  embedded %d missing nodes\n", n)
-				}
-			}()
+			st, err := eng.ReconcileVectorIdentity(context.Background())
+			switch {
+			case err != nil:
+				fmt.Fprintf(os.Stderr, "warning: vector identity reconcile failed: %v\n", err)
+			case !st.Match:
+				fmt.Fprintf(os.Stderr, "\n⚠ %s\n\n", st.Reason)
+			default:
+				fmt.Fprintf(os.Stderr, "  vectors: %s\n", st.Action)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					defer cancel()
+					if n, err := eng.EmbedMissing(ctx); err != nil {
+						fmt.Fprintf(os.Stderr, "embed missing: %v\n", err)
+					} else if n > 0 {
+						fmt.Fprintf(os.Stderr, "  embedded %d missing nodes\n", n)
+					}
+				}()
+			}
 		}
 	}
 

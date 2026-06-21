@@ -79,6 +79,7 @@ func init() {
 	searchCmd.Flags().BoolVar(&searchSmart, "smart", false, "Use LLM-assisted search")
 	searchCmd.Flags().IntVarP(&searchLimit, "limit", "n", 10, "Maximum number of results")
 	searchCmd.Flags().StringVarP(&searchCategory, "category", "c", "", "Filter by category")
+	searchCmd.Flags().BoolVar(&searchExplain, "explain", false, "Show score decomposition (similarity, relevance) per result")
 
 	// Profile flags
 	profileCmd.Flags().BoolVar(&profileVerbose, "verbose", false, "Show all profile and preference nodes")
@@ -103,6 +104,7 @@ var (
 	searchSmart    bool
 	searchLimit    int
 	searchCategory string
+	searchExplain  bool
 )
 
 var searchCmd = &cobra.Command{
@@ -162,6 +164,11 @@ func runSearch(cmd *cobra.Command, args []string) error {
 
 	for i, r := range resp.Results {
 		fmt.Printf("%d. [%.3f] %s\n", i+1, r.Score, r.URI)
+		if searchExplain {
+			// Score decomposition — so ranking can be inspected from the CLI
+			// instead of curling /api/search and parsing JSON by hand.
+			fmt.Printf("   score=%.3f = similarity=%.3f x relevance=%.3f (x category boost)\n", r.Score, r.Similarity, r.Relevance)
+		}
 		fmt.Printf("   %s [%s]\n", r.L0Abstract, r.Category)
 		if r.L1Overview != "" {
 			// Show first 200 chars of L1
