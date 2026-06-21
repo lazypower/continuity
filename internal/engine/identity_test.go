@@ -297,6 +297,37 @@ func TestFindRetractedMatchesSkipsWhenLocked(t *testing.T) {
 	}
 }
 
+// TestRememberFailsClosedWhenLocked pins Codex round-3: while the identity is
+// locked the retracted-PII gate can't run, so an unacknowledged write must be
+// REFUSED (not silently allowed); --acknowledge-retracted still overrides.
+func TestRememberFailsClosedWhenLocked(t *testing.T) {
+	db := memTestDB(t)
+	e := New(db, nil)
+	e.SetEmbedder(stubEmbedder{model: "active", dims: 8})
+	e.identityMismatch = true // locked
+
+	const body = "a sufficiently long overview body for validation"
+	if _, _, err := e.Remember(context.Background(), RememberInput{
+		Category: "patterns", Name: "alpha", Summary: "hello world", Body: body,
+	}); err == nil {
+		t.Fatal("locked Remember without --acknowledge-retracted must refuse")
+	}
+
+	uri, _, err := e.Remember(context.Background(), RememberInput{
+		Category: "patterns", Name: "beta", Summary: "hello world", Body: body, AcknowledgeRetracted: true,
+	})
+	if err != nil {
+		t.Fatalf("acknowledged locked Remember should proceed: %v", err)
+	}
+	// It must have stayed Pending — no vector written into the foreign space.
+	stored, _ := db.GetNodeByURI(uri)
+	if stored != nil {
+		if v, _ := db.GetVector(stored.ID); v != nil {
+			t.Fatalf("locked Remember must leave node Pending, got vector %+v", v)
+		}
+	}
+}
+
 func TestEmbedMissingFillsTrulyMissing(t *testing.T) {
 	db := memTestDB(t)
 	id := seedLeaf(t, db, "mem://agent/patterns/a", "alpha")

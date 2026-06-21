@@ -190,6 +190,17 @@ func runDoctorRepair(db *store.DB, emb engine.Embedder, apply bool) error {
 		return nil
 	}
 
+	// Refuse to repair under a live server that is running a DIFFERENT, unlocked
+	// embedder: it would keep writing its own-identity vectors against the corpus
+	// we just rebound, re-mixing it. Require the server stopped, locked, or in
+	// agreement before rewriting.
+	if srv := fetchServerIdentity(); srv.Reachable && !srv.Locked &&
+		srv.ActiveEmbedder != "" && srv.ActiveEmbedder != activeID {
+		return fmt.Errorf("the running server is embedding with %s (not locked) but repair targets %s; "+
+			"stop the server (or let it lock) before --apply, then `continuity restart` after — otherwise it "+
+			"would keep writing %s vectors into the repaired corpus", srv.ActiveEmbedder, activeID, srv.ActiveEmbedder)
+	}
+
 	snap, err := db.SnapshotNow("pre-repair-vectors")
 	if err != nil {
 		return fmt.Errorf("snapshot before repair: %w", err)

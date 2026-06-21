@@ -191,8 +191,15 @@ func (e *Engine) Dedup(ctx context.Context, threshold float64) (int, error) {
 		return 0, fmt.Errorf("load vectors: %w", err)
 	}
 
+	// Cluster only within the active identity — never delete a memory based on a
+	// cross-space cosine score against a stale foreign-identity vector (which can
+	// linger even when active==declared, e.g. after an interrupted repair).
+	activeID := EmbedderIdentity(e.Embedder)
 	vecMap := make(map[int64][]float64, len(vectors))
 	for _, v := range vectors {
+		if canonicalIdentity(v.Model, v.Dimensions) != activeID {
+			continue
+		}
 		vecMap[v.NodeID] = v.Embedding
 	}
 
@@ -327,6 +334,15 @@ func (e *Engine) Remember(ctx context.Context, input RememberInput) (string, boo
 		return "", false, validationErrorf("uri %s is retracted; choose a different slug", requestedURI)
 	}
 
+	// While the vector identity is locked, the retracted-memory safety gate
+	// cannot run (the active embedder is incompatible with the corpus). Fail
+	// CLOSED: refuse an unacknowledged write rather than risk re-introducing
+	// retracted (e.g. PII) content the gate would have caught. An explicit
+	// --acknowledge-retracted still overrides, matching the unlocked flow.
+	if !input.AcknowledgeRetracted && e.identityMismatch {
+		return "", false, validationErrorf("vector identity is locked — the retracted-memory check cannot run; resolve with `continuity doctor` (and --repair-vectors), or re-run with --acknowledge-retracted to write without the check")
+	}
+
 	// Dedup against retracted memories. Retracted memories must still participate
 	// in similarity matching, or retraction-because-PII is silently broken: the
 	// next session writes similar content, hits no match, re-introduces the leak.
@@ -400,6 +416,13 @@ const maxMoments = 10
 // most "covered" by the rest gets evicted.
 // Returns the URI of the evicted moment, or empty string if no eviction needed.
 func (e *Engine) evictRedundantMoment(ctx context.Context) (string, error) {
+	// While the vector identity is locked, do not run vector-based eviction:
+	// comparing moments across vector spaces could delete a real moment on
+	// cross-space noise rather than a genuinely redundant one.
+	if e.identityMismatch {
+		return "", nil
+	}
+
 	moments, err := e.DB.FindByCategory("moments")
 	if err != nil {
 		return "", fmt.Errorf("find moments: %w", err)
@@ -427,11 +450,15 @@ func (e *Engine) evictRedundantMoment(ctx context.Context) (string, error) {
 		node store.MemNode
 		vec  []float64
 	}
+	activeID := EmbedderIdentity(e.Embedder)
 	var pool []momentVec
 	for _, m := range moments {
 		v, err := e.DB.GetVector(m.ID)
 		if err != nil || v == nil {
 			continue
+		}
+		if canonicalIdentity(v.Model, v.Dimensions) != activeID {
+			continue // never compare across vector spaces
 		}
 		pool = append(pool, momentVec{m, v.Embedding})
 	}
