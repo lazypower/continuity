@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Embedder generates vector embeddings for text.
@@ -126,8 +127,14 @@ func ProbeOllama(url, model string) bool {
 //   - deterministic across restarts and across machines.
 //
 // Collisions (distinct terms sharing a bucket) are the cost; they are tuned away
-// by dims. Signed hashing (a per-term ±1) keeps collisions unbiased in
-// expectation rather than always additive.
+// by dims. Buckets accumulate UNSIGNED weights: the textbook signed-hashing trick
+// (a per-term ±1) keeps collisions unbiased in expectation, but it lets two
+// colliding terms with opposite signs cancel — which can zero out the whole
+// vector for short inputs (e.g. "oh aaa"), and a zero vector cannot match itself
+// in the retraction gate. For a lexical SAFETY net the cardinal sin is a silent
+// false negative, so we accept the small additive collision bias (which only ever
+// nudges similarity UP, toward firing the gate) in exchange for the guarantee
+// that any surviving content token yields a non-zero vector.
 type HashEmbedder struct {
 	dims int
 }
@@ -157,8 +164,9 @@ func (h *HashEmbedder) Model() string   { return "hashtf" }
 func (h *HashEmbedder) Dimensions() int { return h.dims }
 
 // Embed generates a normalized hashed-TF vector for the given text. Sublinear
-// term frequency (1 + log(count)) damps repetition; signed feature hashing keeps
-// collisions unbiased; L2 normalization makes cosine length-independent.
+// term frequency (1 + log(count)) damps repetition; unsigned feature hashing
+// guarantees any content token contributes a positive weight (no cancellation to
+// zero); L2 normalization makes cosine length-independent.
 func (h *HashEmbedder) Embed(_ context.Context, text string) ([]float64, error) {
 	vec := make([]float64, h.dims)
 
@@ -180,30 +188,29 @@ func (h *HashEmbedder) Embed(_ context.Context, text string) ([]float64, error) 
 	// stays the zero vector.
 	if len(tf) == 0 {
 		if norm := alnumLower(text); norm != "" {
-			bucket, sign := hashFeature(norm, h.dims)
-			vec[bucket] = sign
+			vec[hashBucket(norm, h.dims)] = 1
 			normalize(vec)
 		}
 		return vec, nil
 	}
 
 	for term, count := range tf {
-		bucket, sign := hashFeature(term, h.dims)
 		weight := 1.0 + math.Log(float64(count)) // sublinear TF
-		vec[bucket] += sign * weight
+		vec[hashBucket(term, h.dims)] += weight
 	}
 
 	normalize(vec)
 	return vec, nil
 }
 
-// alnumLower returns text lowercased with every non-alphanumeric rune removed.
-// Used only for the degenerate-input fallback in Embed, to guarantee that any
-// text with alphanumeric content yields a non-zero, self-consistent vector.
+// alnumLower returns text lowercased with every non-alphanumeric rune removed
+// (Unicode-aware, matching tokenize). Used only for the degenerate-input fallback
+// in Embed, to guarantee that any text with alphanumeric content yields a
+// non-zero, self-consistent vector.
 func alnumLower(text string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(text) {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			b.WriteRune(r)
 		}
 	}
@@ -258,22 +265,17 @@ func MatchThreshold(emb Embedder) float64 {
 	return defaultSimilarityThreshold
 }
 
-// hashFeature maps a term to its bucket in [0, dims) and a deterministic ±1 sign
-// (the signed-hashing trick). Bucket and sign come from independent regions of a
-// 64-bit FNV-1a hash: the low bits choose the bucket, the high bit the sign.
-func hashFeature(term string, dims int) (bucket int, sign float64) {
+// hashBucket maps a term to its bucket in [0, dims) via a 64-bit FNV-1a hash.
+func hashBucket(term string, dims int) int {
 	hsh := fnv.New64a()
 	_, _ = hsh.Write([]byte(term))
-	sum := hsh.Sum64()
-	bucket = int(sum % uint64(dims))
-	if sum&(1<<63) == 0 {
-		return bucket, 1.0
-	}
-	return bucket, -1.0
+	return int(hsh.Sum64() % uint64(dims))
 }
 
 // tokenize splits text into lowercase alphanumeric tokens, treating every other
-// rune — including '-' and '_' — as a separator.
+// rune — including '-' and '_' — as a separator. "Alphanumeric" is Unicode-aware
+// (unicode.IsLetter/IsDigit), so non-ASCII memories tokenize to content rather
+// than silently dropping to an all-zero, unmatchable vector.
 //
 // Splitting on '-'/'_' (rather than keeping them inside tokens) is load-bearing
 // for the retraction-resurrection gate: the same PII reformatted differently
@@ -286,7 +288,7 @@ func tokenize(text string) []string {
 	var tokens []string
 	var current strings.Builder
 	for _, r := range text {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			current.WriteRune(r)
 		} else {
 			if current.Len() > 1 { // skip single-char tokens

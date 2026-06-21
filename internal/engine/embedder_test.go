@@ -181,6 +181,46 @@ func TestHashEmbedderDegenerateContentNonZero(t *testing.T) {
 	}
 }
 
+// TestHashEmbedderNoCancellationToZero pins the round-3 fix: unsigned hashing
+// must never let colliding content tokens cancel to an all-zero vector. With the
+// old signed-hashing trick, "oh aaa" hashed both tokens to the same bucket with
+// opposite signs, zeroing the vector so the memory could not match itself.
+func TestHashEmbedderNoCancellationToZero(t *testing.T) {
+	ctx := context.Background()
+	emb, _ := NewHashEmbedder(0)
+
+	v, _ := emb.Embed(ctx, "oh aaa")
+	var sumSq float64
+	for _, x := range v {
+		sumSq += x * x
+	}
+	if sumSq == 0 {
+		t.Fatal("colliding content tokens cancelled to an all-zero vector")
+	}
+	if v2, _ := emb.Embed(ctx, "oh aaa"); CosineSimilarity(v, v2) < 0.999 {
+		t.Error(`"oh aaa" does not self-match`)
+	}
+}
+
+// TestHashEmbedderUnicodeContentNonZero pins the round-3 fix: non-ASCII
+// alphanumeric content must tokenize to a non-zero vector, not silently drop to
+// an all-zero (unmatchable) one.
+func TestHashEmbedderUnicodeContentNonZero(t *testing.T) {
+	ctx := context.Background()
+	emb, _ := NewHashEmbedder(0)
+
+	for _, in := range []string{"café résumé", "你好世界", "Москва"} {
+		v, _ := emb.Embed(ctx, in)
+		var sumSq float64
+		for _, x := range v {
+			sumSq += x * x
+		}
+		if sumSq == 0 {
+			t.Errorf("unicode content %q embedded to all-zero", in)
+		}
+	}
+}
+
 // TestHashEmbedderReformattedDigitsCollide pins the retraction-gate normalization
 // fix (Codex finding): the same PII written with different digit-group separators
 // must still land in the same buckets, so a reformatted re-write trips the gate.
