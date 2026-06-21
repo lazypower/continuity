@@ -1,6 +1,7 @@
 {
   "model": "ollama:nomic-embed-text",
   "dims": 768,
+  "fingerprint": "3fcf2749ffda853759743d342ad4025438fb549f8b4dae0de3ca2657fbcfe955",
   "corpus_vectors": {
     "mem://agent/cases/content-truncation": [
       0.0487053,

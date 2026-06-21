@@ -46,10 +46,11 @@ func run(url, model string, dims int, out string) error {
 	ctx := context.Background()
 
 	fx := goldretrieval.Fixture{
-		Model:      emb.Model(),
-		Dims:       dims,
-		CorpusVecs: map[string][]float64{},
-		QueryVecs:  map[string][]float64{},
+		Model:       emb.Model(),
+		Dims:        dims,
+		Fingerprint: goldretrieval.CorpusFingerprint(),
+		CorpusVecs:  map[string][]float64{},
+		QueryVecs:   map[string][]float64{},
 	}
 
 	for _, e := range goldretrieval.Corpus() {

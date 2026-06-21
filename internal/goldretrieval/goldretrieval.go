@@ -23,10 +23,28 @@ package goldretrieval
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 )
+
+// CorpusFingerprint is a stable hash of the curated corpus + assertions. The
+// generator records it in the fixture; the test recomputes it and fails when it
+// diverges — so changing the corpus/queries without regenerating the recorded
+// vectors (which would let the fixture drift from the definition while the golden
+// stays green) is a hard error, not a silent pass.
+func CorpusFingerprint() string {
+	h := sha256.New()
+	for _, e := range Corpus() {
+		fmt.Fprintf(h, "C\x00%s\x00%s\x00%s\n", e.URI, e.Category, e.L0)
+	}
+	for _, a := range Assertions() {
+		fmt.Fprintf(h, "A\x00%s\x00%s\x00%s\x00%g\n", a.Query, a.Top, a.Above, a.MinMargin)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // Entry is one curated corpus memory.
 type Entry struct {
@@ -97,10 +115,11 @@ func QueryTexts() []string {
 
 // Fixture is the committed golden: recorded vectors for the corpus and queries.
 type Fixture struct {
-	Model      string               `json:"model"`
-	Dims       int                  `json:"dims"`
-	CorpusVecs map[string][]float64 `json:"corpus_vectors"` // uri -> vector
-	QueryVecs  map[string][]float64 `json:"query_vectors"`  // query text -> vector
+	Model       string               `json:"model"`
+	Dims        int                  `json:"dims"`
+	Fingerprint string               `json:"fingerprint"`    // CorpusFingerprint() at generation time
+	CorpusVecs  map[string][]float64 `json:"corpus_vectors"` // uri -> vector
+	QueryVecs   map[string][]float64 `json:"query_vectors"`  // query text -> vector
 }
 
 // Load reads a fixture from disk.

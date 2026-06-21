@@ -38,6 +38,11 @@ func loadGoldenDB(t *testing.T) (*store.DB, *goldretrieval.ReplayEmbedder) {
 	if err != nil {
 		t.Fatalf("load retrieval fixture (regenerate with `make retrieval-fixtures`): %v", err)
 	}
+	// Hard-fail on drift: if the corpus/queries changed without regenerating the
+	// recorded vectors, the fixture no longer describes the definition under test.
+	if fx.Fingerprint != goldretrieval.CorpusFingerprint() {
+		t.Fatalf("retrieval fixture is stale — corpus/queries changed without regenerating; run `make retrieval-fixtures`")
+	}
 
 	db, err := store.OpenMemory()
 	if err != nil {
@@ -98,7 +103,14 @@ func TestRetrievalGolden_Nomic_TopicalQueries(t *testing.T) {
 		gap := 0.0
 		switch {
 		case a.Above != "":
-			gap = scores[a.Top] - scores[a.Above]
+			aboveScore, ok := scores[a.Above]
+			if !ok {
+				// The distractor must actually be in the results to prove it was
+				// outranked — a missing comparator must FAIL, not score as 0.
+				t.Errorf("query %q: comparator %s absent from results — cannot verify it was outranked", a.Query, a.Above)
+				continue
+			}
+			gap = scores[a.Top] - aboveScore
 		case len(res) >= 2:
 			gap = res[0].Score - res[1].Score
 		}
