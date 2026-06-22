@@ -149,6 +149,48 @@ func TestListPinned_OrdersByPinTime(t *testing.T) {
 	}
 }
 
+// TestPinNode_EnforcesCap verifies the write-time cap: the (MaxPins+1)th pin is
+// rejected, so the accepted contract never exceeds the injectable one. Re-pinning
+// an already-pinned node does not count against the cap.
+func TestPinNode_EnforcesCap(t *testing.T) {
+	db := testDB(t)
+
+	// Pin exactly MaxPins memories — all should succeed.
+	for i := 0; i < MaxPins; i++ {
+		uri := "mem://user/feedback/cap-" + string(rune('a'+i))
+		seedNode(t, db, uri, "feedback", "cap test")
+		if _, err := db.PinNode(uri); err != nil {
+			t.Fatalf("pin %d/%d: %v", i+1, MaxPins, err)
+		}
+	}
+
+	// Re-pinning an existing pin is idempotent and must NOT be blocked by the cap.
+	if _, err := db.PinNode("mem://user/feedback/cap-a"); err != nil {
+		t.Errorf("re-pin of existing pin blocked by cap: %v", err)
+	}
+
+	// The next NEW pin must be rejected.
+	seedNode(t, db, "mem://user/feedback/one-too-many", "feedback", "over cap")
+	_, err := db.PinNode("mem://user/feedback/one-too-many")
+	if err == nil {
+		t.Fatalf("pin beyond cap: want error, got nil")
+	}
+	if !isPinValidation(err) {
+		t.Errorf("over-cap error not a PinValidationError: %v", err)
+	}
+	if !strings.Contains(err.Error(), "limit") {
+		t.Errorf("over-cap error = %q, want mention of the limit", err.Error())
+	}
+
+	// After unpinning one, a new pin fits again — the cap counts live pins.
+	if _, err := db.UnpinNode("mem://user/feedback/cap-a"); err != nil {
+		t.Fatalf("unpin: %v", err)
+	}
+	if _, err := db.PinNode("mem://user/feedback/one-too-many"); err != nil {
+		t.Errorf("pin after freeing a slot: %v", err)
+	}
+}
+
 func isPinValidation(err error) bool {
 	_, ok := err.(*PinValidationError)
 	return ok

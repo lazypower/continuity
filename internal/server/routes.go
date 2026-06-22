@@ -3,10 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -406,6 +409,12 @@ func (s *Server) handleRetract(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePin marks a memory as an operator pin (declared contract). Idempotent.
+//
+// Pins are store-native: they only stamp pinned_at and require neither an LLM nor
+// an embedder. The handler therefore depends on s.db (always present) rather than
+// s.engine (nil when no LLM is configured — a supported config). Routing pins
+// through the engine would have made them 503 for exactly the Ollama-free
+// operators the feature serves.
 func (s *Server) handlePin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		URI string `json:"uri"`
@@ -418,17 +427,16 @@ func (s *Server) handlePin(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "uri is required", http.StatusBadRequest)
 		return
 	}
-	if s.engine == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+	if !strings.HasPrefix(req.URI, "mem://") {
+		jsonError(w, fmt.Sprintf("invalid URI %q: must start with mem://", req.URI), http.StatusBadRequest)
 		return
 	}
 
-	newly, err := s.engine.Pin(req.URI)
+	newly, err := s.db.PinNode(req.URI)
 	if err != nil {
-		if isValidation, msg := engine.IsValidationError(err); isValidation {
-			jsonError(w, msg, http.StatusBadRequest)
+		var pve *store.PinValidationError
+		if errors.As(err, &pve) {
+			jsonError(w, pve.Message, http.StatusBadRequest)
 			return
 		}
 		log.Printf("pin: %v", err)
@@ -444,7 +452,7 @@ func (s *Server) handlePin(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{"status": status, "uri": req.URI})
 }
 
-// handleUnpin clears an operator pin. Idempotent.
+// handleUnpin clears an operator pin. Idempotent. Store-native (see handlePin).
 func (s *Server) handleUnpin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		URI string `json:"uri"`
@@ -457,17 +465,16 @@ func (s *Server) handleUnpin(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "uri is required", http.StatusBadRequest)
 		return
 	}
-	if s.engine == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+	if !strings.HasPrefix(req.URI, "mem://") {
+		jsonError(w, fmt.Sprintf("invalid URI %q: must start with mem://", req.URI), http.StatusBadRequest)
 		return
 	}
 
-	newly, err := s.engine.Unpin(req.URI)
+	newly, err := s.db.UnpinNode(req.URI)
 	if err != nil {
-		if isValidation, msg := engine.IsValidationError(err); isValidation {
-			jsonError(w, msg, http.StatusBadRequest)
+		var pve *store.PinValidationError
+		if errors.As(err, &pve) {
+			jsonError(w, pve.Message, http.StatusBadRequest)
 			return
 		}
 		log.Printf("unpin: %v", err)

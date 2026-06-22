@@ -25,6 +25,27 @@ func pinValidationErrorf(format string, args ...any) error {
 	return &PinValidationError{Message: fmt.Sprintf(format, args...)}
 }
 
+// MaxPins is the most live pins that may exist at once. It is the single source
+// of truth for the cap: PinNode enforces it at write time so the accepted
+// contract (what `pin --list` / the pinned endpoint report) always equals the
+// injected contract (what the cold-boot ### Pinned section renders). The context
+// builder caps at this same value as defense-in-depth, but with write-time
+// enforcement that cap never actually fires. Kept small on purpose — the tray is
+// a surgeon's tray, not a garage.
+const MaxPins = 7
+
+// CountLivePins returns the number of live (non-retracted) pinned leaf nodes.
+func (db *DB) CountLivePins() (int, error) {
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM mem_nodes WHERE pinned_at IS NOT NULL AND tombstoned_at IS NULL AND node_type = 'leaf'`,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count live pins: %w", err)
+	}
+	return count, nil
+}
+
 // PinNode marks a memory as an operator-declared pin by stamping pinned_at.
 // A pin is the "declared half" of the operating contract: it forces the memory
 // into the cold-boot injection window's dedicated Pinned section regardless of
@@ -58,6 +79,21 @@ func (db *DB) PinNode(uri string) (newly bool, err error) {
 
 	if target.IsPinned() {
 		return false, nil
+	}
+
+	// Enforce the cap at write time so listed pins == injected pins. Re-pinning an
+	// already-pinned node short-circuits above, so this only gates genuinely-new
+	// pins. (Best-effort under concurrency — the cap is a UX guardrail for a
+	// single operator, not a safety invariant; the retraction gate is the invariant.)
+	count, err := db.CountLivePins()
+	if err != nil {
+		return false, err
+	}
+	if count >= MaxPins {
+		return false, pinValidationErrorf(
+			"pin limit reached (%d pins); unpin one first with `continuity unpin <uri>` before pinning another",
+			MaxPins,
+		)
 	}
 
 	now := time.Now().UnixMilli()

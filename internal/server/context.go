@@ -33,7 +33,10 @@ const (
 	maxRelationalContext = 1000 // budget for relational profile section
 	maxItemContext       = 200  // budget per L0 memory item
 	maxContextItems      = 15   // max items considered (budget usually cuts off earlier)
-	maxPinnedItems       = 7    // max operator pins injected (declared contract)
+	// maxPinnedItems is the cold-boot cap on the ### Pinned section. It tracks
+	// store.MaxPins, which is enforced at pin *write* time — so this cap is
+	// defense-in-depth that never actually fires (listed pins == injected pins).
+	maxPinnedItems = store.MaxPins
 )
 
 // buildContext creates the context markdown for session injection.
