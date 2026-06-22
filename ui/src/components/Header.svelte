@@ -7,6 +7,7 @@
     { id: 'tree', label: 'Tree', icon: '\u25C8' },
     { id: 'search', label: 'Search', icon: '\u26B2' },
     { id: 'profile', label: 'Profile', icon: '\u2666' },
+    { id: 'coldboot', label: 'Cold Boot', icon: '\u2756' },
   ];
 
   function setTab(tab: Tab) {

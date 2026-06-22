@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import { categoryColors, type Category } from '../lib/types';
+  import { pinMemory, unpinMemory } from '../lib/api';
 
   interface Props {
     uri: string;
@@ -14,9 +15,42 @@
     // retracted nodes here, but this guard makes the component correct
     // regardless of upstream filtering — see issue #12.
     retracted?: boolean;
+    // Pin affordance. showPin renders the push-pin toggle (the Tree view, the
+    // curation surface, enables it); pinned reflects current state. onpinchange
+    // lets the parent refresh after a successful toggle.
+    showPin?: boolean;
+    pinned?: boolean;
+    onpinchange?: (uri: string, pinned: boolean) => void;
   }
 
-  let { uri, category, l0_abstract, l1_overview, relevance, score, retracted }: Props = $props();
+  let {
+    uri, category, l0_abstract, l1_overview, relevance, score, retracted,
+    showPin = false, pinned = false, onpinchange,
+  }: Props = $props();
+
+  let pinBusy = $state(false);
+  let pinError = $state('');
+
+  async function togglePin(event: MouseEvent | KeyboardEvent) {
+    event.stopPropagation();
+    if (pinBusy || retracted) return;
+    pinBusy = true;
+    pinError = '';
+    const next = !pinned;
+    try {
+      if (next) {
+        await pinMemory(uri);
+      } else {
+        await unpinMemory(uri);
+      }
+      pinned = next;
+      onpinchange?.(uri, next);
+    } catch (e) {
+      pinError = String(e);
+    } finally {
+      pinBusy = false;
+    }
+  }
 
   let expanded = $state(false);
   let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
@@ -146,9 +180,26 @@
           <p class="text-sm leading-relaxed">{l0_abstract}</p>
         {/if}
       </div>
-      <span class="expand-icon text-[var(--text-secondary)] text-sm shrink-0">
+      <div class="card-actions flex items-center gap-1.5 shrink-0">
+        {#if showPin && !retracted}
+          <button
+            type="button"
+            class="pin-btn text-sm leading-none"
+            class:pinned
+            onclick={togglePin}
+            onkeydown={(e) => e.stopPropagation()}
+            disabled={pinBusy}
+            title={pinError || (pinned ? 'Unpin — remove from the cold-boot window' : 'Pin — inject into every cold SessionStart')}
+            aria-label={pinned ? `Unpin ${uri}` : `Pin ${uri}`}
+            aria-pressed={pinned}
+          >
+            {pinned ? '📌' : '📍'}
+          </button>
+        {/if}
+        <span class="expand-icon text-[var(--text-secondary)] text-sm">
         {expanded ? '\u2212' : '\u002B'}
       </span>
+      </div>
     </div>
 
     <!-- Relevance bar -->
@@ -260,5 +311,29 @@
     cursor: pointer;
     background: transparent;
     transition: border-color 150ms ease, color 150ms ease;
+  }
+
+  .pin-btn {
+    cursor: pointer;
+    background: transparent;
+    border: none;
+    padding: 0 2px;
+    opacity: 0.35;
+    filter: grayscale(1);
+    transition: opacity 150ms ease, filter 150ms ease, transform 150ms ease;
+  }
+
+  .pin-btn:hover {
+    opacity: 0.8;
+  }
+
+  .pin-btn.pinned {
+    opacity: 1;
+    filter: none;
+  }
+
+  .pin-btn:disabled {
+    cursor: default;
+    opacity: 0.5;
   }
 </style>

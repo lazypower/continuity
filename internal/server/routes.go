@@ -739,6 +739,7 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		L1Overview string `json:"l1_overview,omitempty"`
 		Children   int    `json:"children,omitempty"`
 		Retracted  bool   `json:"retracted,omitempty"`
+		Pinned     bool   `json:"pinned,omitempty"`
 	}
 
 	var nodes []treeNodeJSON
@@ -785,6 +786,7 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 				NodeType:  c.NodeType,
 				Category:  c.Category,
 				Retracted: c.IsRetracted(),
+				Pinned:    c.IsPinned(),
 			}
 			// Suppress content fields on retracted nodes — same absence-not-empty
 			// principle as handleGetMemory.

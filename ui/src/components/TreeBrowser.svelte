@@ -36,6 +36,22 @@
     }
   }
 
+  // Reflect a pin toggle locally so the card's state stays correct without a
+  // full tree reload. The MemoryCard already flipped its own state optimistically
+  // after the API call succeeded; we mirror it into the cached node so a collapse/
+  // re-expand shows the right state.
+  function onPinChange(uri: string, pinned: boolean) {
+    for (const dir of Object.keys(expandedDirs)) {
+      const nodes = expandedDirs[dir];
+      const idx = nodes.findIndex((n) => n.uri === uri);
+      if (idx !== -1) {
+        nodes[idx] = { ...nodes[idx], pinned };
+        expandedDirs = { ...expandedDirs };
+        return;
+      }
+    }
+  }
+
   function isExpanded(uri: string): boolean {
     return uri in expandedDirs;
   }
@@ -138,6 +154,9 @@
                         l0_abstract={leaf.l0_abstract || ''}
                         l1_overview={leaf.l1_overview}
                         retracted={leaf.retracted}
+                        showPin={true}
+                        pinned={leaf.pinned}
+                        onpinchange={onPinChange}
                       />
                     {/each}
                   </div>
@@ -149,6 +168,9 @@
                   l0_abstract={child.l0_abstract || ''}
                   l1_overview={child.l1_overview}
                   retracted={child.retracted}
+                  showPin={true}
+                  pinned={child.pinned}
+                  onpinchange={onPinChange}
                 />
               {/if}
             {/each}

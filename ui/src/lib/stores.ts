@@ -1,6 +1,6 @@
 import { writable } from 'svelte/store';
 
-export type Tab = 'health' | 'tree' | 'search' | 'profile';
+export type Tab = 'health' | 'tree' | 'search' | 'profile' | 'coldboot';
 
 export const activeTab = writable<Tab>('health');
 
