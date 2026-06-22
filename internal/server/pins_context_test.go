@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,6 +9,54 @@ import (
 
 	"github.com/lazypower/continuity/internal/store"
 )
+
+// TestRenderContext_PreviewDoesNotTouchMoments is the regression for Codex
+// round-2 finding: the Cold Boot preview must be side-effect-free. A real
+// injection advances moment rotation (TouchNode); a preview must not, or
+// previewing the tray would change what the next real SessionStart receives.
+func TestRenderContext_PreviewDoesNotTouchMoments(t *testing.T) {
+	srv := testServer(t)
+	// Seed >3 moments so selection actually picks (and would touch) some.
+	for i := 0; i < 4; i++ {
+		if err := srv.db.UpsertNode(&store.MemNode{
+			URI:        fmt.Sprintf("mem://agent/moments/m-%d", i),
+			NodeType:   "leaf",
+			Category:   "moments",
+			L0Abstract: fmt.Sprintf("moment number %d", i),
+			Relevance:  1.0,
+		}); err != nil {
+			t.Fatalf("seed moment %d: %v", i, err)
+		}
+	}
+
+	// Preview: zero rotation writes. access_count is the touch signal — TouchNode
+	// is the only writer on the moments path and it increments access_count.
+	// (last_access is stamped at CreateNode time, so its non-nil-ness is not a
+	// touch indicator.)
+	_ = srv.renderContext("", true)
+	for i := 0; i < 4; i++ {
+		n, _ := srv.db.GetNodeByURI(fmt.Sprintf("mem://agent/moments/m-%d", i))
+		if n == nil {
+			t.Fatalf("moment %d missing", i)
+		}
+		if n.AccessCount != 0 {
+			t.Errorf("preview touched moment %d (access=%d) — preview must not consume rotation", i, n.AccessCount)
+		}
+	}
+
+	// Real injection: rotation advances (at least one selected moment touched).
+	_ = srv.buildContext("")
+	touched := 0
+	for i := 0; i < 4; i++ {
+		n, _ := srv.db.GetNodeByURI(fmt.Sprintf("mem://agent/moments/m-%d", i))
+		if n != nil && n.AccessCount > 0 {
+			touched++
+		}
+	}
+	if touched == 0 {
+		t.Error("real injection touched no moments — rotation is not advancing")
+	}
+}
 
 // TestPinEndpoint_WorksWithoutEngine is the regression for Codex finding #1: a
 // server started without an LLM (nil engine — the supported Ollama-free config)

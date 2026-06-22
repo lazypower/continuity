@@ -16,7 +16,12 @@ import (
 )
 
 func (s *Server) handleGetContext(w http.ResponseWriter, r *http.Request) {
-	ctx := s.buildContext(r.URL.Query().Get("session_id"))
+	// preview=true renders the cold-boot window WITHOUT mutating rotation state
+	// (the Cold Boot UI uses this). A real SessionStart injection omits the flag
+	// so moment rotation advances. A preview that consumed rotation would change
+	// the very thing it claims to show — the panel is an honesty instrument.
+	preview := r.URL.Query().Get("preview") == "true"
+	ctx := s.renderContext(r.URL.Query().Get("session_id"), preview)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -39,9 +44,19 @@ const (
 	maxPinnedItems = store.MaxPins
 )
 
-// buildContext creates the context markdown for session injection.
-// Enforces a hard character budget to prevent context bloat.
+// buildContext creates the context markdown for a real session injection.
+// It advances moment rotation (TouchNode) as a side effect — this is the
+// SessionStart path. For a side-effect-free render (the Cold Boot preview),
+// use renderContext(sessionID, true).
 func (s *Server) buildContext(currentSessionID string) string {
+	return s.renderContext(currentSessionID, false)
+}
+
+// renderContext builds the context markdown. When preview is true, it makes no
+// writes — moment rotation is NOT advanced — so callers can show exactly what a
+// cold SessionStart would inject without consuming the rotation that injection
+// would. Enforces a hard character budget to prevent context bloat.
+func (s *Server) renderContext(currentSessionID string, preview bool) string {
 	var b strings.Builder
 	budget := maxContextTotal
 
@@ -159,8 +174,11 @@ func (s *Server) buildContext(currentSessionID string) string {
 					l0 = truncateAtSentence(l0, maxItemContext)
 				}
 				section += fmt.Sprintf("- %s\n", l0)
-				// Touch for rotation tracking — next session deprioritizes these
-				s.db.TouchNode(m.URI)
+				// Touch for rotation tracking — next session deprioritizes these.
+				// Skipped in preview: a preview must not consume the rotation it shows.
+				if !preview {
+					s.db.TouchNode(m.URI)
+				}
 			}
 			b.WriteString(section)
 			budget -= len(section)

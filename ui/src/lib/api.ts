@@ -66,10 +66,11 @@ export function fetchPinned(): Promise<PinnedResponse> {
   return get('/memories/pinned');
 }
 
-// The verbatim cold-boot injection — no session_id, so it's exactly the tray a
-// fresh SessionStart receives.
+// The verbatim cold-boot injection. preview=true renders exactly what a fresh
+// SessionStart receives WITHOUT advancing moment rotation — previewing the tray
+// must not consume the rotation it shows.
 export function fetchColdBootContext(): Promise<ContextResponse> {
-  return get('/context');
+  return get('/context?preview=true');
 }
 
 export function pinMemory(uri: string): Promise<{ status: string; uri: string }> {
