@@ -405,6 +405,126 @@ func (s *Server) handleRetract(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handlePin marks a memory as an operator pin (declared contract). Idempotent.
+func (s *Server) handlePin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URI string `json:"uri"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.URI == "" {
+		jsonError(w, "uri is required", http.StatusBadRequest)
+		return
+	}
+	if s.engine == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+		return
+	}
+
+	newly, err := s.engine.Pin(req.URI)
+	if err != nil {
+		if isValidation, msg := engine.IsValidationError(err); isValidation {
+			jsonError(w, msg, http.StatusBadRequest)
+			return
+		}
+		log.Printf("pin: %v", err)
+		jsonError(w, "failed to pin memory", http.StatusBadRequest)
+		return
+	}
+
+	status := "pinned"
+	if !newly {
+		status = "already_pinned"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": status, "uri": req.URI})
+}
+
+// handleUnpin clears an operator pin. Idempotent.
+func (s *Server) handleUnpin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URI string `json:"uri"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.URI == "" {
+		jsonError(w, "uri is required", http.StatusBadRequest)
+		return
+	}
+	if s.engine == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+		return
+	}
+
+	newly, err := s.engine.Unpin(req.URI)
+	if err != nil {
+		if isValidation, msg := engine.IsValidationError(err); isValidation {
+			jsonError(w, msg, http.StatusBadRequest)
+			return
+		}
+		log.Printf("unpin: %v", err)
+		jsonError(w, "failed to unpin memory", http.StatusBadRequest)
+		return
+	}
+
+	status := "unpinned"
+	if !newly {
+		status = "not_pinned"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": status, "uri": req.URI})
+}
+
+// handleListPinned returns the live (non-retracted) operator pins, oldest first.
+// This is the data behind the UI's cold-boot injection view — what the agent
+// wakes up with in the Pinned section.
+func (s *Server) handleListPinned(w http.ResponseWriter, r *http.Request) {
+	pinned, err := s.db.ListPinned()
+	if err != nil {
+		log.Printf("list pinned: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	type pinJSON struct {
+		URI        string  `json:"uri"`
+		Category   string  `json:"category"`
+		L0Abstract string  `json:"l0_abstract"`
+		L1Overview string  `json:"l1_overview,omitempty"`
+		Relevance  float64 `json:"relevance"`
+		PinnedAt   int64   `json:"pinned_at"`
+	}
+
+	out := make([]pinJSON, 0, len(pinned))
+	for _, p := range pinned {
+		pj := pinJSON{
+			URI:        p.URI,
+			Category:   p.Category,
+			L0Abstract: p.L0Abstract,
+			L1Overview: p.L1Overview,
+			Relevance:  p.Relevance,
+		}
+		if p.PinnedAt != nil {
+			pj.PinnedAt = *p.PinnedAt
+		}
+		out = append(out, pj)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"count": len(out),
+		"pins":  out,
+	})
+}
+
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {

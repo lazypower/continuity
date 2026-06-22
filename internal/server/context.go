@@ -29,10 +29,11 @@ func (s *Server) handleGetContext(w http.ResponseWriter, r *http.Request) {
 // correctly, content should already fit. When these fire, it means upstream
 // limits drifted and we log a warning so the problem is visible.
 const (
-	maxContextTotal       = 4000 // total character budget for entire context block
-	maxRelationalContext  = 1000 // budget for relational profile section
-	maxItemContext        = 200  // budget per L0 memory item
-	maxContextItems       = 15   // max items considered (budget usually cuts off earlier)
+	maxContextTotal      = 4000 // total character budget for entire context block
+	maxRelationalContext = 1000 // budget for relational profile section
+	maxItemContext       = 200  // budget per L0 memory item
+	maxContextItems      = 15   // max items considered (budget usually cuts off earlier)
+	maxPinnedItems       = 7    // max operator pins injected (declared contract)
 )
 
 // buildContext creates the context markdown for session injection.
@@ -80,6 +81,51 @@ func (s *Server) buildContext(currentSessionID string) string {
 		budget -= len(section)
 	}
 
+	// Operator pins (declared contract) — the highest-priority resident content
+	// after the relational profile. These are memories the operator explicitly
+	// pinned to the tray; they ride every cold boot regardless of recency or
+	// relevance. ListPinned excludes retracted nodes at the store layer, so a
+	// pinned-then-retracted memory goes silent here without any check in this
+	// function — the single retraction chokepoint. pinnedURIs records what was
+	// shown so the ranked sections below don't render the same node twice.
+	pinnedURIs := make(map[string]bool)
+	if pinned, err := s.db.ListPinned(); err == nil && len(pinned) > 0 {
+		const pinnedHeader = "\n### Pinned\n"
+		section := pinnedHeader
+		used := 0
+		for _, p := range pinned {
+			if used >= maxPinnedItems {
+				log.Printf("context: pinned section capped at %d (operator has %d pins)", maxPinnedItems, len(pinned))
+				break
+			}
+			// The relational profile has its own "Working With You" section above;
+			// mark it shown but don't render it twice if the operator pinned it.
+			if p.URI == "mem://user/profile/communication" {
+				pinnedURIs[p.URI] = true
+				continue
+			}
+			if p.L0Abstract == "" {
+				continue
+			}
+			l0 := p.L0Abstract
+			if len(l0) > maxItemContext {
+				l0 = truncateAtSentence(l0, maxItemContext)
+			}
+			line := fmt.Sprintf("- [%s] %s\n", p.Category, l0)
+			if budget-len(section)-len(line) < 0 {
+				log.Printf("context: budget exhausted in pinned section after %d items", used)
+				break
+			}
+			section += line
+			pinnedURIs[p.URI] = true
+			used++
+		}
+		if section != pinnedHeader {
+			b.WriteString(section)
+			budget -= len(section)
+		}
+	}
+
 	// Reserve space for session footer (~300 chars for 5 sessions + current)
 	const footerReserve = 400
 	itemBudget := budget - footerReserve
@@ -91,6 +137,16 @@ func (s *Server) buildContext(currentSessionID string) string {
 	// Uses diversity sampling: rotation via last_access, greedy max-diversity selection
 	moments, err := s.db.FindByCategory("moments")
 	if err == nil && len(moments) > 0 {
+		// Drop any moment already shown as a pin so it isn't rendered twice.
+		if len(pinnedURIs) > 0 {
+			live := moments[:0]
+			for _, m := range moments {
+				if !pinnedURIs[m.URI] {
+					live = append(live, m)
+				}
+			}
+			moments = live
+		}
 		selected := s.selectDiverseMoments(moments, 3)
 		if len(selected) > 0 {
 			section := "\n### Moments\n"
@@ -133,6 +189,9 @@ func (s *Server) buildContext(currentSessionID string) string {
 		for _, n := range nodes {
 			if n.URI == "mem://user/profile/communication" {
 				continue // already shown above
+			}
+			if pinnedURIs[n.URI] {
+				continue // already shown in the Pinned section
 			}
 			if n.L0Abstract == "" || n.Relevance < 0.3 {
 				continue
