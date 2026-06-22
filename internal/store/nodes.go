@@ -86,11 +86,19 @@ type MemNode struct {
 	TombstonedAt    *int64
 	TombstoneReason string
 	SupersededBy    string
+
+	// Operator pin (declared contract). nil when the node is not pinned.
+	PinnedAt *int64
 }
 
 // IsRetracted reports whether this node has been retracted.
 func (n *MemNode) IsRetracted() bool {
 	return n.TombstonedAt != nil
+}
+
+// IsPinned reports whether this node is an operator-declared pin.
+func (n *MemNode) IsPinned() bool {
+	return n.PinnedAt != nil
 }
 
 // mergeableCategories defines which categories support in-place merging.
@@ -157,18 +165,18 @@ func (db *DB) CreateNode(node *MemNode) error {
 func (db *DB) GetNodeByURI(uri string) (*MemNode, error) {
 	var n MemNode
 	var mergeable int
-	var lastAccess, tombstonedAt sql.NullInt64
+	var lastAccess, tombstonedAt, pinnedAt sql.NullInt64
 	var parentURI, l0, l1, l2, mergedFrom, sourceSession, tombstoneReason, supersededBy sql.NullString
 	err := db.QueryRow(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE uri = ?
 	`, uri).Scan(&n.ID, &n.URI, &parentURI, &n.NodeType, &n.Category,
 		&l0, &l1, &l2,
 		&mergeable, &mergedFrom, &n.Relevance, &lastAccess, &n.AccessCount,
 		&sourceSession, &n.CreatedAt, &n.UpdatedAt,
-		&tombstonedAt, &tombstoneReason, &supersededBy)
+		&tombstonedAt, &tombstoneReason, &supersededBy, &pinnedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -190,6 +198,9 @@ func (db *DB) GetNodeByURI(uri string) (*MemNode, error) {
 	}
 	n.TombstoneReason = tombstoneReason.String
 	n.SupersededBy = supersededBy.String
+	if pinnedAt.Valid {
+		n.PinnedAt = &pinnedAt.Int64
+	}
 	return &n, nil
 }
 
@@ -287,7 +298,7 @@ func (db *DB) FindByCategory(category string) ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE category = ? AND node_type = 'leaf' AND tombstoned_at IS NULL
 		ORDER BY relevance DESC
 	`, category)
@@ -305,7 +316,7 @@ func (db *DB) ListLeaves() ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE node_type = 'leaf' AND tombstoned_at IS NULL
 		ORDER BY relevance DESC
 	`)
@@ -546,18 +557,18 @@ func parentURIOf(uri string) string {
 func (db *DB) GetNodeByID(id int64) (*MemNode, error) {
 	var n MemNode
 	var mergeable int
-	var lastAccess, tombstonedAt sql.NullInt64
+	var lastAccess, tombstonedAt, pinnedAt sql.NullInt64
 	var parentURI, l0, l1, l2, mergedFrom, sourceSession, tombstoneReason, supersededBy sql.NullString
 	err := db.QueryRow(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE id = ?
 	`, id).Scan(&n.ID, &n.URI, &parentURI, &n.NodeType, &n.Category,
 		&l0, &l1, &l2,
 		&mergeable, &mergedFrom, &n.Relevance, &lastAccess, &n.AccessCount,
 		&sourceSession, &n.CreatedAt, &n.UpdatedAt,
-		&tombstonedAt, &tombstoneReason, &supersededBy)
+		&tombstonedAt, &tombstoneReason, &supersededBy, &pinnedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -579,6 +590,9 @@ func (db *DB) GetNodeByID(id int64) (*MemNode, error) {
 	}
 	n.TombstoneReason = tombstoneReason.String
 	n.SupersededBy = supersededBy.String
+	if pinnedAt.Valid {
+		n.PinnedAt = &pinnedAt.Int64
+	}
 	return &n, nil
 }
 
@@ -588,7 +602,7 @@ func (db *DB) GetChildren(parentURI string) ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE parent_uri = ? AND tombstoned_at IS NULL
 		ORDER BY uri
 	`, parentURI)
@@ -604,7 +618,7 @@ func (db *DB) ListRoots() ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE parent_uri IS NULL
 		ORDER BY uri
 	`)
@@ -641,7 +655,7 @@ func (db *DB) GetNodesByIDs(ids []int64) ([]MemNode, error) {
 	query := fmt.Sprintf(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE id IN (%s)
 	`, ph)
 
@@ -706,13 +720,13 @@ func scanNodes(rows *sql.Rows) ([]MemNode, error) {
 	for rows.Next() {
 		var n MemNode
 		var mergeable int
-		var lastAccess, tombstonedAt sql.NullInt64
+		var lastAccess, tombstonedAt, pinnedAt sql.NullInt64
 		var parentURI, l0, l1, l2, mergedFrom, sourceSession, tombstoneReason, supersededBy sql.NullString
 		if err := rows.Scan(&n.ID, &n.URI, &parentURI, &n.NodeType, &n.Category,
 			&l0, &l1, &l2,
 			&mergeable, &mergedFrom, &n.Relevance, &lastAccess, &n.AccessCount,
 			&sourceSession, &n.CreatedAt, &n.UpdatedAt,
-			&tombstonedAt, &tombstoneReason, &supersededBy); err != nil {
+			&tombstonedAt, &tombstoneReason, &supersededBy, &pinnedAt); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		n.ParentURI = parentURI.String
@@ -730,6 +744,9 @@ func scanNodes(rows *sql.Rows) ([]MemNode, error) {
 		}
 		n.TombstoneReason = tombstoneReason.String
 		n.SupersededBy = supersededBy.String
+		if pinnedAt.Valid {
+			n.PinnedAt = &pinnedAt.Int64
+		}
 		nodes = append(nodes, n)
 	}
 	return nodes, rows.Err()

@@ -3,10 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -405,6 +408,130 @@ func (s *Server) handleRetract(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handlePin marks a memory as an operator pin (declared contract). Idempotent.
+//
+// Pins are store-native: they only stamp pinned_at and require neither an LLM nor
+// an embedder. The handler therefore depends on s.db (always present) rather than
+// s.engine (nil when no LLM is configured — a supported config). Routing pins
+// through the engine would have made them 503 for exactly the Ollama-free
+// operators the feature serves.
+func (s *Server) handlePin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URI string `json:"uri"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.URI == "" {
+		jsonError(w, "uri is required", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(req.URI, "mem://") {
+		jsonError(w, fmt.Sprintf("invalid URI %q: must start with mem://", req.URI), http.StatusBadRequest)
+		return
+	}
+
+	newly, err := s.db.PinNode(req.URI)
+	if err != nil {
+		var pve *store.PinValidationError
+		if errors.As(err, &pve) {
+			jsonError(w, pve.Message, http.StatusBadRequest)
+			return
+		}
+		log.Printf("pin: %v", err)
+		jsonError(w, "failed to pin memory", http.StatusBadRequest)
+		return
+	}
+
+	status := "pinned"
+	if !newly {
+		status = "already_pinned"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": status, "uri": req.URI})
+}
+
+// handleUnpin clears an operator pin. Idempotent. Store-native (see handlePin).
+func (s *Server) handleUnpin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URI string `json:"uri"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.URI == "" {
+		jsonError(w, "uri is required", http.StatusBadRequest)
+		return
+	}
+	if !strings.HasPrefix(req.URI, "mem://") {
+		jsonError(w, fmt.Sprintf("invalid URI %q: must start with mem://", req.URI), http.StatusBadRequest)
+		return
+	}
+
+	newly, err := s.db.UnpinNode(req.URI)
+	if err != nil {
+		var pve *store.PinValidationError
+		if errors.As(err, &pve) {
+			jsonError(w, pve.Message, http.StatusBadRequest)
+			return
+		}
+		log.Printf("unpin: %v", err)
+		jsonError(w, "failed to unpin memory", http.StatusBadRequest)
+		return
+	}
+
+	status := "unpinned"
+	if !newly {
+		status = "not_pinned"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"status": status, "uri": req.URI})
+}
+
+// handleListPinned returns the live (non-retracted) operator pins, oldest first.
+// This is the data behind the UI's cold-boot injection view — what the agent
+// wakes up with in the Pinned section.
+func (s *Server) handleListPinned(w http.ResponseWriter, r *http.Request) {
+	pinned, err := s.db.ListPinned()
+	if err != nil {
+		log.Printf("list pinned: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	type pinJSON struct {
+		URI        string  `json:"uri"`
+		Category   string  `json:"category"`
+		L0Abstract string  `json:"l0_abstract"`
+		L1Overview string  `json:"l1_overview,omitempty"`
+		Relevance  float64 `json:"relevance"`
+		PinnedAt   int64   `json:"pinned_at"`
+	}
+
+	out := make([]pinJSON, 0, len(pinned))
+	for _, p := range pinned {
+		pj := pinJSON{
+			URI:        p.URI,
+			Category:   p.Category,
+			L0Abstract: p.L0Abstract,
+			L1Overview: p.L1Overview,
+			Relevance:  p.Relevance,
+		}
+		if p.PinnedAt != nil {
+			pj.PinnedAt = *p.PinnedAt
+		}
+		out = append(out, pj)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"count": len(out),
+		"pins":  out,
+	})
+}
+
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
 	if query == "" {
@@ -619,6 +746,7 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		L1Overview string `json:"l1_overview,omitempty"`
 		Children   int    `json:"children,omitempty"`
 		Retracted  bool   `json:"retracted,omitempty"`
+		Pinned     bool   `json:"pinned,omitempty"`
 	}
 
 	var nodes []treeNodeJSON
@@ -665,6 +793,7 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 				NodeType:  c.NodeType,
 				Category:  c.Category,
 				Retracted: c.IsRetracted(),
+				Pinned:    c.IsPinned(),
 			}
 			// Suppress content fields on retracted nodes — same absence-not-empty
 			// principle as handleGetMemory.

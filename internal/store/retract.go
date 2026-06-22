@@ -127,7 +127,7 @@ func (db *DB) FindByCategoryIncludingRetracted(category string) ([]MemNode, erro
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE category = ? AND node_type = 'leaf'
 		ORDER BY relevance DESC
 	`, category)
@@ -144,7 +144,7 @@ func (db *DB) ListLeavesIncludingRetracted() ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE node_type = 'leaf'
 		ORDER BY relevance DESC
 	`)
@@ -161,7 +161,7 @@ func (db *DB) GetChildrenIncludingRetracted(parentURI string) ([]MemNode, error)
 	rows, err := db.Query(`
 		SELECT id, uri, parent_uri, node_type, category, l0_abstract, l1_overview, l2_content,
 			mergeable, merged_from, relevance, last_access, access_count, source_session, created_at, updated_at,
-			tombstoned_at, tombstone_reason, superseded_by
+			tombstoned_at, tombstone_reason, superseded_by, pinned_at
 		FROM mem_nodes WHERE parent_uri = ?
 		ORDER BY uri
 	`, parentURI)

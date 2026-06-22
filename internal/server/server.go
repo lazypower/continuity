@@ -77,6 +77,9 @@ func (s *Server) routes() {
 		r.Post("/memories", s.handleRemember)
 		r.Get("/memories", s.handleGetMemory)
 		r.Post("/memories/retract", s.handleRetract)
+		r.Post("/memories/pin", s.handlePin)
+		r.Post("/memories/unpin", s.handleUnpin)
+		r.Get("/memories/pinned", s.handleListPinned)
 	})
 
 	// Serve embedded UI at all non-API paths

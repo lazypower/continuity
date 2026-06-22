@@ -13,6 +13,30 @@ export interface TreeNode {
   l1_overview?: string;
   children?: number;
   retracted?: boolean;
+  pinned?: boolean;
+}
+
+// A live operator pin (GET /api/memories/pinned). Pins are the declared half of
+// the operating contract — memories that ride every cold SessionStart. The list
+// excludes retracted nodes server-side, so anything here is genuinely injected.
+export interface PinnedMemory {
+  uri: string;
+  category: string;
+  l0_abstract: string;
+  l1_overview?: string;
+  relevance: number;
+  pinned_at: number;
+}
+
+export interface PinnedResponse {
+  count: number;
+  pins: PinnedMemory[] | null;
+}
+
+// The verbatim cold-boot injection (GET /api/context with no session). This is
+// exactly what an agent wakes up with — the honesty instrument for the tray.
+export interface ContextResponse {
+  context: string;
 }
 
 export interface TreeResponse {

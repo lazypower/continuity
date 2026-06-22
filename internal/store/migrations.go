@@ -273,6 +273,15 @@ CREATE TABLE mem_meta (
 );
 `,
 	},
+	{
+		Version:     12,
+		Description: "mem_nodes: add pinned_at for operator pins (declared contract)",
+		// Additive column; no user data touched. pinned_at is the single source of
+		// truth for whether a memory is an operator-declared pin — when non-NULL the
+		// node is injected in the cold-boot "Pinned" section (subject to the same
+		// retraction exclusion as every other read path). See store/pins.go.
+		SQL: `ALTER TABLE mem_nodes ADD COLUMN pinned_at INTEGER;`,
+	},
 }
 
 // headVersion is the highest schema version this binary knows how to apply.

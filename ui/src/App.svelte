@@ -5,6 +5,7 @@
   import TreeBrowser from './components/TreeBrowser.svelte';
   import SearchPanel from './components/SearchPanel.svelte';
   import ProfilePanel from './components/ProfilePanel.svelte';
+  import ColdBootPanel from './components/ColdBootPanel.svelte';
 </script>
 
 <div class="min-h-screen">
@@ -18,6 +19,8 @@
       <SearchPanel />
     {:else if $activeTab === 'profile'}
       <ProfilePanel />
+    {:else if $activeTab === 'coldboot'}
+      <ColdBootPanel />
     {/if}
   </main>
 </div>

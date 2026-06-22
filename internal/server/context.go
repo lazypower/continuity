@@ -16,7 +16,12 @@ import (
 )
 
 func (s *Server) handleGetContext(w http.ResponseWriter, r *http.Request) {
-	ctx := s.buildContext(r.URL.Query().Get("session_id"))
+	// preview=true renders the cold-boot window WITHOUT mutating rotation state
+	// (the Cold Boot UI uses this). A real SessionStart injection omits the flag
+	// so moment rotation advances. A preview that consumed rotation would change
+	// the very thing it claims to show — the panel is an honesty instrument.
+	preview := r.URL.Query().Get("preview") == "true"
+	ctx := s.renderContext(r.URL.Query().Get("session_id"), preview)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -29,15 +34,29 @@ func (s *Server) handleGetContext(w http.ResponseWriter, r *http.Request) {
 // correctly, content should already fit. When these fire, it means upstream
 // limits drifted and we log a warning so the problem is visible.
 const (
-	maxContextTotal       = 4000 // total character budget for entire context block
-	maxRelationalContext  = 1000 // budget for relational profile section
-	maxItemContext        = 200  // budget per L0 memory item
-	maxContextItems       = 15   // max items considered (budget usually cuts off earlier)
+	maxContextTotal      = 4000 // total character budget for entire context block
+	maxRelationalContext = 1000 // budget for relational profile section
+	maxItemContext       = 200  // budget per L0 memory item
+	maxContextItems      = 15   // max items considered (budget usually cuts off earlier)
+	// maxPinnedItems is the cold-boot cap on the ### Pinned section. It tracks
+	// store.MaxPins, which is enforced at pin *write* time — so this cap is
+	// defense-in-depth that never actually fires (listed pins == injected pins).
+	maxPinnedItems = store.MaxPins
 )
 
-// buildContext creates the context markdown for session injection.
-// Enforces a hard character budget to prevent context bloat.
+// buildContext creates the context markdown for a real session injection.
+// It advances moment rotation (TouchNode) as a side effect — this is the
+// SessionStart path. For a side-effect-free render (the Cold Boot preview),
+// use renderContext(sessionID, true).
 func (s *Server) buildContext(currentSessionID string) string {
+	return s.renderContext(currentSessionID, false)
+}
+
+// renderContext builds the context markdown. When preview is true, it makes no
+// writes — moment rotation is NOT advanced — so callers can show exactly what a
+// cold SessionStart would inject without consuming the rotation that injection
+// would. Enforces a hard character budget to prevent context bloat.
+func (s *Server) renderContext(currentSessionID string, preview bool) string {
 	var b strings.Builder
 	budget := maxContextTotal
 
@@ -80,6 +99,51 @@ func (s *Server) buildContext(currentSessionID string) string {
 		budget -= len(section)
 	}
 
+	// Operator pins (declared contract) — the highest-priority resident content
+	// after the relational profile. These are memories the operator explicitly
+	// pinned to the tray; they ride every cold boot regardless of recency or
+	// relevance. ListPinned excludes retracted nodes at the store layer, so a
+	// pinned-then-retracted memory goes silent here without any check in this
+	// function — the single retraction chokepoint. pinnedURIs records what was
+	// shown so the ranked sections below don't render the same node twice.
+	pinnedURIs := make(map[string]bool)
+	if pinned, err := s.db.ListPinned(); err == nil && len(pinned) > 0 {
+		const pinnedHeader = "\n### Pinned\n"
+		section := pinnedHeader
+		used := 0
+		for _, p := range pinned {
+			if used >= maxPinnedItems {
+				log.Printf("context: pinned section capped at %d (operator has %d pins)", maxPinnedItems, len(pinned))
+				break
+			}
+			// The relational profile has its own "Working With You" section above;
+			// mark it shown but don't render it twice if the operator pinned it.
+			if p.URI == "mem://user/profile/communication" {
+				pinnedURIs[p.URI] = true
+				continue
+			}
+			if p.L0Abstract == "" {
+				continue
+			}
+			l0 := p.L0Abstract
+			if len(l0) > maxItemContext {
+				l0 = truncateAtSentence(l0, maxItemContext)
+			}
+			line := fmt.Sprintf("- [%s] %s\n", p.Category, l0)
+			if budget-len(section)-len(line) < 0 {
+				log.Printf("context: budget exhausted in pinned section after %d items", used)
+				break
+			}
+			section += line
+			pinnedURIs[p.URI] = true
+			used++
+		}
+		if section != pinnedHeader {
+			b.WriteString(section)
+			budget -= len(section)
+		}
+	}
+
 	// Reserve space for session footer (~300 chars for 5 sessions + current)
 	const footerReserve = 400
 	itemBudget := budget - footerReserve
@@ -91,6 +155,16 @@ func (s *Server) buildContext(currentSessionID string) string {
 	// Uses diversity sampling: rotation via last_access, greedy max-diversity selection
 	moments, err := s.db.FindByCategory("moments")
 	if err == nil && len(moments) > 0 {
+		// Drop any moment already shown as a pin so it isn't rendered twice.
+		if len(pinnedURIs) > 0 {
+			live := moments[:0]
+			for _, m := range moments {
+				if !pinnedURIs[m.URI] {
+					live = append(live, m)
+				}
+			}
+			moments = live
+		}
 		selected := s.selectDiverseMoments(moments, 3)
 		if len(selected) > 0 {
 			section := "\n### Moments\n"
@@ -100,8 +174,11 @@ func (s *Server) buildContext(currentSessionID string) string {
 					l0 = truncateAtSentence(l0, maxItemContext)
 				}
 				section += fmt.Sprintf("- %s\n", l0)
-				// Touch for rotation tracking — next session deprioritizes these
-				s.db.TouchNode(m.URI)
+				// Touch for rotation tracking — next session deprioritizes these.
+				// Skipped in preview: a preview must not consume the rotation it shows.
+				if !preview {
+					s.db.TouchNode(m.URI)
+				}
 			}
 			b.WriteString(section)
 			budget -= len(section)
@@ -133,6 +210,9 @@ func (s *Server) buildContext(currentSessionID string) string {
 		for _, n := range nodes {
 			if n.URI == "mem://user/profile/communication" {
 				continue // already shown above
+			}
+			if pinnedURIs[n.URI] {
+				continue // already shown in the Pinned section
 			}
 			if n.L0Abstract == "" || n.Relevance < 0.3 {
 				continue
