@@ -47,6 +47,7 @@ func generatePlist() (string, error) {
 		return "", fmt.Errorf("home dir: %w", err)
 	}
 	logPath := filepath.Join(home, ".continuity", "serve.log")
+	workDir := filepath.Join(home, ".continuity")
 
 	// Bake a usable PATH into the plist so the service can find the LLM provider
 	// binaries (`claude`, `ollama`); launchd does not inherit the login PATH.
@@ -66,6 +67,8 @@ func generatePlist() (string, error) {
         <key>PATH</key>
         <string>%s</string>
     </dict>
+    <key>WorkingDirectory</key>
+    <string>%s</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -76,7 +79,7 @@ func generatePlist() (string, error) {
     <string>%s</string>
 </dict>
 </plist>
-`, xmlEscape(launchAgentLabel), xmlEscape(self), xmlEscape(servicePATH()), xmlEscape(logPath), xmlEscape(logPath)), nil
+`, xmlEscape(launchAgentLabel), xmlEscape(self), xmlEscape(servicePATH()), xmlEscape(workDir), xmlEscape(logPath), xmlEscape(logPath)), nil
 }
 
 func platformServiceStatus() (installed bool, status string) {
