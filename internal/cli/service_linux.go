@@ -33,6 +33,7 @@ func generateUnit() (string, error) {
 		return "", fmt.Errorf("home dir: %w", err)
 	}
 	logPath := filepath.Join(home, ".continuity", "serve.log")
+	workDir := filepath.Join(home, ".continuity")
 
 	// Bake a usable PATH into the unit so the service can find the LLM provider
 	// binaries (`claude`, `ollama`); systemd does not inherit the login PATH.
@@ -49,6 +50,7 @@ After=network.target
 [Service]
 Type=simple
 Environment="PATH=%s"
+WorkingDirectory=%s
 ExecStart=%s serve
 Restart=on-failure
 RestartSec=5
@@ -57,7 +59,7 @@ StandardError=append:%s
 
 [Install]
 WantedBy=default.target
-`, escapeSystemdEnvValue(servicePATH()), self, logPath, logPath), nil
+`, escapeSystemdEnvValue(servicePATH()), workDir, self, logPath, logPath), nil
 }
 
 // escapeSystemdEnvValue escapes a value for inclusion inside a double-quoted

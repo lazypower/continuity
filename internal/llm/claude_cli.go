@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -32,6 +33,12 @@ func (c *ClaudeCLI) Complete(ctx context.Context, prompt string) (*Response, err
 	cmd := exec.CommandContext(ctx, "claude", "-p", "--model", c.model, "--max-turns", "1")
 	cmd.Stdin = strings.NewReader(prompt)
 
+	// Pin the subprocess to a dedicated empty directory. Without this, claude -p
+	// inherits the server's cwd (which is "/" under launchd) and treats it as a
+	// project root — roaming the filesystem and tripping macOS TCC prompts for
+	// Photos, Music, etc. An empty sandbox dir gives it nothing to scan.
+	cmd.Dir = sandboxDir()
+
 	// Strip CLAUDE_* env vars to prevent recursive hook triggering
 	cmd.Env = filterEnv(os.Environ())
 
@@ -47,6 +54,21 @@ func (c *ClaudeCLI) Complete(ctx context.Context, prompt string) (*Response, err
 		Content:  strings.TrimSpace(stdout.String()),
 		Provider: "claude-cli",
 	}, nil
+}
+
+// sandboxDir returns a dedicated empty directory under the continuity home for
+// claude -p to run in, so it has no surrounding project to scan. Falls back to
+// the system temp dir if the home directory can't be resolved or created.
+func sandboxDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return os.TempDir()
+	}
+	dir := filepath.Join(home, ".continuity", "sandbox")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return os.TempDir()
+	}
+	return dir
 }
 
 // filterEnv removes CLAUDE_* environment variables to prevent recursive hooks.
