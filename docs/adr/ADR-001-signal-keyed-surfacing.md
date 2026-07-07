@@ -265,6 +265,18 @@ research window — exact retention is an open item (⚑). "Unbounded exposure t
 an acceptable end state; telemetry that can outgrow the corpus it measures has failed
 the proportionality test.
 
+Accounting boundaries fixed at implementation (Codex round 1): **`deepened` is
+journaled only when the `RecordUse` mutation succeeds** — journal and node state must
+agree on whether a use happened; the read itself stays fail-open. **`shown` for search
+is journaled only after the response write succeeds** — a canceled client must not
+inflate the denominator with results nobody saw. **Inspection surfaces**
+(`/api/profile`, `/api/tree`, the pinned list) still return L1 and write no events:
+they are operator observability, outside the payload contract — counting UI browsing
+as use would inject exactly the noise the deepened-vs-attributed control exists to
+measure. Reducing them to L0+URI is a separate product decision, not folded here.
+**CLI events carry an empty session id** by design; session-level used-given-shown
+joins bucket them apart (per-node rates remain valid).
+
 "Off the hot path" is a write contract, not just a schedule: search and the gate are
 synchronous surfaces, and SQLite is single-writer — a `shown` insert queued behind an
 extraction write could otherwise spend the hook's budget (`busy_timeout=5000`,
@@ -363,16 +375,17 @@ Profile; a failed `shown` write never fails or delays the surfacing that trigger
   after the research window — pick the window and the aggregate shape. (Replaces the
   former decay-interregnum item, resolved by removing relevance from the interim find
   score.)
-- **Contract ordering and cardinality under the decay exemption** (the Round-3 target,
-  if a round runs): with contract categories decay-exempt and relevance refreshed only
-  on *use* — which tray consumption is not — the contract's `ORDER BY relevance DESC`
-  goes flat, and nothing bounds contract growth over years. When the contract outgrows
-  its tray budget, truncation order is arbitrary and a load-bearing preference can
-  silently drop: the quiet cousin of the loss path the exemption just closed. Lean:
-  order contract categories by `updated_at DESC` (re-affirmation recency — moves on
-  merge, i.e. on re-learning, never on exposure, so no popularity re-entry), and surface
-  contract-size-vs-tray-budget in doctor/metrics as a curation prompt; merge and
-  graduation remain the designed pressure valve.
+- **RESOLVED (implementation round 1, Codex-verified P1): contract ordering under the
+  decay exemption.** The gap was confirmed real end-to-end (16+ contract leaves →
+  arbitrary truncation at the cap, only a server log). Decided: contract order — and
+  therefore truncation survival — is **`updated_at DESC`, global across the three
+  contract categories**, not category-major (category-major would drop the newest
+  feedback correction before a stale profile entry; all three render untagged in one
+  section anyway). Codex verified the ordering is loop-safe: `updated_at` moves on
+  merge (re-learning), never on exposure or fetch. Overflow logs "least recently
+  re-affirmed dropped"; contract-size-vs-budget in doctor stays open as a curation
+  aid. Survival is pinned by an acceptance test (newest re-affirmed feedback survives
+  a 17-node contract).
 - **Index shape:** tree-with-counts vs counts + top project-affine L0s; exact budget;
   whether it appears for a project with zero affine nodes.
 - **`re-taught` detection:** extraction dedup already compares against existing nodes —

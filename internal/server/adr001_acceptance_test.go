@@ -273,3 +273,52 @@ func TestAcceptance_ShownCountMatchesReturnedResults(t *testing.T) {
 		t.Errorf("shown events = %d, returned results = %d — exposure accounting must match the caller-visible surface exactly", shown, resp.Count)
 	}
 }
+
+// Criterion (Codex round 1, P1): when the contract exceeds the item cap,
+// survival is re-affirmation recency — the newest re-affirmed contract node
+// must survive truncation; the least recently re-affirmed drop. Category must
+// not trump freshness: the newest node is FEEDBACK (last category in
+// iteration order), which category-major ordering would have dropped first.
+func TestAcceptance_ContractTruncationDropsLeastReaffirmed(t *testing.T) {
+	srv := acceptanceServer(t)
+
+	// 17 contract nodes (cap is 15): 16 preferences with staggered
+	// updated_at, plus 1 feedback node that is the newest of all.
+	for i := 0; i < 16; i++ {
+		uri := fmt.Sprintf("mem://user/preferences/pref-%02d", i)
+		if err := srv.db.CreateNode(&store.MemNode{
+			URI: uri, NodeType: "leaf", Category: "preferences",
+			L0Abstract: fmt.Sprintf("standing preference %02d", i),
+		}); err != nil {
+			t.Fatalf("seed %s: %v", uri, err)
+		}
+		// Older index = older re-affirmation.
+		if _, err := srv.db.Exec(`UPDATE mem_nodes SET updated_at = ? WHERE uri = ?`, int64(1000+i), uri); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := srv.db.CreateNode(&store.MemNode{
+		URI: "mem://user/feedback/newest-correction", NodeType: "leaf", Category: "feedback",
+		L0Abstract: "the newest correction must survive",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.db.Exec(`UPDATE mem_nodes SET updated_at = ? WHERE uri = 'mem://user/feedback/newest-correction'`, int64(9999)); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := srv.buildContext("")
+
+	if !strings.Contains(ctx, "the newest correction must survive") {
+		t.Errorf("newest re-affirmed contract node (feedback) was truncated — survival must be recency, not category:\n%s", ctx)
+	}
+	// The two least recently re-affirmed must be the ones dropped (17 - 15).
+	for _, oldest := range []string{"standing preference 00", "standing preference 01"} {
+		if strings.Contains(ctx, oldest) {
+			t.Errorf("least recently re-affirmed node %q survived while cap was exceeded", oldest)
+		}
+	}
+	if !strings.Contains(ctx, "standing preference 02") {
+		t.Errorf("node just inside the cap was dropped:\n%s", ctx)
+	}
+}

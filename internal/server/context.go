@@ -202,14 +202,20 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 	// §3 index and §4 prompt gate land. What remains on the tray is the
 	// contract — profile, preferences, and feedback collapse into "Your
 	// Profile" without category tags (feedback is directional guidance that
-	// shapes how the agent acts, issue #24). No scoring: contract nodes are
-	// decay-exempt with relevance frozen at full, so a rank would order on a
-	// dead signal. Category iteration order IS the priority; within a
-	// category, FindByCategory's ordering applies. (Flat contract ordering
-	// under the exemption is a flagged open item — ADR-001 ⚑.)
+	// shapes how the agent acts, issue #24). No relevance scoring: contract
+	// nodes are decay-exempt with relevance frozen at full, so a rank would
+	// order on a dead signal. Order — and therefore truncation survival — is
+	// re-affirmation recency: updated_at DESC, GLOBAL across the three
+	// contract categories. updated_at moves on merge (re-learning), never on
+	// exposure or fetch, so no popularity loop re-enters (verified in Codex
+	// round 1). Global rather than category-major because the cap is global:
+	// category-major order would silently drop the newest feedback correction
+	// before a stale profile entry — the exact silent-contract-loss failure
+	// this ADR exists to kill.
 	type contractItem struct {
-		uri string
-		l0  string
+		uri       string
+		l0        string
+		updatedAt int64
 	}
 	var items []contractItem
 
@@ -228,12 +234,18 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 			if n.L0Abstract == "" {
 				continue
 			}
-			items = append(items, contractItem{n.URI, n.L0Abstract})
+			items = append(items, contractItem{n.URI, n.L0Abstract, n.UpdatedAt})
 		}
 	}
 
+	// Most recently re-affirmed first; stable so equal timestamps keep the
+	// category-priority iteration order above as the tiebreaker.
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].updatedAt > items[j].updatedAt
+	})
+
 	if len(items) > maxContextItems {
-		log.Printf("context: contract exceeds item cap (%d > %d) — time to curate (merge/retract), see ADR-001 ⚑", len(items), maxContextItems)
+		log.Printf("context: contract exceeds item cap (%d > %d) — least recently re-affirmed dropped; time to curate (merge/retract)", len(items), maxContextItems)
 		items = items[:maxContextItems]
 	}
 

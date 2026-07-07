@@ -279,11 +279,17 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	// at fetch time (pre-refresh). Tombstones are excluded: retracted nodes
 	// appear on no surface, so "use" is meaningless for them and a fetch
 	// must not brighten what the operator retracted.
+	//
+	// The deepened event is gated on RecordUse succeeding: journal and node
+	// state must agree on whether a use happened (Codex round 1, P2). The
+	// READ itself stays fail-open — the user gets their memory even when the
+	// bookkeeping write hiccups; only the accounting fails closed.
 	if node.NodeType == "leaf" && !node.IsRetracted() {
 		if err := s.db.RecordUse(node.URI); err != nil {
-			log.Printf("get memory: record use for %s: %v", node.URI, err)
+			log.Printf("get memory: record use for %s: %v (deepened not journaled)", node.URI, err)
+		} else {
+			s.events.record("deepened", "", node.URI, r.URL.Query().Get("session_id"))
 		}
-		s.events.record("deepened", "", node.URI, r.URL.Query().Get("session_id"))
 	}
 
 	json.NewEncoder(w).Encode(out)
@@ -642,19 +648,29 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			Similarity: res.Similarity,
 			Relevance:  res.Node.Relevance,
 		}
-		// Exposure telemetry for results actually returned to the caller —
-		// and only those (smart-mode subquery candidates never reach here,
-		// so they can't pollute the used-given-shown denominator).
-		s.events.record("shown", "search", res.Node.URI, sessionID)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	err = json.NewEncoder(w).Encode(map[string]any{
 		"query":   query,
 		"mode":    mode,
 		"count":   len(out),
 		"results": out,
 	})
+
+	// Exposure telemetry AFTER the response write, for results actually
+	// returned to the caller — and only those (smart-mode subquery candidates
+	// never reach here). Recording before the write let a canceled client
+	// inflate the used-given-shown denominator with results nobody saw
+	// (Codex round 1, P2). Encode success is the best delivered-proxy this
+	// layer has; on write failure, nothing is journaled.
+	if err != nil {
+		log.Printf("search: response write failed, %d results not journaled as shown: %v", len(out), err)
+		return
+	}
+	for _, res := range results {
+		s.events.record("shown", "search", res.Node.URI, sessionID)
+	}
 }
 
 func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
