@@ -287,17 +287,17 @@ func parseExtractionResponse(content string) ([]memoryCandidate, error) {
 
 	content = strings.TrimSpace(content)
 
-	// Find the JSON array
+	// Decode the first JSON array starting at the first '['. A streaming decoder
+	// (rather than first-'[' / last-']' slicing) reads exactly one JSON value and
+	// ignores trailing LLM meta-commentary — including a stray ']' after the
+	// array — instead of letting it break the parse (L2).
 	start := strings.Index(content, "[")
-	end := strings.LastIndex(content, "]")
-	if start < 0 || end < 0 || end <= start {
+	if start < 0 {
 		return nil, fmt.Errorf("no JSON array found in response")
 	}
 
-	jsonStr := content[start : end+1]
-
 	var candidates []memoryCandidate
-	if err := json.Unmarshal([]byte(jsonStr), &candidates); err != nil {
+	if err := json.NewDecoder(strings.NewReader(content[start:])).Decode(&candidates); err != nil {
 		return nil, fmt.Errorf("unmarshal candidates: %w", err)
 	}
 
