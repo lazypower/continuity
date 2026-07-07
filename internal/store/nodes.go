@@ -336,29 +336,54 @@ func (db *DB) ListLeaves() ([]MemNode, error) {
 	return scanNodes(rows)
 }
 
-// TouchNode updates last_access and increments access_count (retrieval boost).
-func (db *DB) TouchNode(uri string) error {
+// AdvanceRotation updates last_access only — rotation bookkeeping for
+// diversity-sampled surfaces (moments). Exposure is not use (ADR-001 §2):
+// this must never mutate relevance or any counter. It exists so rotation
+// fairness can't smuggle a ranking signal in through the back door the way
+// the old TouchNode did.
+func (db *DB) AdvanceRotation(uri string) error {
+	now := time.Now().UnixMilli()
+	_, err := db.Exec(`UPDATE mem_nodes SET last_access = ? WHERE uri = ?`, now, uri)
+	if err != nil {
+		return fmt.Errorf("advance rotation: %w", err)
+	}
+	return nil
+}
+
+// RecordUse marks a deliberate fetch of a node by URI (L1/L2 deepening via
+// `continuity show` / GET /api/memories). The ONLY path that refreshes
+// relevance (ADR-001 §2): use resets decay; exposure never does.
+// access_count is deliberately untouched — it froze as a legacy column when
+// the mem_events journal became the authority on use counts.
+func (db *DB) RecordUse(uri string) error {
 	now := time.Now().UnixMilli()
 	_, err := db.Exec(`
-		UPDATE mem_nodes SET last_access = ?, access_count = access_count + 1, relevance = 1.0
+		UPDATE mem_nodes SET last_access = ?, relevance = 1.0
 		WHERE uri = ?
 	`, now, uri)
 	if err != nil {
-		return fmt.Errorf("touch node: %w", err)
+		return fmt.Errorf("record use: %w", err)
 	}
 	return nil
 }
 
 // DecayAllNodes applies time-based decay to all non-exempt nodes.
-// 90-day half-life, floor of 0.1. Profile nodes are exempt.
+// 90-day half-life, floor of 0.1.
+//
+// Decay is an EPISODIC mechanism (ADR-001 §1). Contract categories
+// (profile/preferences/feedback) are exempt: post touch-split, nothing
+// refreshes a contract node — boot injection is shown, not used — so decay
+// plus the cold-boot cutoff would silently erode the user's standing
+// preferences off the tray. Contract lifecycle authority is merge and
+// retraction, never the clock. Moments are exempt as permanent relational
+// anchors (their own category contract).
 func (db *DB) DecayAllNodes() (int, error) {
 	// Fetch all decayable nodes
 	rows, err := db.Query(`
 		SELECT id, uri, relevance, last_access, created_at
 		FROM mem_nodes
 		WHERE node_type = 'leaf'
-			AND uri != 'mem://user/profile/communication'
-			AND category != 'moments'
+			AND category NOT IN ('moments', 'profile', 'preferences', 'feedback')
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("query decayable nodes: %w", err)

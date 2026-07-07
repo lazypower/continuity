@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -45,9 +44,9 @@ const (
 )
 
 // buildContext creates the context markdown for a real session injection.
-// It advances moment rotation (TouchNode) as a side effect — this is the
-// SessionStart path. For a side-effect-free render (the Cold Boot preview),
-// use renderContext(sessionID, true).
+// Side effects — moment rotation bookkeeping (AdvanceRotation) and `shown`
+// telemetry — fire on this path only; this is the SessionStart path. For a
+// side-effect-free render (the Cold Boot preview), use renderContext(sessionID, true).
 func (s *Server) buildContext(currentSessionID string) string {
 	return s.renderContext(currentSessionID, false)
 }
@@ -97,6 +96,9 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 		section += content + "\n"
 		b.WriteString(section)
 		budget -= len(section)
+		if !preview {
+			s.events.record("shown", "tray", relProfile.URI, currentSessionID)
+		}
 	}
 
 	// Operator pins (declared contract) — the highest-priority resident content
@@ -137,6 +139,9 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 			section += line
 			pinnedURIs[p.URI] = true
 			used++
+			if !preview {
+				s.events.record("shown", "tray", p.URI, currentSessionID)
+			}
 		}
 		if section != pinnedHeader {
 			b.WriteString(section)
@@ -174,10 +179,13 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 					l0 = truncateAtSentence(l0, maxItemContext)
 				}
 				section += fmt.Sprintf("- %s\n", l0)
-				// Touch for rotation tracking — next session deprioritizes these.
-				// Skipped in preview: a preview must not consume the rotation it shows.
+				// Rotation bookkeeping only — last_access moves so the next
+				// session deprioritizes these; relevance and counters do NOT
+				// (exposure is not use, ADR-001 §2). Skipped in preview: a
+				// preview must not consume the rotation it shows.
 				if !preview {
-					s.db.TouchNode(m.URI)
+					s.db.AdvanceRotation(m.URI)
+					s.events.record("shown", "moments", m.URI, currentSessionID)
 				}
 			}
 			b.WriteString(section)
@@ -185,24 +193,33 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 		}
 	}
 
-	// Collect all non-relational leaves, rank by signal strength
-	type rankedItem struct {
-		category string
-		l0       string
-		score    float64
+	// Contract categories only (ADR-001 §1). The episodic ranked window
+	// ("Recent Memories" — patterns/events/cases/entities/reference scored by
+	// relevance × access popularity) is deleted, not relocated: at t=0 there
+	// is no query, so any episodic ranking is prediction from priors, and the
+	// measured window surfaced only the already-most-retrieved (12×
+	// amplification, issue #50). Episodic surfacing is pull (search) until the
+	// §3 index and §4 prompt gate land. What remains on the tray is the
+	// contract — profile, preferences, and feedback collapse into "Your
+	// Profile" without category tags (feedback is directional guidance that
+	// shapes how the agent acts, issue #24). No relevance scoring: contract
+	// nodes are decay-exempt with relevance frozen at full, so a rank would
+	// order on a dead signal. Order — and therefore truncation survival — is
+	// re-affirmation recency: updated_at DESC, GLOBAL across the three
+	// contract categories. updated_at moves on merge (re-learning), never on
+	// exposure or fetch, so no popularity loop re-enters (verified in Codex
+	// round 1). Global rather than category-major because the cap is global:
+	// category-major order would silently drop the newest feedback correction
+	// before a stale profile entry — the exact silent-contract-loss failure
+	// this ADR exists to kill.
+	type contractItem struct {
+		uri       string
+		l0        string
+		updatedAt int64
 	}
-	var items []rankedItem
+	var items []contractItem
 
-	// The real "feedback above patterns" guarantee comes from the *section
-	// split* below (feedback rides in "Your Profile", patterns rides in
-	// "Recent Memories" — different sections, rendered in fixed order). The
-	// iteration order here exists for two reasons: (1) documentation of the
-	// intended priority, and (2) as a deterministic tiebreaker for the
-	// stable sort below when scores are equal (common for freshly written
-	// nodes where Relevance=1.0 and AccessCount=0). Don't add a new category
-	// to either end of this list without thinking about which section it
-	// joins downstream.
-	for _, cat := range []string{"profile", "preferences", "feedback", "patterns", "events", "cases", "entities", "reference"} {
+	for _, cat := range []string{"profile", "preferences", "feedback"} {
 		nodes, err := s.db.FindByCategory(cat)
 		if err != nil {
 			continue
@@ -214,59 +231,44 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 			if pinnedURIs[n.URI] {
 				continue // already shown in the Pinned section
 			}
-			if n.L0Abstract == "" || n.Relevance < 0.3 {
+			if n.L0Abstract == "" {
 				continue
 			}
-			score := nodeScore(n)
-			items = append(items, rankedItem{cat, n.L0Abstract, score})
+			items = append(items, contractItem{n.URI, n.L0Abstract, n.UpdatedAt})
 		}
 	}
 
-	// Sort by score descending. SliceStable so that when scores tie (every
-	// freshly written node scores 1.0 * accessBoost == 1.0), the iteration
-	// order above survives as the tiebreaker rather than becoming arbitrary.
+	// Most recently re-affirmed first; stable so equal timestamps keep the
+	// category-priority iteration order above as the tiebreaker.
 	sort.SliceStable(items, func(i, j int) bool {
-		return items[i].score > items[j].score
+		return items[i].updatedAt > items[j].updatedAt
 	})
+
 	if len(items) > maxContextItems {
+		log.Printf("context: contract exceeds item cap (%d > %d) — least recently re-affirmed dropped; time to curate (merge/retract)", len(items), maxContextItems)
 		items = items[:maxContextItems]
 	}
 
-	// Split into profile/prefs vs other, enforcing per-item and total budget
-	var profileLines, memoryLines []string
+	var profileLines []string
+	var profileURIs []string
 	itemsUsed := 0
 
 	for _, it := range items {
 		l0 := it.l0
 		if len(l0) > maxItemContext {
-			log.Printf("context: L0 truncated at output for [%s] (%d → %d chars) — extraction may be drifting", it.category, len(l0), maxItemContext)
+			log.Printf("context: L0 truncated at output (%d → %d chars) — extraction may be drifting", len(l0), maxItemContext)
 			l0 = truncateAtSentence(l0, maxItemContext)
 		}
 
-		var line string
-		// Profile, preferences, and feedback collapse into the "Your Profile" block
-		// without a category tag. Feedback rides with profile/preferences because
-		// it's directional guidance that shapes how the agent should act (issue #24)
-		// — not a labelled "memory" you'd browse but identity-shaping context.
-		isProfileSection := it.category == "profile" || it.category == "preferences" || it.category == "feedback"
-		if isProfileSection {
-			line = fmt.Sprintf("- %s\n", l0)
-		} else {
-			line = fmt.Sprintf("- [%s] %s\n", it.category, l0)
-		}
-
+		line := fmt.Sprintf("- %s\n", l0)
 		if itemBudget-len(line) < 0 {
 			log.Printf("context: budget exhausted after %d items (dropped %d)", itemsUsed, len(items)-itemsUsed)
 			break
 		}
 		itemBudget -= len(line)
 		itemsUsed++
-
-		if isProfileSection {
-			profileLines = append(profileLines, line)
-		} else {
-			memoryLines = append(memoryLines, line)
-		}
+		profileLines = append(profileLines, line)
+		profileURIs = append(profileURIs, it.uri)
 	}
 
 	if len(profileLines) > 0 {
@@ -274,12 +276,10 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 		for _, line := range profileLines {
 			b.WriteString(line)
 		}
-	}
-
-	if len(memoryLines) > 0 {
-		b.WriteString("\n### Recent Memories\n")
-		for _, line := range memoryLines {
-			b.WriteString(line)
+		if !preview {
+			for _, uri := range profileURIs {
+				s.events.record("shown", "tray", uri, currentSessionID)
+			}
 		}
 	}
 
@@ -457,14 +457,3 @@ func (s *Server) selectDiverseMoments(moments []store.MemNode, n int) []store.Me
 	return result
 }
 
-// nodeScore ranks a memory node for context injection priority.
-// Higher = more important to include. Combines relevance (decay-adjusted)
-// with access frequency (memories the agent actually uses stay prominent).
-func nodeScore(n store.MemNode) float64 {
-	accessBoost := 1.0
-	if n.AccessCount > 0 {
-		// Diminishing returns: log2(access+1) gives 1→1.0, 2→1.58, 4→2.32, 8→3.17
-		accessBoost = 1.0 + math.Log2(float64(n.AccessCount))
-	}
-	return n.Relevance * accessBoost
-}

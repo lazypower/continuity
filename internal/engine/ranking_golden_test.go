@@ -54,13 +54,16 @@ func TestFindRankingMechanism_CategoryBoost(t *testing.T) {
 	}
 }
 
-// TestFindRankingMechanism_RelevanceMultiplier pins the relevance term of the
-// score formula (Codex flagged that the nomic golden reduces to pure cosine, so
-// a broken relevance factor would slip through). Two nodes with identical text
-// and category have identical similarity and boost; only relevance differs, so
-// the score gap is purely the relevance multiplier — and would vanish if that
-// term were dropped from Find.
-func TestFindRankingMechanism_RelevanceMultiplier(t *testing.T) {
+// TestFindRankingMechanism_RelevanceIndependence pins the INVERSE of the
+// invariant this test used to pin. Under ADR-001's interim score
+// (similarity × categoryBoost), relevance must NOT move a find-mode score:
+// similarity × relevance buries a scarred memory at similarity 0.9 under
+// fresh noise at 0.15 once decay runs honestly (cross-cohort inversion).
+// Two nodes with identical text and category, wildly different relevance —
+// identical scores, or the relevance term has crept back into Find.
+// (History: the original test pinned the relevance term IN; Codex flagged
+// the pure-cosine golden blind spot. Same blind spot, opposite contract.)
+func TestFindRankingMechanism_RelevanceIndependence(t *testing.T) {
 	db := memTestDB(t)
 	mk := func(uri string) {
 		n := &store.MemNode{URI: uri, NodeType: "leaf", Category: "patterns", L0Abstract: "identical abstract for both nodes"}
@@ -92,11 +95,22 @@ func TestFindRankingMechanism_RelevanceMultiplier(t *testing.T) {
 	if len(res) != 2 {
 		t.Fatalf("want 2 results, got %d", len(res))
 	}
-	if res[0].Node.URI != "mem://agent/patterns/fresh" {
-		t.Fatalf("higher relevance must rank first; got %s then %s", res[0].Node.URI, res[1].Node.URI)
+	// Identical similarity and category ⇒ identical scores. Any gap is the
+	// relevance term creeping back into the interim formula.
+	if ratio := res[1].Score / res[0].Score; ratio < 0.9999 || ratio > 1.0001 {
+		t.Fatalf("score ratio = %.4f, want 1.0 — relevance must not move a find score (ADR-001 interim)", ratio)
 	}
-	// Gap is purely the 1.0-vs-0.3 relevance ratio; ~1.0 would mean the term was dropped.
-	if ratio := res[1].Score / res[0].Score; ratio < 0.25 || ratio > 0.35 {
-		t.Fatalf("relevance ratio = %.4f, want ~0.30 (relevance term active)", ratio)
+	// Relevance still rides the result as metadata for inspection (--explain).
+	var faded *SearchResult
+	for i := range res {
+		if res[i].Node.URI == "mem://agent/patterns/faded" {
+			faded = &res[i]
+		}
+	}
+	if faded == nil {
+		t.Fatal("faded node missing from results")
+	}
+	if faded.Node.Relevance != 0.3 {
+		t.Errorf("faded relevance metadata = %f, want 0.3 (decay state must survive as metadata)", faded.Node.Relevance)
 	}
 }

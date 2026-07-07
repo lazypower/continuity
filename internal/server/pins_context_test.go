@@ -29,32 +29,52 @@ func TestRenderContext_PreviewDoesNotTouchMoments(t *testing.T) {
 		}
 	}
 
-	// Preview: zero rotation writes. access_count is the touch signal — TouchNode
-	// is the only writer on the moments path and it increments access_count.
-	// (last_access is stamped at CreateNode time, so its non-nil-ness is not a
-	// touch indicator.)
+	// Rotation now moves last_access ONLY (ADR-001 §2 — exposure is not use;
+	// AdvanceRotation replaced TouchNode on this path). last_access is stamped
+	// at CreateNode time, so backdate to a known value and assert movement.
+	const t0 = int64(1000)
+	for i := 0; i < 4; i++ {
+		uri := fmt.Sprintf("mem://agent/moments/m-%d", i)
+		if _, err := srv.db.Exec(`UPDATE mem_nodes SET last_access = ? WHERE uri = ?`, t0, uri); err != nil {
+			t.Fatalf("backdate moment %d: %v", i, err)
+		}
+	}
+
+	// Preview: zero rotation writes.
 	_ = srv.renderContext("", true)
 	for i := 0; i < 4; i++ {
 		n, _ := srv.db.GetNodeByURI(fmt.Sprintf("mem://agent/moments/m-%d", i))
 		if n == nil {
 			t.Fatalf("moment %d missing", i)
 		}
+		if n.LastAccess == nil || *n.LastAccess != t0 {
+			t.Errorf("preview advanced rotation for moment %d — preview must not consume rotation", i)
+		}
 		if n.AccessCount != 0 {
 			t.Errorf("preview touched moment %d (access=%d) — preview must not consume rotation", i, n.AccessCount)
 		}
 	}
 
-	// Real injection: rotation advances (at least one selected moment touched).
+	// Real injection: rotation advances via last_access; access_count stays
+	// frozen even on the real path — the old TouchNode counting rotation as
+	// use is the confound that made the most-injected moment (access=209)
+	// masquerade as importance.
 	_ = srv.buildContext("")
-	touched := 0
+	rotated := 0
 	for i := 0; i < 4; i++ {
 		n, _ := srv.db.GetNodeByURI(fmt.Sprintf("mem://agent/moments/m-%d", i))
-		if n != nil && n.AccessCount > 0 {
-			touched++
+		if n == nil {
+			continue
+		}
+		if n.LastAccess != nil && *n.LastAccess > t0 {
+			rotated++
+		}
+		if n.AccessCount != 0 {
+			t.Errorf("real injection incremented access_count for moment %d (access=%d) — exposure must not count as use", i, n.AccessCount)
 		}
 	}
-	if touched == 0 {
-		t.Error("real injection touched no moments — rotation is not advancing")
+	if rotated == 0 {
+		t.Error("real injection advanced no moment rotation — rotation is not advancing")
 	}
 }
 

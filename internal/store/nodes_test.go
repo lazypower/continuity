@@ -194,24 +194,74 @@ func TestFindByCategory(t *testing.T) {
 	}
 }
 
-func TestTouchNode(t *testing.T) {
+// backdateAccess forces a node's last_access to a known old timestamp so a
+// test can assert whether a code path moved it. last_access is stamped at
+// CreateNode time, so non-nil-ness alone proves nothing.
+func backdateAccess(t *testing.T, db *DB, uri string, ts int64) {
+	t.Helper()
+	if _, err := db.Exec(`UPDATE mem_nodes SET last_access = ? WHERE uri = ?`, ts, uri); err != nil {
+		t.Fatalf("backdate %s: %v", uri, err)
+	}
+}
+
+// TestAdvanceRotation pins the shown side of the ADR-001 §2 touch split:
+// rotation bookkeeping moves last_access ONLY. Relevance and access_count
+// must not move — exposure is not use, and the old TouchNode smuggling a
+// relevance reset through rotation was the amplification loop's engine.
+func TestAdvanceRotation(t *testing.T) {
+	db := testDB(t)
+
+	db.CreateNode(&MemNode{URI: "mem://user/moments/rotate-me", NodeType: "leaf", Category: "moments"})
+	const t0 = int64(1000)
+	backdateAccess(t, db, "mem://user/moments/rotate-me", t0)
+	// CreateNode hardcodes relevance to 1.0; set a distinct value so a
+	// smuggled relevance reset is detectable.
+	if _, err := db.Exec(`UPDATE mem_nodes SET relevance = 0.6 WHERE uri = 'mem://user/moments/rotate-me'`); err != nil {
+		t.Fatalf("set relevance: %v", err)
+	}
+
+	if err := db.AdvanceRotation("mem://user/moments/rotate-me"); err != nil {
+		t.Fatalf("AdvanceRotation: %v", err)
+	}
+
+	node, _ := db.GetNodeByURI("mem://user/moments/rotate-me")
+	if node.LastAccess == nil || *node.LastAccess <= t0 {
+		t.Error("expected last_access to advance past the backdated value")
+	}
+	if node.AccessCount != 0 {
+		t.Errorf("access_count = %d, want 0 — rotation must not count as use", node.AccessCount)
+	}
+	if node.Relevance != 0.6 {
+		t.Errorf("relevance = %f, want 0.6 unchanged — rotation must not refresh relevance", node.Relevance)
+	}
+}
+
+// TestRecordUse pins the used side of the split: a deliberate fetch refreshes
+// relevance and stamps last_access. access_count stays frozen — it is a
+// legacy column; the mem_events journal owns use counts.
+func TestRecordUse(t *testing.T) {
 	db := testDB(t)
 
 	db.CreateNode(&MemNode{URI: "mem://user/profile/coding-style", NodeType: "leaf", Category: "profile"})
+	const t0 = int64(1000)
+	backdateAccess(t, db, "mem://user/profile/coding-style", t0)
+	if _, err := db.Exec(`UPDATE mem_nodes SET relevance = 0.4 WHERE uri = 'mem://user/profile/coding-style'`); err != nil {
+		t.Fatalf("set relevance: %v", err)
+	}
 
-	if err := db.TouchNode("mem://user/profile/coding-style"); err != nil {
-		t.Fatalf("TouchNode: %v", err)
+	if err := db.RecordUse("mem://user/profile/coding-style"); err != nil {
+		t.Fatalf("RecordUse: %v", err)
 	}
 
 	node, _ := db.GetNodeByURI("mem://user/profile/coding-style")
-	if node.AccessCount != 1 {
-		t.Errorf("access_count = %d, want 1", node.AccessCount)
-	}
-	if node.LastAccess == nil {
-		t.Error("expected last_access to be set")
-	}
 	if node.Relevance != 1.0 {
-		t.Errorf("relevance = %f, want 1.0 after touch", node.Relevance)
+		t.Errorf("relevance = %f, want 1.0 after use", node.Relevance)
+	}
+	if node.LastAccess == nil || *node.LastAccess <= t0 {
+		t.Error("expected last_access to advance past the backdated value")
+	}
+	if node.AccessCount != 0 {
+		t.Errorf("access_count = %d, want 0 — frozen legacy column, journal owns use counts", node.AccessCount)
 	}
 }
 

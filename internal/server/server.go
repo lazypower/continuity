@@ -21,6 +21,7 @@ type Server struct {
 	router  chi.Router
 	version string
 	started time.Time
+	events  *eventRecorder
 
 	// Durable extraction worker (H1): /extract and /signal enqueue into
 	// store.extraction_queue instead of spawning a fire-and-forget goroutine; a
@@ -43,6 +44,7 @@ func New(db *store.DB, eng *engine.Engine, version string) *Server {
 		engine:  eng,
 		version: version,
 		started: time.Now(),
+		events:  newEventRecorder(db),
 
 		extractWake: make(chan struct{}, 1),
 		extractStop: make(chan struct{}),
@@ -53,6 +55,14 @@ func New(db *store.DB, eng *engine.Engine, version string) *Server {
 	}
 	s.routes()
 	return s
+}
+
+// Close releases the server's background resources (the telemetry recorder).
+// Safe to call once; telemetry flush is bounded, never blocking shutdown.
+func (s *Server) Close() {
+	if s.events != nil {
+		s.events.Close()
+	}
 }
 
 // ServeHTTP implements http.Handler.

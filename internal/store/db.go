@@ -90,6 +90,14 @@ func OpenMemory() (*DB, error) {
 		return nil, fmt.Errorf("open sqlite memory: %w", err)
 	}
 
+	// A plain ":memory:" DSN gives every pooled connection its OWN empty
+	// database — migrations land on one connection and any other goroutine
+	// (the server's telemetry recorder, extraction workers) draws a second
+	// connection and sees no tables. Pin the pool to a single connection so
+	// the in-memory DB is one database, matching the single-writer reality
+	// of the on-disk path.
+	sqlDB.SetMaxOpenConns(1)
+
 	db := &DB{DB: sqlDB, Path: ":memory:"}
 	if err := db.configurePragmas(); err != nil {
 		sqlDB.Close()

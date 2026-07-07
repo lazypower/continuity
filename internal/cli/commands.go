@@ -147,7 +147,6 @@ func runSearch(cmd *cobra.Command, args []string) error {
 			URI        string  `json:"uri"`
 			Category   string  `json:"category"`
 			L0Abstract string  `json:"l0_abstract"`
-			L1Overview string  `json:"l1_overview"`
 			Score      float64 `json:"score"`
 			Similarity float64 `json:"similarity"`
 			Relevance  float64 `json:"relevance"`
@@ -162,22 +161,18 @@ func runSearch(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Search prints pointers, not payloads (ADR-001 §2): L0 + URI. Deepening
+	// to a body is `continuity show <uri>` — a deliberate act the substrate
+	// counts as use.
 	for i, r := range resp.Results {
 		fmt.Printf("%d. [%.3f] %s\n", i+1, r.Score, r.URI)
 		if searchExplain {
 			// Score decomposition — so ranking can be inspected from the CLI
 			// instead of curling /api/search and parsing JSON by hand.
-			fmt.Printf("   score=%.3f = similarity=%.3f x relevance=%.3f (x category boost)\n", r.Score, r.Similarity, r.Relevance)
+			// Relevance is node metadata, not a score input (ADR-001 interim).
+			fmt.Printf("   score=%.3f = similarity=%.3f (x category boost); relevance=%.3f (not scored)\n", r.Score, r.Similarity, r.Relevance)
 		}
 		fmt.Printf("   %s [%s]\n", r.L0Abstract, r.Category)
-		if r.L1Overview != "" {
-			// Show first 200 chars of L1
-			overview := r.L1Overview
-			if len(overview) > 200 {
-				overview = overview[:200] + "..."
-			}
-			fmt.Printf("   %s\n", overview)
-		}
 		fmt.Println()
 	}
 
