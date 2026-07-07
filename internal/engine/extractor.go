@@ -296,9 +296,19 @@ func parseExtractionResponse(content string) ([]memoryCandidate, error) {
 		return nil, fmt.Errorf("no JSON array found in response")
 	}
 
+	dec := json.NewDecoder(strings.NewReader(content[start:]))
 	var candidates []memoryCandidate
-	if err := json.NewDecoder(strings.NewReader(content[start:])).Decode(&candidates); err != nil {
+	if err := dec.Decode(&candidates); err != nil {
 		return nil, fmt.Errorf("unmarshal candidates: %w", err)
+	}
+	// Ambiguity guard: trailing natural-language prose is fine (it won't decode as
+	// JSON, so the extra Decode errors and we keep the array), but a SECOND
+	// decodable JSON value means the model emitted a corrected/multi-array
+	// response. Storing only the first array could persist a superseded candidate,
+	// so fail closed and let extraction retry rather than guess (Codex P2).
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err == nil {
+		return nil, fmt.Errorf("ambiguous extraction: multiple JSON values in response")
 	}
 
 	return candidates, nil

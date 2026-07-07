@@ -66,9 +66,9 @@ func (c *ClaudeCLI) Complete(ctx context.Context, prompt string) (*Response, err
 	cmd.Env = filterEnv(os.Environ())
 
 	stdout := &cappedWriter{}
-	var stderr bytes.Buffer
+	stderr := &cappedWriter{}
 	cmd.Stdout = stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("claude cli: %w (stderr: %s)", err, stderr.String())
