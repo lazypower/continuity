@@ -17,12 +17,21 @@ import (
 	"github.com/lazypower/continuity/internal/store"
 )
 
+// encodeJSON writes v as a JSON response body, logging an encode failure rather
+// than dropping it silently so a truncated or failed response is debuggable (L1).
+func encodeJSON(w http.ResponseWriter, v any) {
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(v); err != nil {
+		log.Printf("routes: encode response: %v", err)
+	}
+}
+
 // jsonError writes a JSON error response with proper Content-Type and encoding.
 // Prefer this over http.Error for consistent JSON responses.
 func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	encodeJSON(w,map[string]string{"error": msg})
 }
 
 func (s *Server) handleSessionInit(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +56,7 @@ func (s *Server) handleSessionInit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	encodeJSON(w,map[string]any{
 		"session_id": sess.SessionID,
 		"status":     sess.Status,
 		"tool_count": sess.ToolCount,
@@ -83,7 +92,7 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	encodeJSON(w,map[string]string{"status": "ok"})
 }
 
 func (s *Server) handleCompleteSession(w http.ResponseWriter, r *http.Request) {
@@ -94,12 +103,12 @@ func (s *Server) handleCompleteSession(w http.ResponseWriter, r *http.Request) {
 		// may have already been completed or never existed. Log but return OK.
 		log.Printf("complete session: %v", err)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		encodeJSON(w,map[string]string{"status": "ok"})
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
+	encodeJSON(w,map[string]string{"status": "completed"})
 }
 
 func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
@@ -112,7 +121,7 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ended"})
+	encodeJSON(w,map[string]string{"status": "ended"})
 }
 
 func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
@@ -130,7 +139,7 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+		encodeJSON(w,map[string]string{"error": "engine not configured"})
 		return
 	}
 
@@ -149,7 +158,7 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{"status": "extracting"})
+	encodeJSON(w,map[string]string{"status": "extracting"})
 }
 
 func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
@@ -170,7 +179,7 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+		encodeJSON(w,map[string]string{"error": "engine not configured"})
 		return
 	}
 
@@ -185,7 +194,7 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{"status": "processing"})
+	encodeJSON(w,map[string]string{"status": "processing"})
 }
 
 // handleUnmarkEmptyExtractions clears extracted_at on every session marked
@@ -201,7 +210,7 @@ func (s *Server) handleUnmarkEmptyExtractions(w http.ResponseWriter, r *http.Req
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	encodeJSON(w,map[string]any{
 		"status":   "ok",
 		"unmarked": n,
 	})
@@ -212,7 +221,7 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	if uri == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "uri parameter required"})
+		encodeJSON(w,map[string]string{"error": "uri parameter required"})
 		return
 	}
 	includeRetracted := r.URL.Query().Get("include_retracted") == "true"
@@ -248,7 +257,7 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 		if node.SupersededBy != "" {
 			out["superseded_by"] = node.SupersededBy
 		}
-		json.NewEncoder(w).Encode(out)
+		encodeJSON(w,out)
 		return
 	}
 
@@ -272,7 +281,7 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 			out["superseded_by"] = node.SupersededBy
 		}
 	}
-	json.NewEncoder(w).Encode(out)
+	encodeJSON(w,out)
 }
 
 func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
@@ -297,7 +306,7 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+		encodeJSON(w,map[string]string{"error": "engine not configured"})
 		return
 	}
 
@@ -320,7 +329,7 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 		if isMatch, uris := engine.IsRetractedMatch(err); isMatch {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusConflict)
-			json.NewEncoder(w).Encode(map[string]any{
+			encodeJSON(w,map[string]any{
 				"status":       "matches_retracted",
 				"matched_uris": uris,
 				"hint":         "inspect each with `continuity show <uri> --include-retracted` before proceeding; pass --acknowledge-retracted to override",
@@ -348,7 +357,7 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"status": status, "uri": uri})
+	encodeJSON(w,map[string]string{"status": status, "uri": uri})
 }
 
 func (s *Server) handleRetract(w http.ResponseWriter, r *http.Request) {
@@ -373,7 +382,7 @@ func (s *Server) handleRetract(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "engine not configured"})
+		encodeJSON(w,map[string]string{"error": "engine not configured"})
 		return
 	}
 
@@ -401,7 +410,7 @@ func (s *Server) handleRetract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	encodeJSON(w,map[string]any{
 		"status":        status,
 		"uri":           req.URI,
 		"superseded_by": req.SupersededBy,
@@ -449,7 +458,7 @@ func (s *Server) handlePin(w http.ResponseWriter, r *http.Request) {
 		status = "already_pinned"
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"status": status, "uri": req.URI})
+	encodeJSON(w,map[string]any{"status": status, "uri": req.URI})
 }
 
 // handleUnpin clears an operator pin. Idempotent. Store-native (see handlePin).
@@ -487,7 +496,7 @@ func (s *Server) handleUnpin(w http.ResponseWriter, r *http.Request) {
 		status = "not_pinned"
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"status": status, "uri": req.URI})
+	encodeJSON(w,map[string]any{"status": status, "uri": req.URI})
 }
 
 // handleListPinned returns the live (non-retracted) operator pins, oldest first.
@@ -526,7 +535,7 @@ func (s *Server) handleListPinned(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	encodeJSON(w,map[string]any{
 		"count": len(out),
 		"pins":  out,
 	})
@@ -559,7 +568,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if s.engine == nil || s.engine.Embedder == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": "search not available — no embedder configured"})
+		encodeJSON(w,map[string]string{"error": "search not available — no embedder configured"})
 		return
 	}
 
@@ -570,7 +579,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if locked, reason := s.engine.VectorIdentityLocked(); locked {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"error": reason})
+		encodeJSON(w,map[string]string{"error": reason})
 		return
 	}
 
@@ -622,7 +631,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	encodeJSON(w,map[string]any{
 		"query":   query,
 		"mode":    mode,
 		"count":   len(out),
@@ -671,7 +680,7 @@ func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(out)
+	encodeJSON(w,out)
 }
 
 // handleMetrics returns the read-only Memory Health payload. Decay is computed
@@ -684,7 +693,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(m)
+	encodeJSON(w,m)
 }
 
 func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
@@ -728,7 +737,7 @@ func (s *Server) handleProfile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	encodeJSON(w,map[string]any{
 		"relational_profile": profileText,
 		"nodes":              profileNodes,
 	})
@@ -815,7 +824,7 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	encodeJSON(w,map[string]any{
 		"uri":   uri,
 		"nodes": nodes,
 	})

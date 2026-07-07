@@ -2,8 +2,10 @@ package transcript
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -36,7 +38,19 @@ type ParsedEntry struct {
 
 var systemReminderRe = regexp.MustCompile(`<system-reminder>[\s\S]*?</system-reminder>`)
 
-// ParseFile reads a JSONL transcript file and returns parsed entries.
+// maxTranscriptLine bounds how many bytes ParseFile retains for a single JSONL
+// line. A real Claude Code transcript line is a few KB; a multi-megabyte line
+// means a large paste landed in one message. bufio.Scanner used to abort the
+// ENTIRE file on such a line (ErrTooLong), silently losing a whole session's
+// memory — and transcripts are ephemeral, so that loss is permanent. We now
+// truncate the oversized line (it then fails JSON parse and is skipped) and keep
+// scanning the rest of the session. 4MB sits far above any real line while
+// capping per-line memory against a pathological paste.
+const maxTranscriptLine = 4 * 1024 * 1024
+
+// ParseFile reads a JSONL transcript file and returns parsed entries. A single
+// oversized or malformed line never aborts the parse — it is skipped so the rest
+// of the session still extracts.
 func ParseFile(path string) ([]ParsedEntry, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -45,29 +59,48 @@ func ParseFile(path string) ([]ParsedEntry, error) {
 	defer f.Close()
 
 	var entries []ParsedEntry
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB line buffer
+	r := bufio.NewReaderSize(f, 64*1024)
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	for {
+		line, readErr := readLine(r, maxTranscriptLine)
+		if len(line) > 0 {
+			if entry, err := parseLine(line); err == nil && entry != nil {
+				entries = append(entries, *entry)
+			}
 		}
-
-		entry, err := parseLine(line)
-		if err != nil {
-			continue // skip malformed lines
-		}
-		if entry != nil {
-			entries = append(entries, *entry)
+		if readErr != nil {
+			if readErr == io.EOF {
+				return entries, nil
+			}
+			return nil, fmt.Errorf("read transcript: %w", readErr)
 		}
 	}
+}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan transcript: %w", err)
+// readLine reads one '\n'-delimited line from r, retaining at most max bytes.
+// Bytes past max — and the remainder of an oversized line — are read and
+// discarded, so a huge line truncates instead of aborting the scan or growing
+// memory without bound. The returned slice has a trailing "\r\n" or "\n"
+// stripped. It returns io.EOF when the stream ends, alongside any final
+// newline-less line.
+func readLine(r *bufio.Reader, max int) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if room := max - len(line); room > 0 {
+			if len(chunk) > room {
+				line = append(line, chunk[:room]...)
+			} else {
+				line = append(line, chunk...)
+			}
+		}
+		if err == bufio.ErrBufferFull {
+			continue // line exceeds bufio's buffer; keep draining it
+		}
+		line = bytes.TrimSuffix(line, []byte{'\n'})
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		return line, err
 	}
-
-	return entries, nil
 }
 
 // ParseLines parses transcript content from a string (for testing).
