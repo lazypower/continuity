@@ -2,6 +2,7 @@ package server
 
 import (
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,11 +16,18 @@ import (
 // are therefore buffered and fire-and-forget: a full buffer DROPS the event
 // and counts the drop. Telemetry is allowed to lose an event; the surfacing
 // that triggered it is never allowed to wait for one.
+//
+// Shutdown uses a stop signal rather than closing the buffer channel: record()
+// may race Close() (a late request during shutdown), and a send on a closed
+// channel panics. With the stop pattern the late event is simply dropped —
+// which is the telemetry contract anyway.
 type eventRecorder struct {
-	db      *store.DB
-	ch      chan store.MemEvent
-	done    chan struct{}
-	dropped atomic.Int64
+	db       *store.DB
+	ch       chan store.MemEvent
+	stop     chan struct{}
+	done     chan struct{}
+	stopOnce sync.Once
+	dropped  atomic.Int64
 }
 
 const eventBuffer = 256
@@ -28,6 +36,7 @@ func newEventRecorder(db *store.DB) *eventRecorder {
 	r := &eventRecorder{
 		db:   db,
 		ch:   make(chan store.MemEvent, eventBuffer),
+		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
 	go r.drain()
@@ -36,17 +45,39 @@ func newEventRecorder(db *store.DB) *eventRecorder {
 
 func (r *eventRecorder) drain() {
 	defer close(r.done)
-	for e := range r.ch {
-		if err := r.db.InsertEvent(e); err != nil {
-			// Best-effort by contract: log and move on. A persistent failure
-			// here (e.g. schema drift) surfaces in doctor, not in surfacing.
-			log.Printf("events: write failed for %s/%s %s: %v", e.Event, e.Surface, e.NodeURI, err)
+	for {
+		select {
+		case e := <-r.ch:
+			r.insert(e)
+		case <-r.stop:
+			// Flush whatever is already buffered, then exit.
+			for {
+				select {
+				case e := <-r.ch:
+					r.insert(e)
+				default:
+					return
+				}
+			}
 		}
 	}
 }
 
-// record enqueues one event without blocking. Full buffer = drop + count.
+func (r *eventRecorder) insert(e store.MemEvent) {
+	if err := r.db.InsertEvent(e); err != nil {
+		// Best-effort by contract: log and move on. A persistent failure
+		// here (e.g. schema drift) surfaces in doctor, not in surfacing.
+		log.Printf("events: write failed for %s/%s %s: %v", e.Event, e.Surface, e.NodeURI, err)
+	}
+}
+
+// record enqueues one event without blocking. Full buffer or shutdown = drop.
 func (r *eventRecorder) record(event, surface, uri, sessionID string) {
+	select {
+	case <-r.stop:
+		return // shutting down; a late telemetry event is droppable by contract
+	default:
+	}
 	e := store.MemEvent{
 		NodeURI:   uri,
 		Event:     event,
@@ -66,8 +97,9 @@ func (r *eventRecorder) record(event, surface, uri, sessionID string) {
 
 // Close stops accepting events and flushes what's buffered, bounded by a
 // timeout — telemetry is droppable, so shutdown never hangs on it.
+// Idempotent; tests also use it as a deterministic drain barrier.
 func (r *eventRecorder) Close() {
-	close(r.ch)
+	r.stopOnce.Do(func() { close(r.stop) })
 	select {
 	case <-r.done:
 	case <-time.After(2 * time.Second):

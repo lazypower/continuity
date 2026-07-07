@@ -90,12 +90,14 @@ func TestBuildContextItemBudget(t *testing.T) {
 func TestBuildContextOversizedL0Truncated(t *testing.T) {
 	srv := testServer(t)
 
-	// Seed a node with an L0 that exceeds per-item budget (200 chars)
+	// Seed a CONTRACT node with an L0 that exceeds per-item budget (200
+	// chars) — contract categories are the only corpus content left on the
+	// tray (ADR-001 §1), so the truncation guard is exercised there.
 	bigL0 := strings.Repeat("This memory is way too long for an L0 abstract. ", 10) // ~480 chars
 	err := srv.db.UpsertNode(&store.MemNode{
-		URI:        "mem://agent/patterns/bloated",
+		URI:        "mem://user/feedback/bloated",
 		NodeType:   "leaf",
-		Category:   "patterns",
+		Category:   "feedback",
 		L0Abstract: bigL0,
 		L1Overview: "overview content that is long enough",
 		L2Content:  "full content",
@@ -106,9 +108,9 @@ func TestBuildContextOversizedL0Truncated(t *testing.T) {
 	}
 
 	ctx := srv.buildContext("")
-	// The item should appear but truncated
-	if !strings.Contains(ctx, "Recent Memories") {
-		t.Error("context missing memories section")
+	// The item should appear (Your Profile section) but truncated
+	if !strings.Contains(ctx, "### Your Profile") {
+		t.Error("context missing Your Profile section")
 	}
 	// The full bloated L0 should NOT appear verbatim
 	if strings.Contains(ctx, bigL0) {
@@ -304,9 +306,14 @@ func TestBuildContextFeedbackInProfileSection(t *testing.T) {
 		t.Errorf("feedback should NOT carry a category tag in context — it rides with profile:\n%s", ctx)
 	}
 
-	// Reference SHOULD carry a [reference] tag; it's in the Recent Memories block.
-	if !strings.Contains(ctx, "[reference]") {
-		t.Errorf("reference should carry [reference] tag in Recent Memories:\n%s", ctx)
+	// Reference is episodic and must NOT appear at boot at all (ADR-001 §1):
+	// the ranked episodic window is deleted; episodic surfacing is pull
+	// (search) until the index and prompt gate land.
+	if strings.Contains(ctx, "[reference]") || strings.Contains(ctx, "Linear INGEST") {
+		t.Errorf("episodic reference node leaked into cold-boot context:\n%s", ctx)
+	}
+	if strings.Contains(ctx, "Recent Memories") {
+		t.Errorf("Recent Memories section must not exist (ADR-001 §1):\n%s", ctx)
 	}
 
 	// The Your Profile section must appear since at least one feedback item is present.
