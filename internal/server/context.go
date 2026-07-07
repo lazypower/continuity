@@ -456,4 +456,3 @@ func (s *Server) selectDiverseMoments(moments []store.MemNode, n int) []store.Me
 	}
 	return result
 }
-

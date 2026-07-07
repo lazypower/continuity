@@ -43,7 +43,7 @@ func TestAddObservationTruncation(t *testing.T) {
 	defer db.Close()
 
 	bigInput := strings.Repeat("i", 20*1024)    // 20KB
-	bigResponse := strings.Repeat("r", 20*1024)  // 20KB
+	bigResponse := strings.Repeat("r", 20*1024) // 20KB
 	err = db.AddObservation("sess-001", "Bash", bigInput, bigResponse)
 	if err != nil {
 		t.Fatalf("AddObservation: %v", err)

@@ -12,8 +12,8 @@ import (
 )
 
 var (
-	extractForce        bool
-	extractTranscript   string
+	extractForce         bool
+	extractTranscript    string
 	extractBackfillEmpty bool
 )
 

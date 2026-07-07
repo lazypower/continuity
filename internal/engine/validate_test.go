@@ -21,7 +21,7 @@ func TestSanitizeURIHint(t *testing.T) {
 		{"trailing---", "trailing"},
 		{"a--b", "a--b"}, // double hyphens OK, not worth overcomplicating
 		{"valid123", "valid123"},
-		{"café", "caf"},         // non-ascii dropped
+		{"café", "caf"}, // non-ascii dropped
 		{"hello world!", "hello-world"},
 		{"", ""},
 		{"   ", ""},

@@ -261,7 +261,7 @@ func TestHasSignal(t *testing.T) {
 		// H5 poisoning gate: a trigger buried in a large paste must NOT fire.
 		{strings.Repeat("padding text ", 200) + "always use devbox", false}, // >2000 chars → gated by length
 		{strings.Repeat("x", 600) + " always use devbox", false},            // trigger past offset 500 → gated
-		{strings.Repeat("a", 400) + " remember this: use WAL", true},         // early trigger in a short prompt still fires
+		{strings.Repeat("a", 400) + " remember this: use WAL", true},        // early trigger in a short prompt still fires
 	}
 
 	for _, tt := range tests {
