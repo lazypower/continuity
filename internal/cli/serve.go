@@ -195,6 +195,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
+	// Start the extraction worker only after a successful bind — a failed bind
+	// returns from runServe under deferred db.Close()/eng.Stop(), so a worker
+	// started earlier could run against a closing DB. The shutdown path below is
+	// the single place that drains it.
+	srv.StartExtractionWorker()
+
 	// The listener is bound: this is a genuine "the new schema boots and
 	// serves" signal. Tick retention now, then surface what's still retained.
 	// Deliberately not in store.Open, so CLI subcommands that inspect or prune
@@ -253,7 +259,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	return httpServer.Shutdown(ctx)
+	shutdownErr := httpServer.Shutdown(ctx)
+	// Drain the extraction worker after HTTP stops accepting: a job still running
+	// gets a bounded window to finish; if it doesn't, its queue row persists and
+	// replays on the next boot (H1).
+	srv.StopExtractionWorker(10 * time.Second)
+	return shutdownErr
 }
 
 // applyServeEnvOverrides mutates cfg with values from CONTINUITY_* env vars.

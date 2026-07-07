@@ -282,6 +282,27 @@ CREATE TABLE mem_meta (
 		// retraction exclusion as every other read path). See store/pins.go.
 		SQL: `ALTER TABLE mem_nodes ADD COLUMN pinned_at INTEGER;`,
 	},
+	{
+		Version:     13,
+		Description: "extraction_queue: durable pending-extraction queue (crash-safe capture)",
+		// Additive table; no user data touched. Extraction used to be a
+		// fire-and-forget goroutine, so a crash or restart mid-extraction lost the
+		// work — and Claude Code transcripts are ephemeral, making the loss
+		// permanent. A hook now enqueues here first; the worker deletes the row
+		// only on success, so an abandoned job survives to be retried on the next
+		// boot. kind is 'session' | 'signal'; payload is the transcript path or
+		// the signal prompt (H1).
+		SQL: `
+CREATE TABLE extraction_queue (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT    NOT NULL,
+    kind       TEXT    NOT NULL,              -- 'session' | 'signal'
+    payload    TEXT    NOT NULL,              -- transcript path (session) or prompt (signal)
+    force      INTEGER NOT NULL DEFAULT 0,    -- 1 = bypass idempotency (ExtractSessionForce)
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    queued_at  INTEGER NOT NULL
+);`,
+	},
 }
 
 // headVersion is the highest schema version this binary knows how to apply.
