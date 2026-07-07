@@ -33,13 +33,13 @@ type HookInput struct {
 
 // skipTools are meta-tools that generate noise, not useful observations.
 var skipTools = map[string]bool{
-	"TodoRead":  true,
-	"TodoWrite": true,
-	"Thinking":  true,
-	"TaskList":     true,
-	"TaskCreate":   true,
-	"TaskGet":      true,
-	"TaskUpdate":   true,
+	"TodoRead":   true,
+	"TodoWrite":  true,
+	"Thinking":   true,
+	"TaskList":   true,
+	"TaskCreate": true,
+	"TaskGet":    true,
+	"TaskUpdate": true,
 }
 
 // ShouldSkipTool returns true if this tool should not be recorded as an observation.

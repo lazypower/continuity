@@ -14,9 +14,9 @@ const anthropicAPI = "https://api.anthropic.com/v1/messages"
 
 // Anthropic calls the Anthropic Messages API directly.
 type Anthropic struct {
-	apiKey  string
-	model   string
-	client  *http.Client
+	apiKey string
+	model  string
+	client *http.Client
 }
 
 // NewAnthropic creates a new Anthropic API client.
