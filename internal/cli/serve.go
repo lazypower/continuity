@@ -173,6 +173,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	srv := server.New(db, eng, VersionString())
+	srv.StartExtractionWorker()
 	addr := cfg.ListenAddr()
 
 	httpServer := &http.Server{
@@ -253,7 +254,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	return httpServer.Shutdown(ctx)
+	shutdownErr := httpServer.Shutdown(ctx)
+	// Drain the extraction worker after HTTP stops accepting: a job still running
+	// gets a bounded window to finish; if it doesn't, its queue row persists and
+	// replays on the next boot (H1).
+	srv.StopExtractionWorker(10 * time.Second)
+	return shutdownErr
 }
 
 // applyServeEnvOverrides mutates cfg with values from CONTINUITY_* env vars.

@@ -134,18 +134,15 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Async extraction — return 202 immediately
-	go func() {
-		var err error
-		if req.Force {
-			err = s.engine.ExtractSessionForce(sessionID, req.TranscriptPath)
-		} else {
-			err = s.engine.ExtractSession(sessionID, req.TranscriptPath)
-		}
-		if err != nil {
-			log.Printf("extraction failed for %s: %v", sessionID, err)
-		}
-	}()
+	// Durable enqueue — the worker drains the queue and deletes each row only on
+	// success, so a crash or restart mid-extraction replays instead of losing the
+	// session (H1).
+	if err := s.db.EnqueueExtraction(sessionID, "session", req.TranscriptPath, req.Force); err != nil {
+		log.Printf("enqueue extraction for %s: %v", sessionID, err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	s.wakeExtractionWorker()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -174,14 +171,13 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Async extraction — return 202 immediately
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		if err := s.engine.ExtractSignal(ctx, sessionID, req.Prompt); err != nil {
-			log.Printf("signal extraction failed for %s: %v", sessionID, err)
-		}
-	}()
+	// Durable enqueue (H1) — see handleExtractSession.
+	if err := s.db.EnqueueExtraction(sessionID, "signal", req.Prompt, false); err != nil {
+		log.Printf("enqueue signal for %s: %v", sessionID, err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	s.wakeExtractionWorker()
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
