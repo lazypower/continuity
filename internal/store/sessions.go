@@ -37,7 +37,9 @@ func (db *DB) InitSession(sessionID, project string) (*Session, error) {
 	if err == nil {
 		// Re-activate if not already active
 		if s.Status != "active" {
-			db.Exec(`UPDATE sessions SET status = 'active' WHERE id = ?`, s.ID)
+			if _, err := db.Exec(`UPDATE sessions SET status = 'active' WHERE id = ?`, s.ID); err != nil {
+				return nil, fmt.Errorf("reactivate session: %w", err)
+			}
 			s.Status = "active"
 		}
 		return &s, nil

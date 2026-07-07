@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -240,9 +241,16 @@ func (db *DB) UpsertNode(node *MemNode) error {
 	}
 
 	if existing.Mergeable {
-		// Skip if new content is near-identical to existing (avoid churn)
+		// Skip if new content is near-identical to existing (avoid churn).
+		// Log the skip: a mergeable update that re-states most of its content
+		// while adding one orthogonal observation is discarded here, and for the
+		// relational profile a silent refusal to learn is a real failure mode
+		// (H4 in the fresh-eyes audit). Visibility, not a behavior change.
 		if textNearIdentical(existing.L1Overview, node.L1Overview) &&
 			textNearIdentical(existing.L0Abstract, node.L0Abstract) {
+			log.Printf("upsert: skipped near-identical merge for %s (L1 %d→%d chars, L0 %d→%d)",
+				existing.URI, len(existing.L1Overview), len(node.L1Overview),
+				len(existing.L0Abstract), len(node.L0Abstract))
 			return nil
 		}
 		// Tombstone-guarded in-place update: if the row is retracted between the
@@ -384,6 +392,14 @@ func (db *DB) DecayAllNodes() (int, error) {
 	halfLifeMs := float64(90 * 24 * 60 * 60 * 1000) // 90 days in ms
 	updated := 0
 
+	// Wrap the whole sweep in one transaction so a mid-sweep failure leaves the
+	// corpus fully un-decayed rather than partially decayed (M4 in the audit).
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin decay tx: %w", err)
+	}
+	defer tx.Rollback() // no-op after Commit; makes every early return atomic
+
 	for _, t := range targets {
 		refTime := t.createdAt
 		if t.lastAccess != nil {
@@ -405,12 +421,15 @@ func (db *DB) DecayAllNodes() (int, error) {
 			continue // relevance can only decrease via decay
 		}
 
-		if _, err := db.Exec(`UPDATE mem_nodes SET relevance = ? WHERE id = ?`, newRelevance, t.id); err != nil {
-			return updated, fmt.Errorf("update decay: %w", err)
+		if _, err := tx.Exec(`UPDATE mem_nodes SET relevance = ? WHERE id = ?`, newRelevance, t.id); err != nil {
+			return 0, fmt.Errorf("update decay (rolled back): %w", err)
 		}
 		updated++
 	}
 
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit decay: %w", err)
+	}
 	return updated, nil
 }
 

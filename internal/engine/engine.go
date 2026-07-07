@@ -162,6 +162,13 @@ func (e *Engine) Dedup(ctx context.Context, threshold float64) (int, error) {
 	if e.Embedder == nil {
 		return 0, fmt.Errorf("no embedder configured")
 	}
+	// Refuse to embed while the corpus vector identity is locked: the inline
+	// embed below writes active-identity vectors, and doing that into a
+	// mismatched corpus is the exact silent side effect EmbedNode/EmbedMissing
+	// guard against. Dedup is an explicit op, so fail loud rather than skip.
+	if e.identityMismatch {
+		return 0, fmt.Errorf("vector identity is locked — run `continuity doctor --repair-vectors` before dedup")
+	}
 
 	leaves, err := e.DB.ListLeaves()
 	if err != nil {
