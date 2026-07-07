@@ -4,11 +4,41 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 )
+
+// maxLLMResponse caps how much output any LLM backend may return, so a runaway
+// or malformed response cannot OOM the server (M7 in the audit). 10 MiB is far
+// above any real extraction or merge response.
+const maxLLMResponse = 10 << 20
+
+// cappedWriter buffers up to maxLLMResponse bytes and drops the rest. It always
+// reports a full write so the child process is never blocked or errored by the
+// cap; overflow is discarded and flagged.
+type cappedWriter struct {
+	buf     bytes.Buffer
+	dropped bool
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	if room := maxLLMResponse - w.buf.Len(); room > 0 {
+		if len(p) > room {
+			w.buf.Write(p[:room])
+			w.dropped = true
+		} else {
+			w.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		w.dropped = true
+	}
+	return len(p), nil
+}
+
+func (w *cappedWriter) String() string { return w.buf.String() }
 
 // ClaudeCLI calls the Claude CLI (`claude -p`) as a subprocess.
 type ClaudeCLI struct {
@@ -35,12 +65,16 @@ func (c *ClaudeCLI) Complete(ctx context.Context, prompt string) (*Response, err
 	// Strip CLAUDE_* env vars to prevent recursive hook triggering
 	cmd.Env = filterEnv(os.Environ())
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	stdout := &cappedWriter{}
+	var stderr bytes.Buffer
+	cmd.Stdout = stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("claude cli: %w (stderr: %s)", err, stderr.String())
+	}
+	if stdout.dropped {
+		log.Printf("claude cli: response exceeded %d bytes; truncated", maxLLMResponse)
 	}
 
 	return &Response{

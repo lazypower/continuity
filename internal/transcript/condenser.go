@@ -2,6 +2,7 @@ package transcript
 
 import (
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -49,7 +50,7 @@ func Condense(entries []ParsedEntry) string {
 		if i == 0 || i == len(assistantMsgs)-1 {
 			// First or last
 			if len(a.Text) > firstLastAssistantMax {
-				b.WriteString(a.Text[:firstLastAssistantMax])
+				b.WriteString(truncateRunes(a.Text, firstLastAssistantMax))
 				b.WriteString("...")
 			} else {
 				b.WriteString(a.Text)
@@ -57,7 +58,7 @@ func Condense(entries []ParsedEntry) string {
 		} else {
 			// Mid
 			if len(a.Text) > midAssistantMax {
-				b.WriteString(a.Text[:midAssistantMax])
+				b.WriteString(truncateRunes(a.Text, midAssistantMax))
 				b.WriteString("...")
 			} else {
 				b.WriteString(a.Text)
@@ -67,4 +68,17 @@ func Condense(entries []ParsedEntry) string {
 	}
 
 	return strings.TrimSpace(b.String())
+}
+
+// truncateRunes returns s cut to at most max bytes without splitting a
+// multi-byte rune — byte slicing (s[:max]) can land mid-rune and emit invalid
+// UTF-8 into the condensed transcript. Backs up to the nearest rune start.
+func truncateRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }

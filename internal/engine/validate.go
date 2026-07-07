@@ -4,6 +4,7 @@ import (
 	"log"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Content size limits.
@@ -99,16 +100,30 @@ func validateCandidate(c memoryCandidate) (memoryCandidate, error) {
 }
 
 // truncateClean truncates a string to maxLen, cutting at the last word boundary
-// to avoid mid-word breaks.
+// to avoid mid-word breaks. The initial cut is rune-safe so a multi-byte rune is
+// never split into invalid UTF-8 before the word-boundary backup runs.
 func truncateClean(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
 
+	truncated := truncateRunes(s, maxLen)
 	// Back up to last space
-	truncated := s[:maxLen]
 	if idx := strings.LastIndexFunc(truncated, unicode.IsSpace); idx > maxLen-200 {
 		truncated = truncated[:idx]
 	}
 	return strings.TrimSpace(truncated)
+}
+
+// truncateRunes returns s cut to at most max bytes without splitting a
+// multi-byte rune. Byte slicing (s[:max]) can land mid-rune and emit invalid
+// UTF-8 into stored tiers; back up to the nearest rune start.
+func truncateRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
