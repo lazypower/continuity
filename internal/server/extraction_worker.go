@@ -51,6 +51,18 @@ func (s *Server) extractionLoop() {
 // attempts and ends the pass so the ticker retries later (no tight spin), and a
 // job that exhausts maxExtractionAttempts is dropped with a loud log.
 func (s *Server) drainExtractionQueue() {
+	// If the corpus vector identity is locked, extraction is DEFERRED, not failed:
+	// the engine returns nil in that state (see ExtractSignal / extractSession),
+	// which we must not treat as "done" — deleting the row would lose the capture.
+	// Skip the whole pass; the operator repairs and the ticker retries. Guarded on
+	// a live engine (tests inject runJob with a nil engine).
+	if s.engine != nil {
+		if locked, _ := s.engine.VectorIdentityLocked(); locked {
+			log.Printf("extraction worker: vector identity locked — deferring drain (run `continuity doctor --repair-vectors`)")
+			return
+		}
+	}
+
 	for {
 		select {
 		case <-s.extractStop:
@@ -58,13 +70,13 @@ func (s *Server) drainExtractionQueue() {
 		default:
 		}
 
-		job, err := s.db.NextExtraction()
+		job, err := s.db.NextExtraction(maxExtractionAttempts)
 		if err != nil {
 			log.Printf("extraction worker: read queue: %v", err)
 			return
 		}
 		if job == nil {
-			return // queue empty
+			return // nothing eligible (queue empty or only parked jobs remain)
 		}
 
 		if err := s.runJob(job); err != nil {
@@ -84,14 +96,13 @@ func (s *Server) drainExtractionQueue() {
 					job.SessionID, attempts, maxExtractionAttempts, err)
 			}
 			if attempts >= maxExtractionAttempts {
-				log.Printf("extraction worker: ABANDONING job %d (%s %s) after %d attempts — memory not captured",
-					job.ID, job.Kind, job.SessionID, attempts)
-				if delErr := s.db.DeleteExtraction(job.ID); delErr != nil {
-					log.Printf("extraction worker: %v", delErr)
-				}
+				// PARK, never delete: the row stays (NextExtraction excludes it) so
+				// the capture is not silently lost — it surfaces in /api/health's
+				// queue depth and can be retried once the cause is fixed.
+				log.Printf("extraction worker: PARKING %s job for %s after %d failed attempts — "+
+					"kept in queue for inspection/retry, NOT captured", job.Kind, job.SessionID, attempts)
 			}
-			// End the pass: leave the failed job at the front for the next retry
-			// tick rather than spinning on it now.
+			// End the pass rather than spin; the ticker/wake retries eligible jobs.
 			return
 		}
 
@@ -133,7 +144,7 @@ func (s *Server) wakeExtractionWorker() {
 // to finish its current job. Abandonment is safe: an unfinished job's row stays
 // in the queue and replays on the next boot, so a slow shutdown never loses it.
 func (s *Server) StopExtractionWorker(timeout time.Duration) {
-	close(s.extractStop)
+	s.extractStopOnce.Do(func() { close(s.extractStop) })
 	select {
 	case <-s.extractDone:
 	case <-time.After(timeout):

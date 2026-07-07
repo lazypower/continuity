@@ -94,7 +94,7 @@ func TestExtractionWorkerRetainsFailedJob(t *testing.T) {
 	// Wait until the worker has attempted the job at least once.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if job, _ := s.db.NextExtraction(); job != nil && job.Attempts >= 1 {
+		if job, _ := s.db.NextExtraction(maxExtractionAttempts); job != nil && job.Attempts >= 1 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -104,7 +104,7 @@ func TestExtractionWorkerRetainsFailedJob(t *testing.T) {
 	if n, _ := s.db.PendingExtractions(); n != 1 {
 		t.Fatalf("failed job must remain queued, pending=%d", n)
 	}
-	job, _ := s.db.NextExtraction()
+	job, _ := s.db.NextExtraction(maxExtractionAttempts)
 	if job == nil || job.Attempts < 1 {
 		t.Fatalf("attempts not bumped: %+v", job)
 	}

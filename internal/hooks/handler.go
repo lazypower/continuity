@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -75,20 +76,23 @@ func Handle(event string, stdin io.Reader) {
 // a best-effort marker file — hooks are separate processes, so a per-process
 // guard would warn on every tool call.
 func warnServerUnreachableOnce(sessionID string) {
-	marker := ""
 	if sessionID != "" {
-		marker = filepath.Join(os.TempDir(), "continuity-unreachable-"+sanitizeSessionID(sessionID))
-		if _, err := os.Stat(marker); err == nil {
-			return // already warned this session
+		marker := filepath.Join(os.TempDir(), "continuity-unreachable-"+sanitizeSessionID(sessionID))
+		// Atomic claim: only the process that CREATES the marker warns. O_EXCL
+		// closes the check-then-create race, so concurrent hooks for the same
+		// session don't both print. An existing marker means another hook already
+		// warned (stay silent); any other error (e.g. unwritable tmp) falls through
+		// and warns best-effort rather than going silent.
+		f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		switch {
+		case err == nil:
+			f.Close()
+		case errors.Is(err, os.ErrExist):
+			return
 		}
 	}
 	fmt.Fprintln(os.Stderr, "continuity: server unreachable — this session is not being captured "+
 		"(run `continuity serve` or check the service)")
-	if marker != "" {
-		if f, err := os.Create(marker); err == nil { // best-effort; worst case the notice repeats
-			f.Close()
-		}
-	}
 }
 
 // sanitizeSessionID reduces a session id to a filesystem-safe marker suffix.

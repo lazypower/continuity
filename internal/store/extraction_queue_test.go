@@ -2,16 +2,18 @@ package store
 
 import "testing"
 
-// TestExtractionQueueLifecycle pins the durable-queue contract H1 relies on:
-// FIFO ordering, persisted attempts, delete-on-success, and a safe no-op bump on
-// a row that has already been removed.
+const testMaxAttempts = 20
+
+// TestExtractionQueueLifecycle pins the durable-queue contract: fresh-first /
+// fewer-failed ordering (head-of-line guard), persisted attempts, and
+// delete-on-success.
 func TestExtractionQueueLifecycle(t *testing.T) {
 	db := testDB(t)
 
 	if n, err := db.PendingExtractions(); err != nil || n != 0 {
 		t.Fatalf("empty queue: n=%d err=%v", n, err)
 	}
-	if j, err := db.NextExtraction(); err != nil || j != nil {
+	if j, err := db.NextExtraction(testMaxAttempts); err != nil || j != nil {
 		t.Fatalf("NextExtraction on empty: j=%+v err=%v", j, err)
 	}
 
@@ -25,8 +27,8 @@ func TestExtractionQueueLifecycle(t *testing.T) {
 		t.Fatalf("pending=%d want 2", n)
 	}
 
-	// FIFO: the first enqueued job comes out first, fields intact.
-	j, err := db.NextExtraction()
+	// Two fresh jobs (attempts 0): the older id comes first.
+	j, err := db.NextExtraction(testMaxAttempts)
 	if err != nil || j == nil {
 		t.Fatalf("next: %v %+v", err, j)
 	}
@@ -34,22 +36,23 @@ func TestExtractionQueueLifecycle(t *testing.T) {
 		t.Fatalf("unexpected first job: %+v", j)
 	}
 
-	// Attempts persist and don't change position (still FIFO front).
-	att, err := db.BumpExtractionAttempts(j.ID)
-	if err != nil || att != 1 {
+	// Bump s1 → attempts 1; it now sinks BELOW the fresh s2, so the next eligible
+	// job is s2 (a repeatedly-failing job can't head-of-line-block fresh work).
+	if att, err := db.BumpExtractionAttempts(j.ID); err != nil || att != 1 {
 		t.Fatalf("bump: att=%d err=%v", att, err)
 	}
-	if j2, _ := db.NextExtraction(); j2 == nil || j2.ID != j.ID || j2.Attempts != 1 {
-		t.Fatalf("attempts not persisted / order changed: %+v", j2)
+	j2, _ := db.NextExtraction(testMaxAttempts)
+	if j2 == nil || j2.SessionID != "s2" || j2.Kind != "signal" || !j2.Force {
+		t.Fatalf("failed job should sink below fresh work; got %+v", j2)
 	}
 
-	// Delete the front → the signal job (force=true) surfaces next.
-	if err := db.DeleteExtraction(j.ID); err != nil {
+	// Delete s2 → only s1 (attempts 1) remains and is returned, attempts intact.
+	if err := db.DeleteExtraction(j2.ID); err != nil {
 		t.Fatal(err)
 	}
-	j3, _ := db.NextExtraction()
-	if j3 == nil || j3.SessionID != "s2" || j3.Kind != "signal" || j3.Payload != "remember this" || !j3.Force {
-		t.Fatalf("second job wrong: %+v", j3)
+	j3, _ := db.NextExtraction(testMaxAttempts)
+	if j3 == nil || j3.SessionID != "s1" || j3.Attempts != 1 {
+		t.Fatalf("s1 not returned with persisted attempts: %+v", j3)
 	}
 
 	if err := db.DeleteExtraction(j3.ID); err != nil {
@@ -62,5 +65,32 @@ func TestExtractionQueueLifecycle(t *testing.T) {
 	// Bumping a vanished row is a safe no-op, not an error.
 	if att, err := db.BumpExtractionAttempts(99999); err != nil || att != 0 {
 		t.Fatalf("bump missing row: att=%d err=%v", att, err)
+	}
+}
+
+// TestExtractionQueueParksExhaustedJob: a job that reaches the attempt cap is
+// PARKED — excluded from NextExtraction so it can't wedge the queue — but NEVER
+// deleted, so the capture is not silently lost and stays visible in the backlog.
+func TestExtractionQueueParksExhaustedJob(t *testing.T) {
+	db := testDB(t)
+	if err := db.EnqueueExtraction("s", "session", "/p", false); err != nil {
+		t.Fatal(err)
+	}
+	j, _ := db.NextExtraction(testMaxAttempts)
+	if j == nil {
+		t.Fatal("expected a claimable job")
+	}
+	for i := 0; i < testMaxAttempts; i++ {
+		if _, err := db.BumpExtractionAttempts(j.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Parked: no longer claimable...
+	if pj, err := db.NextExtraction(testMaxAttempts); err != nil || pj != nil {
+		t.Fatalf("exhausted job must be parked (unclaimable): %+v err=%v", pj, err)
+	}
+	// ...but still present — not lost — and counted in the backlog.
+	if n, _ := db.PendingExtractions(); n != 1 {
+		t.Fatalf("parked job must remain queued, pending=%d want 1", n)
 	}
 }

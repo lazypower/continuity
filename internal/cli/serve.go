@@ -173,7 +173,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	srv := server.New(db, eng, VersionString())
-	srv.StartExtractionWorker()
 	addr := cfg.ListenAddr()
 
 	httpServer := &http.Server{
@@ -195,6 +194,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
+
+	// Start the extraction worker only after a successful bind — a failed bind
+	// returns from runServe under deferred db.Close()/eng.Stop(), so a worker
+	// started earlier could run against a closing DB. The shutdown path below is
+	// the single place that drains it.
+	srv.StartExtractionWorker()
 
 	// The listener is bound: this is a genuine "the new schema boots and
 	// serves" signal. Tick retention now, then surface what's still retained.

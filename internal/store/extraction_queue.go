@@ -35,14 +35,20 @@ func (db *DB) EnqueueExtraction(sessionID, kind, payload string, force bool) err
 	return nil
 }
 
-// NextExtraction returns the oldest pending extraction, or nil if the queue is
-// empty. Ordered by id (FIFO) so a crashed job replays before newer work.
-func (db *DB) NextExtraction() (*ExtractionJob, error) {
+// NextExtraction returns the next still-eligible pending extraction, or nil if
+// none remain. Jobs that have exhausted maxAttempts are excluded — they are
+// PARKED, not deleted, so a job that never succeeds stays in the queue for
+// inspection/replay instead of silently losing the capture. Ordering prefers
+// fewer-failed then older jobs so a repeatedly-failing job cannot head-of-line-
+// block fresh work.
+func (db *DB) NextExtraction(maxAttempts int) (*ExtractionJob, error) {
 	var j ExtractionJob
 	var force int
 	err := db.QueryRow(
 		`SELECT id, session_id, kind, payload, force, attempts
-		 FROM extraction_queue ORDER BY id LIMIT 1`,
+		 FROM extraction_queue WHERE attempts < ?
+		 ORDER BY attempts ASC, id ASC LIMIT 1`,
+		maxAttempts,
 	).Scan(&j.ID, &j.SessionID, &j.Kind, &j.Payload, &force, &j.Attempts)
 	if err == sql.ErrNoRows {
 		return nil, nil
