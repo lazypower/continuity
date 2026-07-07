@@ -1,6 +1,10 @@
 package transcript
 
 import (
+	"bufio"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -109,6 +113,64 @@ func TestParseLinesMalformed(t *testing.T) {
 	// Should skip malformed, keep valid
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 valid entry, got %d", len(entries))
+	}
+}
+
+func TestReadLineTruncatesOversizedLine(t *testing.T) {
+	// A tiny reader buffer plus a small cap forces the ErrBufferFull drain path:
+	// the oversized middle line must truncate to the cap, and the line after it
+	// must still read intact.
+	input := "short\n" + strings.Repeat("x", 50) + "\nafter"
+	r := bufio.NewReaderSize(strings.NewReader(input), 16)
+
+	var got []string
+	for {
+		line, err := readLine(r, 10)
+		got = append(got, string(line))
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("readLine: %v", err)
+		}
+	}
+
+	want := []string{"short", strings.Repeat("x", 10), "after"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d lines %q, want %q", len(got), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("line %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseFileSkipsOversizedLine(t *testing.T) {
+	valid1 := `{"type":"user","message":{"role":"user","content":"first real message here"}}`
+	// One line larger than maxTranscriptLine simulates a huge paste. It gets
+	// truncated (then fails JSON parse and is skipped) instead of aborting the
+	// whole file the way bufio.Scanner's ErrTooLong used to.
+	huge := `{"type":"user","message":{"role":"user","content":"` + strings.Repeat("x", maxTranscriptLine+1024) + `"}}`
+	valid2 := `{"type":"assistant","message":{"role":"assistant","content":"second real message here"}}`
+
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	if err := os.WriteFile(path, []byte(valid1+"\n"+huge+"\n"+valid2+"\n"), 0o600); err != nil {
+		t.Fatalf("write temp transcript: %v", err)
+	}
+
+	entries, err := ParseFile(path)
+	if err != nil {
+		t.Fatalf("ParseFile must not error on an oversized line: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries (oversized line skipped), got %d", len(entries))
+	}
+	if entries[0].Text != "first real message here" {
+		t.Errorf("entry[0].Text = %q", entries[0].Text)
+	}
+	if entries[1].Text != "second real message here" {
+		t.Errorf("entry[1].Text = %q", entries[1].Text)
 	}
 }
 
