@@ -32,11 +32,29 @@ func isInternalPrompt(prompt string) bool {
 	return strings.HasPrefix(prompt, internalSentinel)
 }
 
-// hasSignal returns true if the prompt contains any signal trigger phrase.
+const (
+	// maxSignalPromptLen bounds the whole prompt: a trigger phrase buried in a
+	// large paste is not the operator asking to remember something — it's
+	// third-party content that happened to transit the session. Signals only fire
+	// on plausibly-human messages (H5 memory-poisoning defense).
+	maxSignalPromptLen = 2000
+	// maxSignalTriggerOffset requires the trigger near the START of the message,
+	// so a paste whose body contains "always use X" deep inside cannot self-author
+	// an attacker-controlled memory.
+	maxSignalTriggerOffset = 500
+)
+
+// hasSignal reports whether the prompt is a plausibly-human, explicit
+// memory-flagging message: short enough to be a real instruction, with a trigger
+// phrase near its start. A trigger buried in a large paste does NOT qualify —
+// that is the drive-by memory-poisoning vector we refuse (H5).
 func hasSignal(prompt string) bool {
+	if len(prompt) > maxSignalPromptLen {
+		return false
+	}
 	lower := strings.ToLower(prompt)
 	for _, trigger := range signalTriggers {
-		if strings.Contains(lower, trigger) {
+		if idx := strings.Index(lower, trigger); idx >= 0 && idx <= maxSignalTriggerOffset {
 			return true
 		}
 	}
