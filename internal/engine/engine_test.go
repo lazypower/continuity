@@ -396,7 +396,7 @@ func TestExtractSignal(t *testing.T) {
 	if len(mock.Calls) != 1 {
 		t.Errorf("expected 1 LLM call, got %d", len(mock.Calls))
 	}
-	if len(mock.Calls) > 0 && !strings.Contains(mock.Calls[0], "explicitly flagged") {
+	if len(mock.Calls) > 0 && !strings.Contains(mock.Calls[0], "memory cue") {
 		t.Error("expected signal extraction prompt")
 	}
 }
