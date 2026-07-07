@@ -422,6 +422,6 @@ func runDedup(cmd *cobra.Command, args []string) error {
 
 var importCmd = &cobra.Command{
 	Use:   "import",
-	Short: "Import from claude-mem database",
+	Short: "Import from claude-mem database (not yet implemented)",
 	Run:   stubRun("import"),
 }

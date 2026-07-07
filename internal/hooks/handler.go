@@ -2,8 +2,12 @@ package hooks
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 const maxHookInputSize = 10 << 20 // 10MB
@@ -42,8 +46,10 @@ func Handle(event string, stdin io.Reader) {
 			surfaceServerSkewFromHealth(client, hs)
 		}
 	} else {
-		// Non-start events: liveness only; degrade silently if down.
+		// Non-start events: liveness only; degrade if down — but say so once per
+		// session so a silent capture loss becomes a visible, fixable condition (M5).
 		if !client.Healthy() {
+			warnServerUnreachableOnce(input.SessionID)
 			return
 		}
 	}
@@ -62,4 +68,39 @@ func Handle(event string, stdin io.Reader) {
 	default:
 		ExitError(fmt.Errorf("unknown hook event: %s", event))
 	}
+}
+
+// warnServerUnreachableOnce prints a single stderr notice per session when a hook
+// cannot reach the server, converting a silent capture loss into a visible,
+// fixable condition (M5). It dedups across a session's many hook invocations with
+// a best-effort marker file — hooks are separate processes, so a per-process
+// guard would warn on every tool call.
+func warnServerUnreachableOnce(sessionID string) {
+	if sessionID != "" {
+		marker := filepath.Join(os.TempDir(), "continuity-unreachable-"+sanitizeSessionID(sessionID))
+		// Atomic claim: only the process that CREATES the marker warns. O_EXCL
+		// closes the check-then-create race, so concurrent hooks for the same
+		// session don't both print. An existing marker means another hook already
+		// warned (stay silent); any other error (e.g. unwritable tmp) falls through
+		// and warns best-effort rather than going silent.
+		f, err := os.OpenFile(marker, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		switch {
+		case err == nil:
+			f.Close()
+		case errors.Is(err, os.ErrExist):
+			return
+		}
+	}
+	fmt.Fprintln(os.Stderr, "continuity: server unreachable — this session is not being captured "+
+		"(run `continuity serve` or check the service)")
+}
+
+// sanitizeSessionID reduces a session id to a filesystem-safe marker suffix.
+func sanitizeSessionID(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, s)
 }

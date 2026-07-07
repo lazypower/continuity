@@ -162,6 +162,13 @@ func (e *Engine) Dedup(ctx context.Context, threshold float64) (int, error) {
 	if e.Embedder == nil {
 		return 0, fmt.Errorf("no embedder configured")
 	}
+	// Refuse to embed while the corpus vector identity is locked: the inline
+	// embed below writes active-identity vectors, and doing that into a
+	// mismatched corpus is the exact silent side effect EmbedNode/EmbedMissing
+	// guard against. Dedup is an explicit op, so fail loud rather than skip.
+	if e.identityMismatch {
+		return 0, fmt.Errorf("vector identity is locked — run `continuity doctor --repair-vectors` before dedup")
+	}
 
 	leaves, err := e.DB.ListLeaves()
 	if err != nil {
@@ -259,6 +266,11 @@ func (e *Engine) Dedup(ctx context.Context, threshold float64) (int, error) {
 					continue
 				}
 				log.Printf("dedup: removing %s (duplicate of %s in %s)", nodes[idx].URI, nodes[bestIdx].URI, cat)
+				// NOTE (M2): accountable dedup — tombstoning losers instead of
+				// hard-deleting — is deferred pending a design decision. A reason-prefix
+				// discriminator for the retraction-resurrection gate is a forgeable PII
+				// bypass (the retract API accepts arbitrary reasons); a safe version needs
+				// a system-owned superseded-vs-retracted distinction. See PR discussion.
 				if err := e.DB.DeleteNode(nodes[idx].ID); err != nil {
 					log.Printf("dedup: delete %s: %v", nodes[idx].URI, err)
 					continue
@@ -490,8 +502,11 @@ func (e *Engine) evictRedundantMoment(ctx context.Context) (string, error) {
 
 	// Evict the most redundant
 	evictURI := pool[mostRedundantIdx].node.URI
-	if err := e.DB.DeleteNode(pool[mostRedundantIdx].node.ID); err != nil {
-		return "", fmt.Errorf("delete redundant moment: %w", err)
+	// Demote, don't destroy: moments are the category the product treats as
+	// emotionally load-bearing. Tombstone the most-redundant one — it leaves an
+	// accountable marker and drops out of the live pool — instead of shredding it (M2).
+	if _, err := e.DB.RetractNode(evictURI, "evicted from moment pool — most redundant", ""); err != nil {
+		return "", fmt.Errorf("retract redundant moment: %w", err)
 	}
 
 	// Clean up orphaned directory nodes

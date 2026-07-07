@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -21,6 +22,18 @@ type Server struct {
 	version string
 	started time.Time
 	events  *eventRecorder
+
+	// Durable extraction worker (H1): /extract and /signal enqueue into
+	// store.extraction_queue instead of spawning a fire-and-forget goroutine; a
+	// single serial worker drains the queue and deletes each row only on success,
+	// so a crash or restart mid-extraction replays the work instead of losing it.
+	extractWake     chan struct{} // buffered(1); pinged on enqueue to wake the worker
+	extractStop     chan struct{} // closed by StopExtractionWorker to end the loop
+	extractStopOnce sync.Once     // guards extractStop against a double close
+	extractDone     chan struct{} // closed when the worker loop has exited
+	// runJob executes one queued job. Defaults to runExtractionJob (needs a live
+	// engine); overridable in tests to drive the drain loop without an LLM.
+	runJob func(*store.ExtractionJob) error
 }
 
 // New creates a new Server with the given database, engine, and version string.
@@ -32,6 +45,13 @@ func New(db *store.DB, eng *engine.Engine, version string) *Server {
 		version: version,
 		started: time.Now(),
 		events:  newEventRecorder(db),
+
+		extractWake: make(chan struct{}, 1),
+		extractStop: make(chan struct{}),
+		extractDone: make(chan struct{}),
+	}
+	if eng != nil {
+		s.runJob = s.runExtractionJob
 	}
 	s.routes()
 	return s
@@ -109,6 +129,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// primary job is liveness. dbOK already reflects connectivity trouble.
 	schemaCurrent, _ := s.db.SchemaVersion()
 
+	// Surface the durable extraction backlog so a wedged or parked queue is
+	// visible (accountability), not buried only in logs.
+	pendingExtractions, _ := s.db.PendingExtractions()
+
 	// os.Executable is best-effort; an empty string is acceptable for clients.
 	exe, _ := os.Executable()
 
@@ -131,13 +155,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"db":      dbOK,
 
 		// Compatibility/skew-detection fields (issue #36).
-		"api_version":    buildinfo.APIVersion,
-		"schema_head":    store.HeadSchemaVersion(),
-		"schema_current": schemaCurrent,
-		"pid":            os.Getpid(),
-		"started_at":     s.started.Unix(),
-		"db_path":        s.db.Path,
-		"exe":            exe,
+		"api_version":         buildinfo.APIVersion,
+		"schema_head":         store.HeadSchemaVersion(),
+		"schema_current":      schemaCurrent,
+		"pending_extractions": pendingExtractions,
+		"pid":                 os.Getpid(),
+		"started_at":          s.started.Unix(),
+		"db_path":             s.db.Path,
+		"exe":                 exe,
 
 		// Vector-identity fields: what the live server embeds with, and whether
 		// search is locked due to a corpus/embedder mismatch.

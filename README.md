@@ -193,7 +193,7 @@ Agents get shape without weight. The right memories surface at the right time.
 
 ## Architecture
 
-**9 memory categories**, each with merge rules:
+**8 memory categories** (plus diversity-sampled moments), each with merge rules:
 
 | Category | Owner | Mergeable | Decay | Example |
 |----------|-------|-----------|-------|---------|

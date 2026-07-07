@@ -262,6 +262,21 @@ func TestParseExtractionResponse(t *testing.T) {
 			input:   "No memories to extract.",
 			wantErr: true,
 		},
+		{
+			name:  "trailing prose with bracket preserved (L2)",
+			input: `[{"category":"profile","uri_hint":"t","l0":"a","l1":"b","l2":"c"}]` + "\nNote: see item [3] above.",
+			want:  1,
+		},
+		{
+			name:    "two arrays are ambiguous",
+			input:   `[{"category":"profile","uri_hint":"t","l0":"a","l1":"b","l2":"c"}][{"category":"events","uri_hint":"u","l0":"d","l1":"e","l2":"f"}]`,
+			wantErr: true,
+		},
+		{
+			name:    "array then trailing json object is ambiguous",
+			input:   `[{"category":"profile","uri_hint":"t","l0":"a","l1":"b","l2":"c"}]` + "\n{\"corrected\":true}",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -381,7 +396,7 @@ func TestExtractSignal(t *testing.T) {
 	if len(mock.Calls) != 1 {
 		t.Errorf("expected 1 LLM call, got %d", len(mock.Calls))
 	}
-	if len(mock.Calls) > 0 && !strings.Contains(mock.Calls[0], "explicitly flagged") {
+	if len(mock.Calls) > 0 && !strings.Contains(mock.Calls[0], "memory cue") {
 		t.Error("expected signal extraction prompt")
 	}
 }

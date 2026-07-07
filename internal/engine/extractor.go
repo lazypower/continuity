@@ -287,18 +287,28 @@ func parseExtractionResponse(content string) ([]memoryCandidate, error) {
 
 	content = strings.TrimSpace(content)
 
-	// Find the JSON array
+	// Decode the first JSON array starting at the first '['. A streaming decoder
+	// (rather than first-'[' / last-']' slicing) reads exactly one JSON value and
+	// ignores trailing LLM meta-commentary — including a stray ']' after the
+	// array — instead of letting it break the parse (L2).
 	start := strings.Index(content, "[")
-	end := strings.LastIndex(content, "]")
-	if start < 0 || end < 0 || end <= start {
+	if start < 0 {
 		return nil, fmt.Errorf("no JSON array found in response")
 	}
 
-	jsonStr := content[start : end+1]
-
+	dec := json.NewDecoder(strings.NewReader(content[start:]))
 	var candidates []memoryCandidate
-	if err := json.Unmarshal([]byte(jsonStr), &candidates); err != nil {
+	if err := dec.Decode(&candidates); err != nil {
 		return nil, fmt.Errorf("unmarshal candidates: %w", err)
+	}
+	// Ambiguity guard: trailing natural-language prose is fine (it won't decode as
+	// JSON, so the extra Decode errors and we keep the array), but a SECOND
+	// decodable JSON value means the model emitted a corrected/multi-array
+	// response. Storing only the first array could persist a superseded candidate,
+	// so fail closed and let extraction retry rather than guess (Codex P2).
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err == nil {
+		return nil, fmt.Errorf("ambiguous extraction: multiple JSON values in response")
 	}
 
 	return candidates, nil

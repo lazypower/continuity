@@ -58,7 +58,7 @@ func (a *Anthropic) Complete(ctx context.Context, prompt string) (*Response, err
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxLLMResponse))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
