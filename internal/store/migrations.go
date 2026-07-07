@@ -282,6 +282,45 @@ CREATE TABLE mem_meta (
 		// retraction exclusion as every other read path). See store/pins.go.
 		SQL: `ALTER TABLE mem_nodes ADD COLUMN pinned_at INTEGER;`,
 	},
+	{
+		Version:     13,
+		Description: "mem_events: append-only surfacing journal (ADR-001 §5, shown-vs-used)",
+		// Additive table; no user data touched. The journal is the single
+		// authority on exposure and use — mem_nodes.access_count freezes as
+		// legacy. The CHECK pins the full ADR-001 event vocabulary (this slice
+		// writes only shown/deepened); adding a name is a deliberate act that
+		// takes a migration, so a typo'd writer can't corrupt research data.
+		SQL: `
+CREATE TABLE mem_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_uri   TEXT NOT NULL,
+    event      TEXT NOT NULL CHECK (event IN ('shown','deepened','attributed','re-taught','retrieval-miss')),
+    surface    TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_events_uri     ON mem_events(node_uri, event);
+CREATE INDEX idx_events_created ON mem_events(created_at);
+`,
+	},
+	{
+		Version:     14,
+		Description: "restore contract-category relevance eroded by pre-exemption decay (ADR-001 §1)",
+		// Data repair, idempotent and monotonic (sets full relevance; never
+		// lowers). Contract categories (profile/preferences/feedback) decayed
+		// like episodic memory before ADR-001 made them decay-exempt, so a
+		// standing preference that was never search-hit may already sit below
+		// the cold-boot cutoff. The exemption stops future erosion; this
+		// restores nodes it already eroded, or the contract ships pre-hidden.
+		// Tombstoned rows are excluded: retraction is the contract's lifecycle
+		// authority and a repair must not brighten what the operator retracted.
+		SQL: `
+UPDATE mem_nodes SET relevance = 1.0
+WHERE node_type = 'leaf'
+  AND category IN ('profile','preferences','feedback')
+  AND tombstoned_at IS NULL;
+`,
+	},
 }
 
 // headVersion is the highest schema version this binary knows how to apply.

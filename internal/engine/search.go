@@ -47,7 +47,21 @@ func categoryBoost(category string) float64 {
 }
 
 // Find performs fast vector search without LLM assistance.
-// Score = similarity * relevance * categoryBoost.
+// Score = similarity * categoryBoost.
+//
+// Relevance is deliberately absent (ADR-001 §Consequences): with decay
+// running honestly, similarity×relevance does not preserve order across
+// cohorts — a floored node at similarity 0.9 scores below a fresh, barely
+// related node at 0.15, burying exactly the scarred memories the system
+// exists to keep findable. Interim staleness authority is retraction;
+// decay keeps accumulating state and re-enters ranking only inside whatever
+// formula the §5 shown/used data earns.
+//
+// Find is read-idempotent on node state (ADR-001 §2): it mutates no node
+// column. Exposure telemetry (`shown`) is written by the SERVER for results
+// actually returned to the caller — never here, so smart-mode subquery
+// candidates the user never sees can't pollute the used-given-shown
+// denominator.
 func Find(ctx context.Context, db *store.DB, embedder Embedder, query string, opts SearchOpts) ([]SearchResult, error) {
 	if embedder == nil {
 		return nil, fmt.Errorf("no embedder configured")
@@ -120,7 +134,7 @@ func Find(ctx context.Context, db *store.DB, embedder Embedder, query string, op
 		}
 
 		similarity := CosineSimilarity(queryVec, v.Embedding)
-		score := similarity * node.Relevance * categoryBoost(node.Category)
+		score := similarity * categoryBoost(node.Category)
 
 		if score > 0 {
 			results = append(results, SearchResult{
@@ -146,11 +160,6 @@ func Find(ctx context.Context, db *store.DB, embedder Embedder, query string, op
 		results = results[:limit]
 	}
 
-	// Touch accessed nodes (retrieval boost)
-	for _, r := range results {
-		db.TouchNode(r.Node.URI)
-	}
-
 	return results, nil
 }
 
@@ -161,7 +170,14 @@ type subQuery struct {
 }
 
 // Search performs LLM-assisted search with intent decomposition.
-// Score = 0.5*similarity + 0.3*relevance + 0.2*parentScore.
+// Score = (0.5*similarity + 0.2*parentScore) * categoryBoost.
+//
+// The §2 invariants bind this mode identically to Find: no node-state
+// mutation, and relevance leaves the re-rank for the ADR-001 interregnum
+// (same cross-cohort burial argument — see Find). The 0.3 relevance weight
+// is removed, not redistributed: ordering is scale-invariant, and keeping
+// the surviving coefficients stable makes the two eras of scores easier to
+// compare in the §5 research window.
 func Search(ctx context.Context, db *store.DB, embedder Embedder, client llm.Client, query string, opts SearchOpts) ([]SearchResult, error) {
 	if client == nil {
 		// Fall back to Find() if no LLM available
@@ -205,13 +221,13 @@ func Search(ctx context.Context, db *store.DB, embedder Embedder, client llm.Cli
 	}
 
 	// Build parent score map for tree-aware scoring
-	parentScores := buildParentScores(db, seen)
+	parentScores := buildParentScores(seen)
 
-	// Re-score with full formula: (0.5*similarity + 0.3*relevance + 0.2*parentScore) * categoryBoost
+	// Re-score with the tree-aware formula: (0.5*similarity + 0.2*parentScore) * categoryBoost
 	var results []SearchResult
 	for _, r := range seen {
 		ps := parentScores[r.Node.ParentURI]
-		r.Score = (0.5*r.Similarity + 0.3*r.Node.Relevance + 0.2*ps) * categoryBoost(r.Node.Category)
+		r.Score = (0.5*r.Similarity + 0.2*ps) * categoryBoost(r.Node.Category)
 		results = append(results, r)
 	}
 
@@ -230,7 +246,7 @@ func Search(ctx context.Context, db *store.DB, embedder Embedder, client llm.Cli
 }
 
 // buildParentScores computes average similarity of sibling nodes for tree-aware scoring.
-func buildParentScores(db *store.DB, results map[int64]SearchResult) map[string]float64 {
+func buildParentScores(results map[int64]SearchResult) map[string]float64 {
 	parentScores := make(map[string]float64)
 	parentCounts := make(map[string]int)
 

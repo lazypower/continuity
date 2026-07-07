@@ -20,6 +20,7 @@ type Server struct {
 	router  chi.Router
 	version string
 	started time.Time
+	events  *eventRecorder
 }
 
 // New creates a new Server with the given database, engine, and version string.
@@ -30,9 +31,18 @@ func New(db *store.DB, eng *engine.Engine, version string) *Server {
 		engine:  eng,
 		version: version,
 		started: time.Now(),
+		events:  newEventRecorder(db),
 	}
 	s.routes()
 	return s
+}
+
+// Close releases the server's background resources (the telemetry recorder).
+// Safe to call once; telemetry flush is bounded, never blocking shutdown.
+func (s *Server) Close() {
+	if s.events != nil {
+		s.events.Close()
+	}
 }
 
 // ServeHTTP implements http.Handler.

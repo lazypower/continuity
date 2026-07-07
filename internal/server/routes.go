@@ -272,6 +272,20 @@ func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 			out["superseded_by"] = node.SupersededBy
 		}
 	}
+
+	// This fetch IS the use event (ADR-001 §2): payloads live only behind
+	// this endpoint, so reaching L1/L2 is a deliberate act — the single path
+	// that refreshes relevance. The response above reflects the node's state
+	// at fetch time (pre-refresh). Tombstones are excluded: retracted nodes
+	// appear on no surface, so "use" is meaningless for them and a fetch
+	// must not brighten what the operator retracted.
+	if node.NodeType == "leaf" && !node.IsRetracted() {
+		if err := s.db.RecordUse(node.URI); err != nil {
+			log.Printf("get memory: record use for %s: %v", node.URI, err)
+		}
+		s.events.record("deepened", "", node.URI, r.URL.Query().Get("session_id"))
+	}
+
 	json.NewEncoder(w).Encode(out)
 }
 
@@ -598,27 +612,40 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Search returns pointers, not payloads (ADR-001 §2): L0 + URI only.
+	// L1/L2 live behind GET /api/memories, so consuming a hit's payload is a
+	// deliberate fetch — the use event the touch split counts. Returning L1
+	// here was the drift from the original tiering design; with it, an agent
+	// could consume payloads invisibly to shown/used accounting.
+	// Relevance stays in the response as node metadata (it is no longer a
+	// score input — see engine.Find).
 	type resultJSON struct {
 		URI        string  `json:"uri"`
 		Category   string  `json:"category"`
 		L0Abstract string  `json:"l0_abstract"`
-		L1Overview string  `json:"l1_overview,omitempty"`
 		Score      float64 `json:"score"`
 		Similarity float64 `json:"similarity"`
 		Relevance  float64 `json:"relevance"`
 	}
 
+	// Optional caller-supplied session attribution for the §5 journal (the
+	// staged prompt gate will pass it; CLI searches leave it empty).
+	sessionID := r.URL.Query().Get("session_id")
+
 	out := make([]resultJSON, len(results))
-	for i, r := range results {
+	for i, res := range results {
 		out[i] = resultJSON{
-			URI:        r.Node.URI,
-			Category:   r.Node.Category,
-			L0Abstract: r.Node.L0Abstract,
-			L1Overview: r.Node.L1Overview,
-			Score:      r.Score,
-			Similarity: r.Similarity,
-			Relevance:  r.Node.Relevance,
+			URI:        res.Node.URI,
+			Category:   res.Node.Category,
+			L0Abstract: res.Node.L0Abstract,
+			Score:      res.Score,
+			Similarity: res.Similarity,
+			Relevance:  res.Node.Relevance,
 		}
+		// Exposure telemetry for results actually returned to the caller —
+		// and only those (smart-mode subquery candidates never reach here,
+		// so they can't pollute the used-given-shown denominator).
+		s.events.record("shown", "search", res.Node.URI, sessionID)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
