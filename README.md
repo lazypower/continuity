@@ -209,6 +209,11 @@ Agents get shape without weight. The right memories surface at the right time.
 
 **Smart decay**: 90-day half-life without access. Retrieval boosts relevance back to 1.0. Stale memories fade but never disappear — floor of 0.1. Moments and the relational profile are exempt.
 
+**Garbage collection (compost)** — *opt-in, off by default*: decay fades a memory but never deletes it, so the corpus only grows. GC is the release valve — a sweep (riding the daily decay pass) that reclaims genuine dead weight: memories that decayed to the floor **and** went unretrieved for 180+ days. Retraction receipts, pins, and the decay-exempt categories are never touched. It's the one operation that destroys real memories, so it ships **off** and earns its way up via `CONTINUITY_GC`:
+- **`off`** (default) — the sweep does nothing.
+- **`shadow`** — the sweep runs and *logs exactly what it would reclaim*, deleting nothing. Watch it against real decay before trusting it; `/api/health` reports `gc_mode` and `gc_reclaimable` (the current count).
+- **`on`** — takes a `VACUUM INTO` snapshot (a restore point) first, then reclaims up to 50 per sweep. Promote to `on` only once `shadow` is naming memories you'd have deleted yourself.
+
 **Relational profiling**: Extracts *how you work* — not what you work on. Feedback calibration, autonomy preferences, corrections given, trust earned. This is the compounding profile that makes your agent better over time.
 
 **Session tone**: Each completed session gets a compressed emotional arc — a 10-20 token fragment like "flow state, sharp pivots" or "grind into breakthrough, late-night clarity." Displayed in session history so the agent reads narrative, not just logs.

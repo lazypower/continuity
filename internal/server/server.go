@@ -141,9 +141,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// embedder instead of re-resolving a fresh one — the fresh-resolve blind spot.
 	activeEmbedder := ""
 	identityLocked := false
+	gcMode := "off"
+	gcReclaimable := 0
 	if s.engine != nil {
 		activeEmbedder = s.engine.ActiveIdentity()
 		identityLocked, _ = s.engine.VectorIdentityLocked()
+		gcMode = s.engine.GCMode().String()
+		// Only scan when GC is actually enabled — off means dormant, no query.
+		if gcMode != "off" {
+			gcReclaimable, _ = s.engine.GCReclaimableCount()
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -159,6 +166,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"schema_head":         store.HeadSchemaVersion(),
 		"schema_current":      schemaCurrent,
 		"pending_extractions": pendingExtractions,
+		"gc_mode":             gcMode,
+		"gc_reclaimable":      gcReclaimable,
 		"pid":                 os.Getpid(),
 		"started_at":          s.started.Unix(),
 		"db_path":             s.db.Path,
