@@ -1,0 +1,204 @@
+name: Dev Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# The dev channel is a single rolling release that tracks the tip of main.
+# Serialize runs so two quick pushes can't race on deleting/recreating the
+# same "dev" tag; cancel any in-flight run in favor of the newer commit.
+concurrency:
+  group: dev-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.24'
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Build UI
+        run: |
+          cd ui && npm ci && npm run build && cd ..
+          cp -r ui/dist cmd/continuity/ui
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          COMMIT=$(git rev-parse --short HEAD)
+          VERSION="dev-${COMMIT}"
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-X github.com/lazypower/continuity/internal/buildinfo.Version=${VERSION}"
+          LDFLAGS="${LDFLAGS} -X github.com/lazypower/continuity/internal/buildinfo.Commit=${COMMIT}"
+          LDFLAGS="${LDFLAGS} -X github.com/lazypower/continuity/internal/buildinfo.BuildDate=${DATE}"
+
+          EXT=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
+
+          go build -ldflags "${LDFLAGS}" -o "continuity-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" ./cmd/continuity
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: continuity-${{ matrix.goos }}-${{ matrix.goarch }}
+          # Anchor to the per-matrix binary name (with optional .exe for windows)
+          # so an unanchored continuity-* glob doesn't also ship committed docs.
+          path: continuity-${{ matrix.goos }}-${{ matrix.goarch }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish rolling dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # "dev" is a single prerelease that always points at the latest main.
+          # Delete the previous release and its tag, then recreate at the current
+          # commit so the tag moves forward and stale assets don't linger. It is
+          # marked --prerelease so it never becomes GitHub's "latest" — install.sh
+          # and the stable homebrew formula keep tracking tagged releases only.
+          gh release delete dev --repo lazypower/continuity --yes --cleanup-tag || true
+          gh release create dev artifacts/continuity-* \
+            --repo lazypower/continuity \
+            --target "${GITHUB_SHA}" \
+            --title "continuity dev (main)" \
+            --notes "Rolling build of main @ ${GITHUB_SHA}. Unstable — tracks the tip of main. Install: brew install lazypower/tap/continuity-dev" \
+            --prerelease
+
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew dev formula
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set, skipping Homebrew update"
+            exit 0
+          fi
+
+          # The download URLs point at the fixed "dev" tag, so the formula version
+          # exists only to drive `brew upgrade`. A monotonic UTC timestamp keeps it
+          # strictly increasing; the sha256 changes each build and forces a
+          # re-download from the same URL.
+          VERSION=$(date -u +%Y.%m.%d.%H%M%S)
+          COMMIT=$(echo "${GITHUB_SHA}" | cut -c1-7)
+
+          # Compute checksums from the freshly published dev assets
+          gh release download dev --repo lazypower/continuity -p "continuity-darwin-arm64" -D /tmp
+          SHA_DARWIN_ARM64=$(sha256sum /tmp/continuity-darwin-arm64 | cut -d' ' -f1)
+          gh release download dev --repo lazypower/continuity -p "continuity-darwin-amd64" -D /tmp
+          SHA_DARWIN_AMD64=$(sha256sum /tmp/continuity-darwin-amd64 | cut -d' ' -f1)
+          gh release download dev --repo lazypower/continuity -p "continuity-linux-amd64" -D /tmp
+          SHA_LINUX_AMD64=$(sha256sum /tmp/continuity-linux-amd64 | cut -d' ' -f1)
+          gh release download dev --repo lazypower/continuity -p "continuity-linux-arm64" -D /tmp
+          SHA_LINUX_ARM64=$(sha256sum /tmp/continuity-linux-arm64 | cut -d' ' -f1)
+
+          # Generate the formula
+          cat > /tmp/continuity-dev.rb <<FORMULA
+          class ContinuityDev < Formula
+            desc "Persistent memory for AI coding agents (rolling dev build of main)"
+            homepage "https://github.com/lazypower/continuity"
+            version "${VERSION}"
+            license "MIT"
+
+            # Tracks the tip of main via the rolling "dev" prerelease and installs
+            # the same "continuity" binary as the stable formula, so the dev and
+            # stable channels are mutually exclusive.
+            conflicts_with "continuity", because: "both install the continuity binary"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/lazypower/continuity/releases/download/dev/continuity-darwin-arm64"
+                sha256 "${SHA_DARWIN_ARM64}"
+
+                def install
+                  bin.install "continuity-darwin-arm64" => "continuity"
+                end
+              end
+
+              on_intel do
+                url "https://github.com/lazypower/continuity/releases/download/dev/continuity-darwin-amd64"
+                sha256 "${SHA_DARWIN_AMD64}"
+
+                def install
+                  bin.install "continuity-darwin-amd64" => "continuity"
+                end
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/lazypower/continuity/releases/download/dev/continuity-linux-arm64"
+                sha256 "${SHA_LINUX_ARM64}"
+
+                def install
+                  bin.install "continuity-linux-arm64" => "continuity"
+                end
+              end
+
+              on_intel do
+                url "https://github.com/lazypower/continuity/releases/download/dev/continuity-linux-amd64"
+                sha256 "${SHA_LINUX_AMD64}"
+
+                def install
+                  bin.install "continuity-linux-amd64" => "continuity"
+                end
+              end
+            end
+
+            test do
+              assert_match "continuity", shell_output("#{bin}/continuity version")
+            end
+          end
+          FORMULA
+
+          # Strip leading whitespace from heredoc indentation
+          sed -i 's/^          //' /tmp/continuity-dev.rb
+
+          # Clone tap, update formula, push
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/lazypower/homebrew-tap.git" /tmp/tap
+          cp /tmp/continuity-dev.rb /tmp/tap/Formula/continuity-dev.rb
+          cd /tmp/tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/continuity-dev.rb
+          git commit -m "continuity-dev ${VERSION} (${COMMIT})"
+          git push
