@@ -377,13 +377,19 @@ func (db *DB) RecordUse(uri string) error {
 // preferences off the tray. Contract lifecycle authority is merge and
 // retraction, never the clock. Moments are exempt as permanent relational
 // anchors (their own category contract).
+// decayExemptCategoriesSQL is the canonical SQL fragment naming the categories the
+// decay clock never touches (contract categories + moments). One authority: both
+// DecayAllNodes and the GC candidate predicate (gcCandidateWhere) derive from it,
+// so a category made decay-exempt can never silently become GC-eligible.
+const decayExemptCategoriesSQL = `'moments', 'profile', 'preferences', 'feedback'`
+
 func (db *DB) DecayAllNodes() (int, error) {
 	// Fetch all decayable nodes
 	rows, err := db.Query(`
 		SELECT id, uri, relevance, last_access, created_at
 		FROM mem_nodes
 		WHERE node_type = 'leaf'
-			AND category NOT IN ('moments', 'profile', 'preferences', 'feedback')
+			AND category NOT IN (` + decayExemptCategoriesSQL + `)
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("query decayable nodes: %w", err)
@@ -713,14 +719,21 @@ func (db *DB) GetNodesByIDs(ids []int64) ([]MemNode, error) {
 
 // DeleteNode removes a node and its associated vector by ID.
 func (db *DB) DeleteNode(id int64) error {
-	if err := db.DeleteVector(id); err != nil {
+	// Atomic: if the node delete is rejected (e.g. a foreign key), the vector
+	// delete rolls back with it — never strand a vectorless node. Load-bearing now
+	// that the GC sweep hard-deletes real memories through this primitive.
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("delete node %d: begin: %w", id, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM mem_vectors WHERE node_id = ?", id); err != nil {
 		return fmt.Errorf("delete vector for node %d: %w", id, err)
 	}
-	_, err := db.Exec("DELETE FROM mem_nodes WHERE id = ?", id)
-	if err != nil {
+	if _, err := tx.Exec("DELETE FROM mem_nodes WHERE id = ?", id); err != nil {
 		return fmt.Errorf("delete node %d: %w", id, err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // DeleteOrphanDirs removes directory nodes that have no children.

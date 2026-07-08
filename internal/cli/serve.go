@@ -29,6 +29,7 @@ const (
 	envServePort     = "CONTINUITY_PORT"     // overrides Server.Port (int)
 	envServeBind     = "CONTINUITY_BIND"     // overrides Server.Bind
 	envServeEmbedder = "CONTINUITY_EMBEDDER" // "tfidf" | "ollama" | "none" | "" (auto)
+	envServeGC       = "CONTINUITY_GC"       // "off" (default) | "shadow" | "on"
 )
 
 // tfidfLexicalNotice is surfaced once at startup whenever the hashed lexical
@@ -81,9 +82,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: LLM not configured (%v), extraction disabled\n", err)
 	} else {
 		eng = engine.New(db, llmClient)
-		eng.StartDecayTimer()
+		gcMode := engine.ParseGCMode(os.Getenv(envServeGC))
+		eng.SetGCMode(gcMode)
 		defer eng.Stop()
 		fmt.Fprintf(os.Stderr, "  llm: %s (%s)\n", cfg.LLM.Provider, cfg.LLM.Model)
+		if gcMode != engine.GCOff {
+			fmt.Fprintf(os.Stderr, "  gc: %s\n", gcMode)
+		}
 		if bin := llm.ProviderBinaryUnresolved(cfg.LLM); bin != "" {
 			fmt.Fprintf(os.Stderr,
 				"warning: LLM provider binary %q is not on this process's PATH — extraction will fail.\n"+
@@ -200,6 +205,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// started earlier could run against a closing DB. The shutdown path below is
 	// the single place that drains it.
 	srv.StartExtractionWorker()
+
+	// Start decay + GC only after a successful bind — same boundary as the worker.
+	// GC hard-deletes, so a failed-start process must never run a compost sweep.
+	if eng != nil {
+		eng.StartDecayTimer()
+	}
 
 	// The listener is bound: this is a genuine "the new schema boots and
 	// serves" signal. Tick retention now, then surface what's still retained.

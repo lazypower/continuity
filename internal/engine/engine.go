@@ -18,6 +18,7 @@ type Engine struct {
 	LLM      llm.Client
 	Embedder Embedder
 	stopCh   chan struct{}
+	gcMode   GCMode // garbage-collection toggle; off unless CONTINUITY_GC set
 
 	// Vector-identity lock. Set by ReconcileVectorIdentity when the active
 	// embedder's identity differs from the corpus's declared identity. While
@@ -129,6 +130,7 @@ func (e *Engine) StartDecayTimer() {
 	} else if updated > 0 {
 		log.Printf("decay: updated %d nodes", updated)
 	}
+	e.runGCSweep()
 
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
@@ -142,6 +144,7 @@ func (e *Engine) StartDecayTimer() {
 				} else if updated > 0 {
 					log.Printf("decay: updated %d nodes", updated)
 				}
+				e.runGCSweep()
 			case <-e.stopCh:
 				return
 			}
