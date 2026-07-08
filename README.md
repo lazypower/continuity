@@ -40,6 +40,9 @@ curl -fsSL https://raw.githubusercontent.com/lazypower/continuity/main/install.s
 # Homebrew
 brew install lazypower/tap/continuity
 
+# Homebrew — dev channel (rolling build of main, unstable)
+brew install lazypower/tap/continuity-dev
+
 # Arch Linux (AUR) — community-maintained by @klrmngr
 yay -S continuity-bin     # or: paru -S continuity-bin
 
