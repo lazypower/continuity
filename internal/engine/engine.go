@@ -251,26 +251,63 @@ func (e *Engine) Dedup(ctx context.Context, threshold float64) (int, error) {
 				continue
 			}
 
-			// Find the most recently updated node in the cluster
+			// Keeper = most recently updated node; it survives with its URI, vector
+			// identity, and relevance intact.
 			bestIdx := cluster[0]
 			for _, idx := range cluster[1:] {
 				if nodes[idx].UpdatedAt > nodes[bestIdx].UpdatedAt {
 					bestIdx = idx
 				}
 			}
+			keeper := &nodes[bestIdx]
 
-			// Delete all others
+			// Merge-for-coverage: dedup is a reduction, but the survivor must not
+			// lose detail a loser held — the keeper (chosen by recency) may be a
+			// terser restatement. Adopt the most complete L1/L2 found in the cluster
+			// before deleting the rest. Heuristic (longest per tier), not a semantic
+			// union: near-duplicates rarely carry divergent unique detail, and a true
+			// merge would need an LLM. L0 (and thus the keeper's vector) is untouched.
+			coverageChanged := false
+			for _, idx := range cluster {
+				if idx == bestIdx {
+					continue
+				}
+				if len(nodes[idx].L1Overview) > len(keeper.L1Overview) {
+					keeper.L1Overview = nodes[idx].L1Overview
+					coverageChanged = true
+				}
+				if len(nodes[idx].L2Content) > len(keeper.L2Content) {
+					keeper.L2Content = nodes[idx].L2Content
+					coverageChanged = true
+				}
+			}
+			if coverageChanged {
+				if err := e.DB.UpdateNode(keeper); err != nil {
+					// The keeper's adopted L1/L2 didn't persist, so deleting the
+					// losers now would drop exactly the detail this step exists to
+					// preserve. Keep the cluster intact this pass; the next dedup
+					// retries. Losers stay unclaimed — that's fine, they're just not
+					// collapsed yet.
+					log.Printf("dedup: coverage-merge into %s failed, keeping cluster intact this pass: %v", keeper.URI, err)
+					continue
+				}
+			}
+
+			// Hard-delete the losers — their unique detail now lives in the keeper.
 			for _, idx := range cluster {
 				claimed[nodes[idx].ID] = true
 				if idx == bestIdx {
 					continue
 				}
 				log.Printf("dedup: removing %s (duplicate of %s in %s)", nodes[idx].URI, nodes[bestIdx].URI, cat)
-				// NOTE (M2): accountable dedup — tombstoning losers instead of
-				// hard-deleting — is deferred pending a design decision. A reason-prefix
-				// discriminator for the retraction-resurrection gate is a forgeable PII
-				// bypass (the retract API accepts arbitrary reasons); a safe version needs
-				// a system-owned superseded-vs-retracted distinction. See PR discussion.
+				// M2 (won't-fix by design): dedup hard-deletes losers, it does NOT
+				// tombstone them. Dedup is a REDUCTION — collapsing near-identical
+				// restatements — so a per-loser accountability receipt defeats its
+				// purpose (the tree would fill with dedup tombstones). Detail is not
+				// lost: merge-for-coverage above folds the most complete L1/L2 into the
+				// keeper first. (A tombstone-with-reason variant was rejected — the
+				// retract API takes an arbitrary reason, so a reason-prefix gate
+				// discriminator would be a forgeable PII-resurrection bypass.)
 				if err := e.DB.DeleteNode(nodes[idx].ID); err != nil {
 					log.Printf("dedup: delete %s: %v", nodes[idx].URI, err)
 					continue
