@@ -90,14 +90,14 @@ func TestBuildContextItemBudget(t *testing.T) {
 func TestBuildContextOversizedL0Truncated(t *testing.T) {
 	srv := testServer(t)
 
-	// Seed a CONTRACT node with an L0 that exceeds per-item budget (200
-	// chars) — contract categories are the only corpus content left on the
-	// tray (ADR-001 §1), so the truncation guard is exercised there.
+	// Seed a MOMENT with an L0 that exceeds per-item budget (200 chars).
+	// Moments are a pushed section, so the per-item truncation guard is
+	// exercised there — the enumerated contract tray that used to host it is gone.
 	bigL0 := strings.Repeat("This memory is way too long for an L0 abstract. ", 10) // ~480 chars
 	err := srv.db.UpsertNode(&store.MemNode{
-		URI:        "mem://user/feedback/bloated",
+		URI:        "mem://user/moments/bloated",
 		NodeType:   "leaf",
-		Category:   "feedback",
+		Category:   "moments",
 		L0Abstract: bigL0,
 		L1Overview: "overview content that is long enough",
 		L2Content:  "full content",
@@ -108,9 +108,9 @@ func TestBuildContextOversizedL0Truncated(t *testing.T) {
 	}
 
 	ctx := srv.buildContext("")
-	// The item should appear (Your Profile section) but truncated
-	if !strings.Contains(ctx, "### Your Profile") {
-		t.Error("context missing Your Profile section")
+	// The moment should appear but truncated.
+	if !strings.Contains(ctx, "### Moments") {
+		t.Error("context missing Moments section")
 	}
 	// The full bloated L0 should NOT appear verbatim
 	if strings.Contains(ctx, bigL0) {
@@ -264,12 +264,11 @@ func TestBuildContextNoMoments(t *testing.T) {
 	}
 }
 
-// TestBuildContextFeedbackInProfileSection pins the issue #24 rendering rule:
-// feedback memories collapse into the "Your Profile" section (no [category]
-// tag), because they shape *action* — not labelled memory you'd browse, but
-// identity-shaping guidance. Reference memories land in "Recent Memories"
-// with their tag, like other locator data.
-func TestBuildContextFeedbackInProfileSection(t *testing.T) {
+// TestBuildContextContractFactsArePull: individual feedback and reference nodes
+// are NOT auto-injected at cold boot. The enumerated contract tray is removed —
+// contract facts are pull (search); the stance rides the synthesized "Working
+// With You" profile and pins.
+func TestBuildContextContractFactsArePull(t *testing.T) {
 	srv := testServer(t)
 
 	err := srv.db.UpsertNode(&store.MemNode{
@@ -298,27 +297,18 @@ func TestBuildContextFeedbackInProfileSection(t *testing.T) {
 
 	ctx := srv.buildContext("")
 
-	if !strings.Contains(ctx, "Terse responses, no trailing summaries.") {
-		t.Errorf("feedback L0 missing from context:\n%s", ctx)
+	// Neither feedback nor reference is auto-injected — both are pull now.
+	if strings.Contains(ctx, "Terse responses, no trailing summaries.") {
+		t.Errorf("feedback L0 was auto-injected — contract facts are pull now:\n%s", ctx)
 	}
-	// Feedback must not carry a [feedback] tag — it rides with profile.
-	if strings.Contains(ctx, "[feedback]") {
-		t.Errorf("feedback should NOT carry a category tag in context — it rides with profile:\n%s", ctx)
+	if strings.Contains(ctx, "Linear INGEST") {
+		t.Errorf("reference node leaked into cold-boot context:\n%s", ctx)
 	}
-
-	// Reference is episodic and must NOT appear at boot at all (ADR-001 §1):
-	// the ranked episodic window is deleted; episodic surfacing is pull
-	// (search) until the index and prompt gate land.
-	if strings.Contains(ctx, "[reference]") || strings.Contains(ctx, "Linear INGEST") {
-		t.Errorf("episodic reference node leaked into cold-boot context:\n%s", ctx)
+	if strings.Contains(ctx, "### Your Profile") {
+		t.Errorf("### Your Profile tray is back (removed):\n%s", ctx)
 	}
 	if strings.Contains(ctx, "Recent Memories") {
 		t.Errorf("Recent Memories section must not exist (ADR-001 §1):\n%s", ctx)
-	}
-
-	// The Your Profile section must appear since at least one feedback item is present.
-	if !strings.Contains(ctx, "### Your Profile") {
-		t.Errorf("Your Profile section missing despite feedback item:\n%s", ctx)
 	}
 }
 

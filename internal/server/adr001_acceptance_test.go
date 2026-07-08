@@ -153,8 +153,11 @@ func TestAcceptance_NodeFetchIsTheUseEvent(t *testing.T) {
 // preview writes none.
 func TestAcceptance_InjectionWritesShownPreviewWritesNothing(t *testing.T) {
 	srv := acceptanceServer(t)
-	seedLeaf(t, srv, "mem://user/feedback/name-the-boundary", "feedback",
-		"name the responsibility boundary, not the mechanism", "naming guidance body")
+	// The relational profile ("Working With You") is a pushed section, so it
+	// records a shown/tray event. (The enumerated contract dump that used to be
+	// the subject here is gone.)
+	seedLeaf(t, srv, "mem://user/profile/communication", "profile",
+		"how the user works, synthesized", "the synthesized relational profile body")
 
 	// Preview: zero events.
 	_ = srv.renderContext("", true)
@@ -168,38 +171,38 @@ func TestAcceptance_InjectionWritesShownPreviewWritesNothing(t *testing.T) {
 	_ = srv.buildContext("boot-session")
 	srv.events.Close()
 
-	events, err := srv.db.EventsByURI("mem://user/feedback/name-the-boundary")
+	events, err := srv.db.EventsByURI("mem://user/profile/communication")
 	if err != nil || len(events) != 1 {
-		t.Fatalf("feedback node events = %d (err %v), want 1", len(events), err)
+		t.Fatalf("relational profile events = %d (err %v), want 1", len(events), err)
 	}
 	if events[0].Event != "shown" || events[0].Surface != "tray" || events[0].SessionID != "boot-session" {
 		t.Errorf("shown event malformed: %+v", events[0])
 	}
 }
 
-// Criterion: a contract node untouched for a year still renders in Your
-// Profile (decay exemption; the split alone would have created the silent
-// contract-loss path).
-func TestAcceptance_YearOldContractStillRenders(t *testing.T) {
+// Criterion: an individual standing contract fact (a preference/feedback node)
+// is NOT auto-injected at cold boot. The enumerated contract tray is gone — the
+// stance is carried by the synthesized "Working With You" profile, a specific
+// fact that must always be present is an explicit pin, and everything else is
+// pull (search). Locks in the north star: make categorization irrelevant to
+// what's pushed rather than enumerating it.
+func TestAcceptance_StandingContractIsPullNotPushed(t *testing.T) {
 	srv := acceptanceServer(t)
 	seedLeaf(t, srv, "mem://user/preferences/old-standing", "preferences",
 		"a standing preference from a year ago", "body")
-	// A year without use, and pre-exemption erosion already applied.
-	if _, err := srv.db.Exec(`UPDATE mem_nodes SET last_access = 1, created_at = 1 WHERE uri = 'mem://user/preferences/old-standing'`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := srv.db.DecayAllNodes(); err != nil {
-		t.Fatal(err)
-	}
 
 	ctx := srv.buildContext("")
-	if !strings.Contains(ctx, "a standing preference from a year ago") {
-		t.Errorf("year-old contract node missing from cold boot — the repeated-correction failure is back:\n%s", ctx)
+	if strings.Contains(ctx, "a standing preference from a year ago") {
+		t.Errorf("individual contract fact was auto-injected — the enumerated dump is back:\n%s", ctx)
+	}
+	if strings.Contains(ctx, "### Your Profile") {
+		t.Errorf("### Your Profile tray is back:\n%s", ctx)
 	}
 }
 
-// Criterion: cold boot contains no episodic ranked section and still contains
-// Your Profile.
+// Criterion: cold boot contains no episodic ranked section AND no enumerated
+// contract tray — neither episodic facts nor individual contract facts are
+// pushed. Both are pull now.
 func TestAcceptance_ColdBootShapeHonorsTheKeystone(t *testing.T) {
 	srv := acceptanceServer(t)
 	seedLeaf(t, srv, "mem://user/preferences/p1", "preferences", "contract line", "body")
@@ -210,13 +213,13 @@ func TestAcceptance_ColdBootShapeHonorsTheKeystone(t *testing.T) {
 	if strings.Contains(ctx, "Recent Memories") {
 		t.Errorf("Recent Memories section exists (ADR-001 §1 deleted it):\n%s", ctx)
 	}
-	for _, episodic := range []string{"episodic event line", "episodic pattern line"} {
-		if strings.Contains(ctx, episodic) {
-			t.Errorf("episodic content on the tray: %q\n%s", episodic, ctx)
-		}
+	if strings.Contains(ctx, "### Your Profile") {
+		t.Errorf("### Your Profile tray exists (removed — contract facts are pull):\n%s", ctx)
 	}
-	if !strings.Contains(ctx, "### Your Profile") || !strings.Contains(ctx, "contract line") {
-		t.Errorf("contract missing from cold boot:\n%s", ctx)
+	for _, pushed := range []string{"episodic event line", "episodic pattern line", "contract line"} {
+		if strings.Contains(ctx, pushed) {
+			t.Errorf("enumerated corpus content on the tray: %q\n%s", pushed, ctx)
+		}
 	}
 }
 
@@ -274,51 +277,7 @@ func TestAcceptance_ShownCountMatchesReturnedResults(t *testing.T) {
 	}
 }
 
-// Criterion (Codex round 1, P1): when the contract exceeds the item cap,
-// survival is re-affirmation recency — the newest re-affirmed contract node
-// must survive truncation; the least recently re-affirmed drop. Category must
-// not trump freshness: the newest node is FEEDBACK (last category in
-// iteration order), which category-major ordering would have dropped first.
-func TestAcceptance_ContractTruncationDropsLeastReaffirmed(t *testing.T) {
-	srv := acceptanceServer(t)
-
-	// 17 contract nodes (cap is 15): 16 preferences with staggered
-	// updated_at, plus 1 feedback node that is the newest of all.
-	for i := 0; i < 16; i++ {
-		uri := fmt.Sprintf("mem://user/preferences/pref-%02d", i)
-		if err := srv.db.CreateNode(&store.MemNode{
-			URI: uri, NodeType: "leaf", Category: "preferences",
-			L0Abstract: fmt.Sprintf("standing preference %02d", i),
-		}); err != nil {
-			t.Fatalf("seed %s: %v", uri, err)
-		}
-		// Older index = older re-affirmation.
-		if _, err := srv.db.Exec(`UPDATE mem_nodes SET updated_at = ? WHERE uri = ?`, int64(1000+i), uri); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := srv.db.CreateNode(&store.MemNode{
-		URI: "mem://user/feedback/newest-correction", NodeType: "leaf", Category: "feedback",
-		L0Abstract: "the newest correction must survive",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := srv.db.Exec(`UPDATE mem_nodes SET updated_at = ? WHERE uri = 'mem://user/feedback/newest-correction'`, int64(9999)); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := srv.buildContext("")
-
-	if !strings.Contains(ctx, "the newest correction must survive") {
-		t.Errorf("newest re-affirmed contract node (feedback) was truncated — survival must be recency, not category:\n%s", ctx)
-	}
-	// The two least recently re-affirmed must be the ones dropped (17 - 15).
-	for _, oldest := range []string{"standing preference 00", "standing preference 01"} {
-		if strings.Contains(ctx, oldest) {
-			t.Errorf("least recently re-affirmed node %q survived while cap was exceeded", oldest)
-		}
-	}
-	if !strings.Contains(ctx, "standing preference 02") {
-		t.Errorf("node just inside the cap was dropped:\n%s", ctx)
-	}
-}
+// (The contract-truncation item-cap test is retired — the enumerated contract
+// tray it exercised is gone. "No contract facts are pushed" is covered by
+// TestAcceptance_StandingContractIsPullNotPushed and
+// TestAcceptance_ColdBootShapeHonorsTheKeystone.)
