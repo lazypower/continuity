@@ -79,6 +79,16 @@ func (db *DB) RetractNode(uri, reason, supersededBy string) (newly bool, err err
 	}
 
 	if target.IsRetracted() {
+		// Idempotent for the receipt (original tombstone + reason preserved), but
+		// still erase any content a prior retraction left behind: an older binary
+		// only HID content, so upgrading must genuinely erase it. The stored vector
+		// (the antibody) is untouched.
+		if _, err := db.Exec(`
+			UPDATE mem_nodes SET l1_overview = '', l2_content = '', updated_at = ?
+			WHERE uri = ? AND tombstoned_at IS NOT NULL
+		`, time.Now().UnixMilli(), uri); err != nil {
+			return false, fmt.Errorf("erase retained content: %w", err)
+		}
 		return false, nil
 	}
 
@@ -96,9 +106,17 @@ func (db *DB) RetractNode(uri, reason, supersededBy string) (newly bool, err err
 	}
 
 	now := time.Now().UnixMilli()
+	// Antibody retraction: record the receipt AND erase the bulky content in one
+	// write. l0 (the abstract) is kept as the receipt's label and the antibody's
+	// re-embed source; the stored vector (mem_vectors) is untouched — it's the
+	// resurrection gate's antibody, a lossy non-invertible fingerprint that resists
+	// the content returning without keeping the content. (Full l0 erasure — a
+	// --scrub mode — needs an identity-independent fingerprint to keep the antibody
+	// across an embedder migration; deferred to a follow-up.)
 	_, err = db.Exec(`
 		UPDATE mem_nodes
-		SET tombstoned_at = ?, tombstone_reason = ?, superseded_by = NULLIF(?, ''), updated_at = ?
+		SET tombstoned_at = ?, tombstone_reason = ?, superseded_by = NULLIF(?, ''),
+			l1_overview = '', l2_content = '', updated_at = ?
 		WHERE uri = ?
 	`, now, reason, supersededBy, now, uri)
 	if err != nil {
