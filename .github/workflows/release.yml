@@ -82,10 +82,16 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          # Hyphenated tags (v1.2.3-rc.1, -beta) publish as pre-releases; clean
+          # semver tags publish as full releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: artifacts/continuity-*
 
   homebrew:
     needs: release
+    # Never bump the STABLE formula for a pre-release: an -rc/-beta tag must not
+    # reach `brew install continuity` users. (The dev channel is a separate path.)
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Update Homebrew formula
