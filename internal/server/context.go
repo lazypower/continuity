@@ -36,7 +36,6 @@ const (
 	maxContextTotal      = 4000 // total character budget for entire context block
 	maxRelationalContext = 1000 // budget for relational profile section
 	maxItemContext       = 200  // budget per L0 memory item
-	maxContextItems      = 15   // max items considered (budget usually cuts off earlier)
 	// maxPinnedItems is the cold-boot cap on the ### Pinned section. It tracks
 	// store.MaxPins, which is enforced at pin *write* time — so this cap is
 	// defense-in-depth that never actually fires (listed pins == injected pins).
@@ -149,13 +148,6 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 		}
 	}
 
-	// Reserve space for session footer (~300 chars for 5 sessions + current)
-	const footerReserve = 400
-	itemBudget := budget - footerReserve
-	if itemBudget < 0 {
-		itemBudget = 0
-	}
-
 	// Inject moments — small, permanent, high-value relational anchors
 	// Uses diversity sampling: rotation via last_access, greedy max-diversity selection
 	moments, err := s.db.FindByCategory("moments")
@@ -193,95 +185,16 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 		}
 	}
 
-	// Contract categories only (ADR-001 §1). The episodic ranked window
-	// ("Recent Memories" — patterns/events/cases/entities/reference scored by
-	// relevance × access popularity) is deleted, not relocated: at t=0 there
-	// is no query, so any episodic ranking is prediction from priors, and the
-	// measured window surfaced only the already-most-retrieved (12×
-	// amplification, issue #50). Episodic surfacing is pull (search) until the
-	// §3 index and §4 prompt gate land. What remains on the tray is the
-	// contract — profile, preferences, and feedback collapse into "Your
-	// Profile" without category tags (feedback is directional guidance that
-	// shapes how the agent acts, issue #24). No relevance scoring: contract
-	// nodes are decay-exempt with relevance frozen at full, so a rank would
-	// order on a dead signal. Order — and therefore truncation survival — is
-	// re-affirmation recency: updated_at DESC, GLOBAL across the three
-	// contract categories. updated_at moves on merge (re-learning), never on
-	// exposure or fetch, so no popularity loop re-enters (verified in Codex
-	// round 1). Global rather than category-major because the cap is global:
-	// category-major order would silently drop the newest feedback correction
-	// before a stale profile entry — the exact silent-contract-loss failure
-	// this ADR exists to kill.
-	type contractItem struct {
-		uri       string
-		l0        string
-		updatedAt int64
-	}
-	var items []contractItem
-
-	for _, cat := range []string{"profile", "preferences", "feedback"} {
-		nodes, err := s.db.FindByCategory(cat)
-		if err != nil {
-			continue
-		}
-		for _, n := range nodes {
-			if n.URI == "mem://user/profile/communication" {
-				continue // already shown above
-			}
-			if pinnedURIs[n.URI] {
-				continue // already shown in the Pinned section
-			}
-			if n.L0Abstract == "" {
-				continue
-			}
-			items = append(items, contractItem{n.URI, n.L0Abstract, n.UpdatedAt})
-		}
-	}
-
-	// Most recently re-affirmed first; stable so equal timestamps keep the
-	// category-priority iteration order above as the tiebreaker.
-	sort.SliceStable(items, func(i, j int) bool {
-		return items[i].updatedAt > items[j].updatedAt
-	})
-
-	if len(items) > maxContextItems {
-		log.Printf("context: contract exceeds item cap (%d > %d) — least recently re-affirmed dropped; time to curate (merge/retract)", len(items), maxContextItems)
-		items = items[:maxContextItems]
-	}
-
-	var profileLines []string
-	var profileURIs []string
-	itemsUsed := 0
-
-	for _, it := range items {
-		l0 := it.l0
-		if len(l0) > maxItemContext {
-			log.Printf("context: L0 truncated at output (%d → %d chars) — extraction may be drifting", len(l0), maxItemContext)
-			l0 = truncateAtSentence(l0, maxItemContext)
-		}
-
-		line := fmt.Sprintf("- %s\n", l0)
-		if itemBudget-len(line) < 0 {
-			log.Printf("context: budget exhausted after %d items (dropped %d)", itemsUsed, len(items)-itemsUsed)
-			break
-		}
-		itemBudget -= len(line)
-		itemsUsed++
-		profileLines = append(profileLines, line)
-		profileURIs = append(profileURIs, it.uri)
-	}
-
-	if len(profileLines) > 0 {
-		b.WriteString("\n### Your Profile\n")
-		for _, line := range profileLines {
-			b.WriteString(line)
-		}
-		if !preview {
-			for _, uri := range profileURIs {
-				s.events.record("shown", "tray", uri, currentSessionID)
-			}
-		}
-	}
+	// The enumerated contract tray ("### Your Profile" — profile/preferences/
+	// feedback dumped as a ranked list) is removed. It was auto-injected noise:
+	// mis-categorized and cross-project entries leaked into every cold boot, and
+	// nothing downstream depended on it (retrieval is semantic; injection is
+	// earned). The stance that earns the push lives in the synthesized "Working
+	// With You" profile above and in the Pinned section; every other memory is
+	// pull (search) — recognition over recall. A tags/index refactor that lets
+	// the human browse loosely while the agent searches is the next-release
+	// adjustment; see the memory-injection north star ("make categorization
+	// irrelevant, not better").
 
 	// Recent sessions
 	sessions, err := s.db.GetRecentSessions(5)
