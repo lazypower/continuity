@@ -261,6 +261,71 @@ func TestDedup(t *testing.T) {
 	}
 }
 
+// TestDedupMergeForCoverage pins merge-for-coverage: when a terser (but more
+// recent) node would win the cluster, the survivor must still absorb the most
+// complete L1/L2 present in the cluster — dedup collapses restatements without
+// dropping the unique detail a loser held.
+func TestDedupMergeForCoverage(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+
+	longL1 := "The user installs binaries to their local bin directory, deliberately avoiding system directories that require sudo."
+	longL2 := "Long-form detail about the install-location preference and its rationale, retained across sessions."
+
+	// Same L0 pair TestDedup proves clusters at 0.70; the detailed node carries
+	// far more L1/L2 than the terse one.
+	terse := &store.MemNode{
+		URI: "mem://user/preferences/install-local-bin", NodeType: "leaf", Category: "preferences",
+		L0Abstract: "Install binaries to ~/.local/bin not system directories",
+		L1Overview: "Terse.", L2Content: "",
+	}
+	detailed := &store.MemNode{
+		URI: "mem://user/preferences/install-to-local-bin", NodeType: "leaf", Category: "preferences",
+		L0Abstract: "Install binaries to ~/.local/bin instead of /usr/local/bin",
+		L1Overview: longL1, L2Content: longL2,
+	}
+	embedder, _ := NewHashEmbedder(0)
+	for _, n := range []*store.MemNode{terse, detailed} {
+		if err := db.CreateNode(n); err != nil {
+			t.Fatal(err)
+		}
+		vec, _ := embedder.Embed(ctx, n.L0Abstract)
+		db.SaveVector(n.ID, vec, embedder.Model())
+	}
+
+	// Force the TERSE node strictly newer so it WINS keeper selection — the merge
+	// must then pull the detailed loser's l1/l2 across. Without this, timing could
+	// make `detailed` the keeper and the test would pass without ever exercising
+	// merge-for-coverage (codex P3).
+	if _, err := db.Exec(`UPDATE mem_nodes SET updated_at = updated_at + 100000 WHERE id = ?`, terse.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := New(db, nil)
+	eng.SetEmbedder(embedder)
+
+	removed, err := eng.Dedup(ctx, 0.70)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("expected exactly 1 duplicate removed, got %d", removed)
+	}
+
+	// Whichever URI survived, it must carry the most complete L1/L2 — no unique
+	// detail dropped even if the terser node was the keeper.
+	leaves, _ := db.FindByCategory("preferences")
+	if len(leaves) != 1 {
+		t.Fatalf("expected 1 surviving preference, got %d", len(leaves))
+	}
+	if leaves[0].L1Overview != longL1 {
+		t.Errorf("survivor l1 = %q, want most complete %q", leaves[0].L1Overview, longL1)
+	}
+	if leaves[0].L2Content != longL2 {
+		t.Errorf("survivor l2 = %q, want most complete %q", leaves[0].L2Content, longL2)
+	}
+}
+
 func TestDedupNoEmbedder(t *testing.T) {
 	db := testDB(t)
 	eng := New(db, nil)
