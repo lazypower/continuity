@@ -35,4 +35,5 @@ func init() {
 	rootCmd.AddCommand(extractCmd)
 	rootCmd.AddCommand(snapshotCmd)
 	rootCmd.AddCommand(doctorCmd)
+	rootCmd.AddCommand(mcpCmd)
 }
