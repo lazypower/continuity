@@ -693,3 +693,52 @@ func TestExtractSessionRouteAcceptsForce(t *testing.T) {
 		t.Fatalf("status = %d, want 202; body: %s", w.Code, w.Body.String())
 	}
 }
+
+// TestExtractSessionRouteSkipsWhenAutoOff pins the default behavior: with auto
+// session extraction off (the default), a non-force request — the Stop/End hook
+// path — is accepted but skipped, enqueuing nothing. This is what silences the
+// high-noise transcript-guessing path.
+func TestExtractSessionRouteSkipsWhenAutoOff(t *testing.T) {
+	srv := testServerWithEngine(t) // autoExtract defaults to false
+	srv.db.InitSession("extract-off", "proj")
+
+	body := `{"transcript_path":"/nonexistent/transcript.jsonl"}`
+	req := newTestRequest("POST", "/api/sessions/extract-off/extract", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); !strings.Contains(got, "extraction_disabled") {
+		t.Fatalf("body = %q, want extraction_disabled", got)
+	}
+	if job, err := srv.db.NextExtraction(maxExtractionAttempts); err != nil {
+		t.Fatalf("NextExtraction: %v", err)
+	} else if job != nil {
+		t.Fatalf("expected empty queue, got job kind=%q session=%q", job.Kind, job.SessionID)
+	}
+}
+
+// TestExtractSessionRouteEnabledEnqueuesNonForce verifies the opt-in path:
+// re-enabling auto extraction restores non-force enqueue, so the deprecated
+// pipeline still works for anyone who explicitly turns it back on.
+func TestExtractSessionRouteEnabledEnqueuesNonForce(t *testing.T) {
+	srv := testServerWithEngine(t)
+	srv.SetAutoExtraction(true)
+	srv.db.InitSession("extract-on", "proj")
+
+	body := `{"transcript_path":"/nonexistent/transcript.jsonl"}`
+	req := newTestRequest("POST", "/api/sessions/extract-on/extract", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body: %s", w.Code, w.Body.String())
+	}
+	if job, err := srv.db.NextExtraction(maxExtractionAttempts); err != nil {
+		t.Fatalf("NextExtraction: %v", err)
+	} else if job == nil {
+		t.Fatal("expected an enqueued job, got none")
+	}
+}

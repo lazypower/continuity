@@ -30,6 +30,10 @@ const (
 	envServeBind     = "CONTINUITY_BIND"     // overrides Server.Bind
 	envServeEmbedder = "CONTINUITY_EMBEDDER" // "tfidf" | "ollama" | "none" | "" (auto)
 	envServeGC       = "CONTINUITY_GC"       // "off" (default) | "shadow" | "on"
+
+	// envServeExtractionAuto re-enables the deprecated automatic session-end
+	// extraction (default off). Accepts any strconv.ParseBool value.
+	envServeExtractionAuto = "CONTINUITY_EXTRACTION_AUTO"
 )
 
 // tfidfLexicalNotice is surfaced once at startup whenever the hashed lexical
@@ -178,6 +182,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	srv := server.New(db, eng, VersionString())
+	srv.SetAutoExtraction(cfg.Extraction.Auto)
+	if cfg.Extraction.Auto {
+		fmt.Fprintf(os.Stderr,
+			"  ! extraction.auto ENABLED (deprecated) — automatic session extraction is high-noise "+
+				"and slated for removal; unset %s to disable\n", envServeExtractionAuto)
+	}
 	addr := cfg.ListenAddr()
 
 	httpServer := &http.Server{
@@ -294,6 +304,13 @@ func applyServeEnvOverrides(cfg *config.Config) error {
 			return fmt.Errorf("%s=%q: must be an integer in [0, 65535]", envServePort, v)
 		}
 		cfg.Server.Port = port
+	}
+	if v := strings.TrimSpace(os.Getenv(envServeExtractionAuto)); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("%s=%q: must be a boolean (true/false/1/0)", envServeExtractionAuto, v)
+		}
+		cfg.Extraction.Auto = enabled
 	}
 	return nil
 }

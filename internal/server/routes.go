@@ -143,6 +143,17 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Auto session extraction is OFF by default (high-noise, deprecated). The
+	// Stop/SessionEnd hooks call this with force=false — skip them so the
+	// transcript-guessing path stays quiet. An explicit `continuity extract
+	// --force` (force=true) is the manual override and still runs. The signal
+	// ("remember this") path is a separate endpoint and unaffected.
+	if !s.autoExtract && !req.Force {
+		w.Header().Set("Content-Type", "application/json")
+		encodeJSON(w, map[string]string{"status": "extraction_disabled"})
+		return
+	}
+
 	// Durable enqueue — the worker drains the queue and deletes each row only on
 	// success, so a crash or restart mid-extraction replays instead of losing the
 	// session (H1).

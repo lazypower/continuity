@@ -43,6 +43,11 @@ func setupHookE2E(t *testing.T) *hookE2E {
 	dbPath := filepath.Join(workDir, "test.db")
 
 	serverURL, env := testharness.HermeticEnv(t, workDir, dbPath, 0)
+	// These e2e tests validate the automatic session-extraction pipeline end to
+	// end. That path is off by default now (deprecated, high-noise), so opt the
+	// hermetic server into it explicitly — otherwise the Stop/End hooks POST
+	// /extract with force=false and the server correctly skips them.
+	env = append(env, "CONTINUITY_EXTRACTION_AUTO=1")
 	srv := testharness.StartServeProcess(t, bin, env)
 	t.Cleanup(srv.Stop)
 	testharness.WaitForReady(t, serverURL+"/api/health")

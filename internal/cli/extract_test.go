@@ -13,9 +13,16 @@ import (
 	"github.com/lazypower/continuity/internal/store"
 )
 
-// extractTestServer stands up an in-memory server and points the CLI client
-// at it via CONTINUITY_URL. Mirrors showTestServer.
+// extractTestServer stands up an in-memory server with auto extraction ENABLED
+// (so the non-force CLI happy paths still queue) and points the CLI client at it
+// via CONTINUITY_URL. Mirrors showTestServer.
 func extractTestServer(t *testing.T) *store.DB {
+	return newExtractTestServer(t, true)
+}
+
+// newExtractTestServer is extractTestServer with an explicit auto-extraction
+// toggle, so a test can exercise the default-off skip path too.
+func newExtractTestServer(t *testing.T, auto bool) *store.DB {
 	t.Helper()
 	db, err := store.OpenMemory()
 	if err != nil {
@@ -25,6 +32,7 @@ func extractTestServer(t *testing.T) *store.DB {
 
 	eng := engine.New(db, nil)
 	srv := server.New(db, eng, "test-version")
+	srv.SetAutoExtraction(auto)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 
@@ -83,6 +91,28 @@ func TestExtractCLIWithExplicitTranscript(t *testing.T) {
 	}
 	if !strings.Contains(out, "extraction queued") {
 		t.Errorf("expected queued message, got: %s", out)
+	}
+}
+
+// TestExtractCLIDisabledByDefault pins the default: against a server with auto
+// extraction off, a non-force `continuity extract` reports the skip rather than
+// falsely claiming the job was queued.
+func TestExtractCLIDisabledByDefault(t *testing.T) {
+	db := newExtractTestServer(t, false)
+	db.InitSession("cli-off", "proj")
+	path := writeDummyTranscript(t)
+
+	resetExtractFlags()
+	extractTranscript = path
+
+	out, err := captureStdout(t, func() error {
+		return runExtract(extractCmd, []string{"cli-off"})
+	})
+	if err != nil {
+		t.Fatalf("runExtract: %v", err)
+	}
+	if !strings.Contains(out, "off") || !strings.Contains(out, "--force") {
+		t.Errorf("expected disabled message mentioning --force, got: %s", out)
 	}
 }
 
