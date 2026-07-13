@@ -124,6 +124,13 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 	encodeJSON(w, map[string]string{"status": "ended"})
 }
 
+// StatusExtractionDisabled is the response status returned by
+// POST /api/sessions/{id}/extract when automatic extraction is off and the
+// request is not forced. It is a stable part of the HTTP contract — asserted by
+// the route tests and consumed by `continuity extract` — not merely a string the
+// CLI happens to recognize.
+const StatusExtractionDisabled = "extraction_disabled"
+
 func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "sessionID")
 
@@ -140,6 +147,18 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		encodeJSON(w, map[string]string{"error": "engine not configured"})
+		return
+	}
+
+	// Auto session extraction is OFF by default: its usefulness is unmeasured and
+	// its writes are not provenance-distinguishable from authored ones. The
+	// Stop/SessionEnd hooks call this with force=false — skip them so the ambient
+	// transcript-inference path stays off. An explicit `continuity extract --force`
+	// (force=true) is the manual override and still runs. The signal ("remember
+	// this") path is a separate endpoint and unaffected.
+	if !s.autoExtract && !req.Force {
+		w.Header().Set("Content-Type", "application/json")
+		encodeJSON(w, map[string]string{"status": StatusExtractionDisabled})
 		return
 	}
 

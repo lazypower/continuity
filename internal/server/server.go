@@ -34,6 +34,14 @@ type Server struct {
 	// runJob executes one queued job. Defaults to runExtractionJob (needs a live
 	// engine); overridable in tests to drive the drain loop without an LLM.
 	runJob func(*store.ExtractionJob) error
+
+	// autoExtract gates automatic session-end extraction. Default false: the
+	// Stop/SessionEnd hooks POST /extract with force=false, and handleExtractSession
+	// skips those when this is off, so the ambient transcript-inference path stays
+	// off by default (unmeasured usefulness, non-provenance-distinguishable writes).
+	// `continuity extract --force` (force=true) and the signal path are unaffected.
+	// Set via SetAutoExtraction from config.Extraction.Auto.
+	autoExtract bool
 }
 
 // New creates a new Server with the given database, engine, and version string.
@@ -56,6 +64,13 @@ func New(db *store.DB, eng *engine.Engine, version string) *Server {
 	s.routes()
 	return s
 }
+
+// SetAutoExtraction toggles automatic session-end extraction. When false (the
+// default), handleExtractSession skips non-force session jobs — the Stop/End
+// hooks (force=false) stop triggering the high-noise transcript-guessing path,
+// while `continuity extract --force` and the signal path remain available.
+// See config.ExtractionConfig for the deprecation rationale.
+func (s *Server) SetAutoExtraction(enabled bool) { s.autoExtract = enabled }
 
 // Close releases the server's background resources (the telemetry recorder).
 // Safe to call once; telemetry flush is bounded, never blocking shutdown.
