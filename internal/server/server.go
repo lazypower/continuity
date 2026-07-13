@@ -37,9 +37,10 @@ type Server struct {
 
 	// autoExtract gates automatic session-end extraction. Default false: the
 	// Stop/SessionEnd hooks POST /extract with force=false, and handleExtractSession
-	// skips those when this is off — silencing the high-noise transcript-guessing
-	// path. `continuity extract --force` (force=true) and the signal path are
-	// unaffected. Set via SetAutoExtraction from config.Extraction.Auto.
+	// skips those when this is off, so the ambient transcript-inference path stays
+	// off by default (unmeasured usefulness, non-provenance-distinguishable writes).
+	// `continuity extract --force` (force=true) and the signal path are unaffected.
+	// Set via SetAutoExtraction from config.Extraction.Auto.
 	autoExtract bool
 }
 

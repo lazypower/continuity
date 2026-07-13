@@ -94,14 +94,15 @@ func runExtract(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("extract: %w", err)
 	}
 
-	// Automatic session extraction is off by default (deprecated). The server
-	// accepts the request but skips it unless --force is set — surface that
-	// plainly rather than falsely reporting the job as queued.
+	// Automatic session extraction is off by default. The server accepts the
+	// request but skips it unless --force is set — surface that plainly rather
+	// than falsely reporting the job as queued. The status string is the server's
+	// stable extraction_disabled contract (server.StatusExtractionDisabled).
 	var resp struct {
 		Status string `json:"status"`
 	}
 	if jsonErr := json.Unmarshal(data, &resp); jsonErr == nil && resp.Status == "extraction_disabled" {
-		fmt.Printf("automatic session extraction is off for %s (deprecated) — re-run with --force to extract it anyway\n", sessionID)
+		fmt.Printf("automatic session extraction is off for %s — re-run with --force to extract it anyway\n", sessionID)
 		return nil
 	}
 

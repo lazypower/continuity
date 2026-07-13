@@ -185,8 +185,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	srv.SetAutoExtraction(cfg.Extraction.Auto)
 	if cfg.Extraction.Auto {
 		fmt.Fprintf(os.Stderr,
-			"  ! extraction.auto ENABLED (deprecated) — automatic session extraction is high-noise "+
-				"and slated for removal; unset %s to disable\n", envServeExtractionAuto)
+			"  ! extraction.auto ENABLED — automatic session extraction is on; it is off by "+
+				"default (unmeasured usefulness, non-provenance-distinguishable writes). "+
+				"Unset %s to return to the default.\n", envServeExtractionAuto)
 	}
 	addr := cfg.ListenAddr()
 

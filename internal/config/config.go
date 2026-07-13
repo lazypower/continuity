@@ -39,11 +39,13 @@ type HooksConfig struct {
 // ExtractionConfig governs automatic memory extraction.
 type ExtractionConfig struct {
 	// Auto enables automatic session-end extraction — the Stop/SessionEnd hooks
-	// asking an LLM to guess memories from the whole transcript. It defaults to
-	// OFF: that path is high-noise and unmeasurable (no provenance distinguishes
-	// an auto-extracted memory from an authored one), so it is on a deprecation
-	// path. Explicit `continuity remember`, the signal ("remember this") path,
-	// and `continuity extract --force` (the manual override) are all unaffected.
+	// asking an LLM to infer memories from the whole transcript. It defaults to
+	// OFF because its usefulness is unmeasured and its writes are not provenance-
+	// distinguishable from authored ones (nodes carry no source_kind): an
+	// always-on, untrusted write path is not a safe default. Retained for explicit
+	// opt-in and compatibility, and may be removed once there is evidence either
+	// way. Explicit `continuity remember`, the signal ("remember this") path, and
+	// `continuity extract --force` (the manual override) are all unaffected.
 	Auto bool `toml:"auto"`
 }
 

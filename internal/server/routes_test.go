@@ -710,8 +710,8 @@ func TestExtractSessionRouteSkipsWhenAutoOff(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 	}
-	if got := w.Body.String(); !strings.Contains(got, "extraction_disabled") {
-		t.Fatalf("body = %q, want extraction_disabled", got)
+	if got := w.Body.String(); !strings.Contains(got, StatusExtractionDisabled) {
+		t.Fatalf("body = %q, want %s", got, StatusExtractionDisabled)
 	}
 	if job, err := srv.db.NextExtraction(maxExtractionAttempts); err != nil {
 		t.Fatalf("NextExtraction: %v", err)
