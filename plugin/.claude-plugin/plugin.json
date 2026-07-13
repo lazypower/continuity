@@ -1,0 +1,12 @@
+{
+  "name": "continuity",
+  "description": "Persistent memory for AI agents — captures what happened and how you work, then injects it into future sessions. Bundles the session hooks and an MCP server exposing the memory tools (remember, search, show, tree, profile, retract).",
+  "version": "0.1.0",
+  "author": {
+    "name": "Chuck Butler",
+    "url": "https://github.com/lazypower"
+  },
+  "homepage": "https://github.com/lazypower/continuity",
+  "repository": "https://github.com/lazypower/continuity",
+  "license": "MIT"
+}
