@@ -1,0 +1,20 @@
+{
+  "description": "Continuity memory integration — capture context during the session and inject it at session start.",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "continuity hook start", "timeout": 10 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "continuity hook submit", "timeout": 10 }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "continuity hook tool", "timeout": 10 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "continuity hook stop", "timeout": 120 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "continuity hook end", "timeout": 10 }] }
+    ]
+  }
+}

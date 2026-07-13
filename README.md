@@ -115,6 +115,14 @@ Drop this in `~/.claude/settings.json`:
 }
 ```
 
+**Register the memory tools (MCP).** So the agent can call memory tools directly — structured arguments, no shell-escaping of multi-line bodies — register the bundled MCP server at user scope:
+
+```bash
+claude mcp add --scope user continuity -- continuity mcp
+```
+
+Restart Claude Code and `remember`, `search`, `show`, `tree`, `profile`, and `retract` become available in every project. The server is a thin client of the running daemon (`continuity serve`). Or install everything as a Claude Code plugin — see [`plugin/`](plugin/) (`.claude-plugin/plugin.json` + `.mcp.json` + `hooks/hooks.json`); test it locally with `claude --plugin-dir ./plugin`.
+
 **3. Initialize memory directives**
 
 ```bash
@@ -407,7 +415,7 @@ continuity-go/
 ├── ui/                        Svelte + Tailwind viewer SPA
 ├── Formula/                   Homebrew formula
 ├── .github/workflows/         CI + release automation
-├── plugin/hooks.json          Claude Code hook definitions
+├── plugin/                    Claude Code plugin (manifest, .mcp.json, hooks/)
 ├── install.sh                 curl-pipe-sh installer
 └── RFC.md                     Full design document
 ```

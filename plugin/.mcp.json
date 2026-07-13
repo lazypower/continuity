@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "continuity": {
+      "type": "stdio",
+      "command": "continuity",
+      "args": ["mcp"]
+    }
+  }
+}
