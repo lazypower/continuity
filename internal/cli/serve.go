@@ -28,7 +28,7 @@ const (
 	envServeDB       = "CONTINUITY_DB"       // overrides Database.Path
 	envServePort     = "CONTINUITY_PORT"     // overrides Server.Port (int)
 	envServeBind     = "CONTINUITY_BIND"     // overrides Server.Bind
-	envServeEmbedder = "CONTINUITY_EMBEDDER" // "tfidf" | "ollama" | "none" | "" (auto)
+	envServeEmbedder = "CONTINUITY_EMBEDDER" // "tfidf" | "ollama" | "model2vec" | "none" | "" (auto)
 	envServeGC       = "CONTINUITY_GC"       // "off" (default) | "shadow" | "on"
 
 	// envServeExtractionAuto re-enables the deprecated automatic session-end
@@ -130,6 +130,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 				}
 				fmt.Fprintf(os.Stderr, "  embedder: tfidf (hashed lexical, forced)\n")
 				fmt.Fprintln(os.Stderr, tfidfLexicalNotice)
+			}
+		case "model2vec":
+			emb, m2vErr := engine.NewModel2VecEmbedder()
+			if m2vErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: model2vec embedder init failed: %v\n", m2vErr)
+			} else {
+				if eng != nil {
+					eng.SetEmbedder(emb)
+				}
+				fmt.Fprintf(os.Stderr, "  embedder: model2vec (%s, semantic, static, forced)\n", emb.Model())
 			}
 		case "none":
 			fmt.Fprintln(os.Stderr, "  embedder: none (forced; dedup-against-retracted gate inactive)")
@@ -317,17 +327,23 @@ func applyServeEnvOverrides(cfg *config.Config) error {
 }
 
 // resolveEmbedderChoice translates the CONTINUITY_EMBEDDER env var into one of
-// {"ollama", "tfidf", "none", "auto"}. Unknown values fall back to "auto" with
-// a warning so a typo never silently bypasses the embedder. The ollamaURL and
-// embeddingModel arguments are unused today; they exist so future validation
-// (e.g. require Ollama reachable when forced) can land without a signature
-// change.
+// {"ollama", "tfidf", "model2vec", "none", "auto"}. Unknown values fall back to
+// "auto" with a warning so a typo never silently bypasses the embedder. The
+// ollamaURL and embeddingModel arguments are unused today; they exist so
+// future validation (e.g. require Ollama reachable when forced) can land
+// without a signature change.
+//
+// "model2vec" is deliberately opt-in only — it is never returned by "auto".
+// Selecting it is what triggers the one-time model download (see
+// engine.NewModel2VecEmbedder); auto's probe order (Ollama, then the hashed
+// lexical fallback) is unchanged so existing installs' vector identity is
+// never silently switched by this addition.
 func resolveEmbedderChoice(ollamaURL, embeddingModel string) string {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(envServeEmbedder)))
 	switch v {
 	case "", "auto":
 		return "auto"
-	case "ollama", "tfidf", "none":
+	case "ollama", "tfidf", "model2vec", "none":
 		return v
 	default:
 		fmt.Fprintf(os.Stderr, "warning: unrecognized %s=%q; falling back to auto\n", envServeEmbedder, v)

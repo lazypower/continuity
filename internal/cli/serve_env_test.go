@@ -97,6 +97,8 @@ func TestResolveEmbedderChoice(t *testing.T) {
 		{"TFIDF", "tfidf"},
 		{"ollama", "ollama"},
 		{"none", "none"},
+		{"model2vec", "model2vec"},
+		{"  MODEL2VEC  ", "model2vec"},
 	}
 	for _, tc := range cases {
 		clearServeEnv(t)

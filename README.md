@@ -245,7 +245,7 @@ Haiku handles bulk extraction. The Claude CLI provider (`claude -p`) is free wit
 
 ## Embedding backends
 
-Continuity needs an embedder for semantic search and for the dedup-against-retracted gate (the safety net that catches a PII-shaped memory being re-written after retraction). Two paths ship today, in probe order:
+Continuity needs an embedder for semantic search and for the dedup-against-retracted gate (the safety net that catches a PII-shaped memory being re-written after retraction). Two paths ship today, in probe order, plus a third opt-in path:
 
 **1. Ollama with `nomic-embed-text` — recommended.**
 
@@ -262,9 +262,13 @@ Zero external dependencies. Used automatically when Ollama is unreachable, so a 
 
 The tradeoff is deliberate: it's a **stable lexical safety net**, not a semantic embedder. Similarity is keyword overlap, not meaning — so it reliably catches a retracted memory being re-written verbatim or near-verbatim (including reformatted PII like `555-123-4567` vs `555 123 4567`), but it won't catch a genuine paraphrase the way a semantic model would.
 
-**Picking a path.** Install Ollama if you want semantic recall — it's the path Continuity is developed against, and it catches paraphrased duplicates the lexical net can't. The built-in fallback is a sound default when you can't run a daemon: the retraction gate works, search works, nothing drifts; you trade semantic recall for zero dependencies.
+**3. Built-in model2vec (`potion-retrieval-32M`) — opt-in, semantic, no daemon.**
 
-**Forcing a backend.** `CONTINUITY_EMBEDDER` overrides the auto-probe: `ollama`, `tfidf` (the hashed lexical fallback), `none` (no embedder — disables semantic search *and* the retraction gate), or `auto` (default: Ollama if reachable, else the fallback).
+A pure-Go static embedder: a fixed lookup-table embedding matrix (~130MB, 512-dim) plus a from-scratch WordPiece tokenizer, no CGO and no new dependencies. `potion-retrieval-32M` is the retrieval-tuned model2vec distillation — stronger on paraphrase-heavy queries than the smaller `potion-base-8M`. Unlike Ollama it needs no running daemon; unlike the hashed lexical fallback its similarity is genuinely semantic (it catches paraphrases). The tradeoff is a one-time model download (fetched to `~/.continuity/models/potion-retrieval-32M/` the first time this backend is selected) and a larger resident matrix than the hash embedder. This is opt-in only — it is not in the auto-probe order, so selecting it never happens by surprise; set `CONTINUITY_EMBEDDER=model2vec` explicitly.
+
+**Picking a path.** Install Ollama if you want the best semantic recall — it's the path Continuity is developed against. Prefer model2vec if you want semantic recall without a daemon dependency. The built-in hashed fallback is a sound default when you can't run either: the retraction gate works, search works, nothing drifts; you trade semantic recall for zero setup.
+
+**Forcing a backend.** `CONTINUITY_EMBEDDER` overrides the auto-probe: `ollama`, `tfidf` (the hashed lexical fallback), `model2vec` (opt-in static semantic embedder, see above), `none` (no embedder — disables semantic search *and* the retraction gate), or `auto` (default: Ollama if reachable, else the hashed fallback — never model2vec).
 
 ## Operator CLI + Health
 

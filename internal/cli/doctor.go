@@ -270,6 +270,8 @@ func resolveActiveEmbedder(db *store.DB, cfg config.Config) (engine.Embedder, er
 		return engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768), nil
 	case "tfidf":
 		return engine.NewHashEmbedder(0)
+	case "model2vec":
+		return engine.NewModel2VecEmbedder()
 	default: // auto: probe Ollama, fall back to the hashed lexical embedder
 		if engine.ProbeOllama(ollamaURL, embeddingModel) {
 			return engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768), nil
