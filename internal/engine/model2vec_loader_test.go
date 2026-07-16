@@ -57,9 +57,9 @@ func TestLoadSafetensorsF32_RoundTrip(t *testing.T) {
 	want := []float32{1.5, -2.25, 0, 3.125, 100.0, -0.5}
 	writeTestSafetensors(t, path, "embeddings", []int{2, 3}, want)
 
-	got, shape, err := loadSafetensorsF32(path, "embeddings")
+	got, shape, err := loadSafetensorsMatrix(path, "embeddings")
 	if err != nil {
-		t.Fatalf("loadSafetensorsF32: %v", err)
+		t.Fatalf("loadSafetensorsMatrix: %v", err)
 	}
 	if len(shape) != 2 || shape[0] != 2 || shape[1] != 3 {
 		t.Fatalf("shape = %v, want [2 3]", shape)
@@ -68,24 +68,95 @@ func TestLoadSafetensorsF32_RoundTrip(t *testing.T) {
 		t.Fatalf("len(got) = %d, want %d", len(got), len(want))
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if got[i] != float64(want[i]) {
 			t.Errorf("got[%d] = %f, want %f", i, got[i], want[i])
 		}
 	}
 }
 
-func TestLoadSafetensorsF32_MissingTensor(t *testing.T) {
+// writeTestSafetensorsI8 builds a minimal valid .safetensors file with a
+// single I8 tensor, for testing the int8 widening path without needing the
+// real ~32MB quantized model file.
+func writeTestSafetensorsI8(t *testing.T, path, tensorName string, shape []int, data []int8) {
+	t.Helper()
+
+	raw := make([]byte, len(data))
+	for i, v := range data {
+		raw[i] = byte(v)
+	}
+
+	header := map[string]safetensorsTensorInfo{
+		tensorName: {
+			Dtype:       "I8",
+			Shape:       shape,
+			DataOffsets: [2]int{0, len(raw)},
+		},
+	}
+	headerBytes, err := json.Marshal(header)
+	if err != nil {
+		t.Fatalf("marshal header: %v", err)
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create %s: %v", path, err)
+	}
+	defer f.Close()
+
+	var lenBuf [8]byte
+	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(headerBytes)))
+	if _, err := f.Write(lenBuf[:]); err != nil {
+		t.Fatalf("write header length: %v", err)
+	}
+	if _, err := f.Write(headerBytes); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	if _, err := f.Write(raw); err != nil {
+		t.Fatalf("write data: %v", err)
+	}
+}
+
+// TestLoadSafetensorsI8_RoundTrip pins the widening behavior the int8 model
+// path depends on: each stored byte is reinterpreted as a signed int8 and
+// widened to float64 AS-IS, with NO dequantization scale applied (see the
+// loadSafetensorsMatrix doc comment for why that is correct rather than a
+// shortcut — model2vec's single per-tensor scale cancels under the
+// embedder's L2 normalization).
+func TestLoadSafetensorsI8_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.safetensors")
+	want := []int8{127, -128, 0, 1, -1, 64}
+	writeTestSafetensorsI8(t, path, "embeddings", []int{2, 3}, want)
+
+	got, shape, err := loadSafetensorsMatrix(path, "embeddings")
+	if err != nil {
+		t.Fatalf("loadSafetensorsMatrix: %v", err)
+	}
+	if len(shape) != 2 || shape[0] != 2 || shape[1] != 3 {
+		t.Fatalf("shape = %v, want [2 3]", shape)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len(got) = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != float64(want[i]) {
+			t.Errorf("got[%d] = %f, want %f", i, got[i], float64(want[i]))
+		}
+	}
+}
+
+func TestLoadSafetensorsMatrix_MissingTensor(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.safetensors")
 	writeTestSafetensors(t, path, "embeddings", []int{1, 2}, []float32{1, 2})
 
-	_, _, err := loadSafetensorsF32(path, "nonexistent")
+	_, _, err := loadSafetensorsMatrix(path, "nonexistent")
 	if err == nil {
 		t.Fatal("expected error for missing tensor name, got nil")
 	}
 }
 
-func TestLoadSafetensorsF32_WrongDtype(t *testing.T) {
+func TestLoadSafetensorsMatrix_UnsupportedDtype(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.safetensors")
 
@@ -101,9 +172,9 @@ func TestLoadSafetensorsF32_WrongDtype(t *testing.T) {
 	f.Write(make([]byte, 8))
 	f.Close()
 
-	_, _, err := loadSafetensorsF32(path, "embeddings")
+	_, _, err := loadSafetensorsMatrix(path, "embeddings")
 	if err == nil {
-		t.Fatal("expected error for non-F32 dtype, got nil")
+		t.Fatal("expected error for unsupported (F16) dtype, got nil")
 	}
 }
 
@@ -123,7 +194,7 @@ func TestLoadSafetensorsF32_TruncatedFile(t *testing.T) {
 	f.Write(make([]byte, 4)) // far short of the declared 400 bytes
 	f.Close()
 
-	_, _, err := loadSafetensorsF32(path, "embeddings")
+	_, _, err := loadSafetensorsMatrix(path, "embeddings")
 	if err == nil {
 		t.Fatal("expected error for truncated tensor data, got nil")
 	}

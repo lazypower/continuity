@@ -5,6 +5,14 @@ Generates internal/engine/testdata/model2vec/parity.json from the REAL
 model2vec Python package, so the Go WordPiece tokenizer + mean-pooling
 reimplementation can be checked byte-exact against ground truth.
 
+Loads the model int8-quantized (quantize_to="int8"), matching what
+continuity ships (see internal/engine/model2vec_embedder.go): the int8
+artifact is 4x smaller than the F32 original with measured-identical
+retrieval quality, because model2vec's int8 quantization uses a single
+per-tensor symmetric scale that cancels out under this embedder's L2
+normalization. Token ids are unaffected by quantization (same tokenizer.json
+either way) — only the pooled vectors differ from an F32-generated fixture.
+
 Usage:
     pip install model2vec
     python3 scripts/gen_model2vec_parity.py
@@ -54,8 +62,8 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "parity.json")
 
-    print(f"Loading {MODEL_NAME} via model2vec...", file=sys.stderr)
-    model = StaticModel.from_pretrained(MODEL_NAME)
+    print(f"Loading {MODEL_NAME} via model2vec (quantize_to=int8)...", file=sys.stderr)
+    model = StaticModel.from_pretrained(MODEL_NAME, quantize_to="int8")
 
     # Sanity: these must all be absent for the "no runtime reweight" assumption
     # the Go loader hard-asserts on. Fail loudly if a future model version adds

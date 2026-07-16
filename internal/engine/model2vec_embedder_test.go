@@ -38,9 +38,9 @@ func loadParityFixture(t *testing.T) map[string]parityFixture {
 // model files from. HERMETICITY ASSUMPTION (documented per the task spec):
 // this test does not perform network I/O and does not shell out to Python — it
 // only reads model.safetensors + tokenizer.json off disk. Those files are
-// ~130MB (safetensors) and ~1.5MB (tokenizer.json), far too large to commit as
-// a repo fixture, so rather than vendoring them into testdata/ this test reads
-// them from the SAME default location the production code uses
+// ~32MB (int8-quantized safetensors) and ~1MB (tokenizer.json), far too large
+// to commit as a repo fixture, so rather than vendoring them into testdata/
+// this test reads them from the SAME default location the production code uses
 // (DefaultModel2VecDir(), i.e. ~/.continuity/models/potion-retrieval-32M/),
 // which can be overridden via CONTINUITY_MODEL2VEC_TEST_DIR for CI images that
 // pre-seed the model elsewhere. If the files are not present, the test SKIPS

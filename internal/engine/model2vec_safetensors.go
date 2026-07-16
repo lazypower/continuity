@@ -19,13 +19,27 @@ type safetensorsTensorInfo struct {
 	DataOffsets [2]int `json:"data_offsets"`
 }
 
-// loadSafetensorsF32 reads a single named F32 tensor out of a .safetensors
-// file and returns it as a row-major []float32 plus its shape.
+// loadSafetensorsMatrix reads a single named tensor out of a .safetensors
+// file and returns it widened to row-major []float64 plus its shape. Two
+// dtypes are supported, matching the two forms the model2vec embedding
+// matrix ships in:
+//
+//   - F32: each 4-byte little-endian value decoded as float32, widened to
+//     float64.
+//   - I8: each signed byte widened to float64 AS-IS, with no dequantization
+//     scale applied. This matches model2vec's own int8 encode path: the
+//     package's int8 quantization uses a single per-tensor symmetric scale
+//     (max|W|/127) that cancels out under L2 normalization, so the saved
+//     int8 artifact carries no scale tensor at all — Python's StaticModel
+//     pools the raw int8 values as float (numpy mean promotes int8->float64)
+//     and normalizes, with no rescale step. Widening here without scaling is
+//     therefore not an approximation; it is the same code path the real
+//     package runs.
 //
 // Format: 8-byte little-endian header length, then that many bytes of JSON
-// header, then the raw tensor bytes (row-major, little-endian) at the
-// offsets the header declares (relative to the end of the header).
-func loadSafetensorsF32(path, tensorName string) (data []float32, shape []int, err error) {
+// header, then the raw tensor bytes (row-major, little-endian for F32) at
+// the offsets the header declares (relative to the end of the header).
+func loadSafetensorsMatrix(path, tensorName string) (data []float64, shape []int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open safetensors %s: %w", path, err)
@@ -58,8 +72,15 @@ func loadSafetensorsF32(path, tensorName string) (data []float32, shape []int, e
 	if !ok {
 		return nil, nil, fmt.Errorf("safetensors file has no tensor %q", tensorName)
 	}
-	if info.Dtype != "F32" {
-		return nil, nil, fmt.Errorf("tensor %q has dtype %q, want F32", tensorName, info.Dtype)
+
+	var elemSize int
+	switch info.Dtype {
+	case "F32":
+		elemSize = 4
+	case "I8":
+		elemSize = 1
+	default:
+		return nil, nil, fmt.Errorf("tensor %q has dtype %q, want F32 or I8", tensorName, info.Dtype)
 	}
 
 	nElems := 1
@@ -69,7 +90,7 @@ func loadSafetensorsF32(path, tensorName string) (data []float32, shape []int, e
 		}
 		nElems *= d
 	}
-	wantBytes := nElems * 4
+	wantBytes := nElems * elemSize
 	gotBytes := info.DataOffsets[1] - info.DataOffsets[0]
 	if gotBytes != wantBytes {
 		return nil, nil, fmt.Errorf("tensor %q data_offsets span %d bytes, want %d for shape %v",
@@ -87,10 +108,20 @@ func loadSafetensorsF32(path, tensorName string) (data []float32, shape []int, e
 		return nil, nil, fmt.Errorf("read tensor %q data: %w", tensorName, err)
 	}
 
-	out := make([]float32, nElems)
-	for i := range out {
-		bits := binary.LittleEndian.Uint32(raw[i*4 : i*4+4])
-		out[i] = math.Float32frombits(bits)
+	out := make([]float64, nElems)
+	switch info.Dtype {
+	case "F32":
+		for i := range out {
+			bits := binary.LittleEndian.Uint32(raw[i*4 : i*4+4])
+			out[i] = float64(math.Float32frombits(bits))
+		}
+	case "I8":
+		for i := range out {
+			// raw[i] is the two's-complement byte; int8() reinterprets it as
+			// signed, matching numpy's int8 dtype. No dequant scale — see the
+			// doc comment above.
+			out[i] = float64(int8(raw[i]))
+		}
 	}
 	return out, info.Shape, nil
 }

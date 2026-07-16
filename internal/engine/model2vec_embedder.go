@@ -16,33 +16,44 @@ import (
 // needs no running daemon, and unlike HashEmbedder its similarity is semantic
 // rather than lexical (keyword overlap) — the tradeoff is a one-time model
 // download and a larger resident matrix (potion-retrieval-32M is a 512-dim,
-// 63091-token matrix).
+// 63091-token matrix, shipped int8-quantized at ~32MB).
+//
+// The matrix ships int8-quantized (~32MB vs ~130MB for F32), with measured-
+// identical retrieval quality: model2vec's int8 quantization uses a single
+// per-tensor symmetric scale (max|W|/127) that CANCELS under this embedder's
+// L2 normalization, so the saved artifact carries no scale tensor and the
+// int8 values are widened to float64 as-is (see loadSafetensorsMatrix). The
+// loader also accepts F32 matrices for compatibility with any manually
+// substituted model file.
 //
 // Inference is: tokenize (WordPiece, add_special_tokens=false) -> drop [UNK]
 // ids -> mean-pool the surviving rows of the embedding matrix -> L2 normalize.
 // This matches Python's model2vec.StaticModel.encode() exactly (verified
 // against internal/engine/testdata/model2vec/parity.json, generated from the
-// real package) because potion-retrieval-32M carries no runtime reweighting:
-// its `weights`, `token_mapping`, and `vocabulary_quantization` are all absent,
-// so the matrix is used as-is with no extra step. loadModel2Vec asserts this
-// (fails closed) rather than silently producing wrong vectors for a future
-// model that DOES carry one of those.
+// real package against the int8-quantized model) because potion-retrieval-32M
+// carries no runtime reweighting: its `weights`, `token_mapping`, and
+// `vocabulary_quantization` are all absent, so the matrix is used as-is with
+// no extra step. loadModel2Vec asserts this (fails closed) rather than
+// silently producing wrong vectors for a future model that DOES carry one of
+// those.
 type Model2VecEmbedder struct {
 	tokenizer *wordpieceTokenizer
-	matrix    []float32 // row-major [vocabSize x dims]
+	matrix    []float64 // row-major [vocabSize x dims]; widened from the on-disk dtype (int8 or float32), see loadSafetensorsMatrix
 	vocabSize int
 	dims      int
 	modelName string // e.g. "potion-retrieval-32M", used only for Model()/paths
 }
 
-// model2vecHFRepo is the Hugging Face repo this backend downloads from. The
-// spec's NON-GOAL is explicit: this is not a general model2vec loader, it is
-// wired to exactly this one pinned model. potion-retrieval-32M is the
-// retrieval-tuned distillation (stronger on paraphrase-heavy queries than
-// potion-base-8M); it shares the exact same inference path — same bge-base-en-v1.5
-// WordPiece tokenizer, same BertNormalizer settings, same "##" prefix, same
-// unk_id, and no runtime reweighting — so only the pinned name/repo differ.
-const model2vecHFRepo = "minishlab/potion-retrieval-32M"
+// Provenance: this backend's weights are sourced from the Hugging Face model
+// minishlab/potion-retrieval-32M (MIT). Our GitHub release re-hosts an
+// int8-quantized re-export of it (see model2vecDownloadURLs) rather than
+// downloading from HF directly. NON-GOAL (explicit): this is not a general
+// model2vec loader, it is wired to exactly this one pinned model.
+// potion-retrieval-32M is the retrieval-tuned distillation (stronger on
+// paraphrase-heavy queries than potion-base-8M); it shares the exact same
+// inference path — same bge-base-en-v1.5 WordPiece tokenizer, same
+// BertNormalizer settings, same "##" prefix, same unk_id, and no runtime
+// reweighting.
 
 // Model2VecModelName is the model this backend is pinned to. Exported so CLI
 // wiring (model dir resolution, doctor, etc.) can reference the same name
@@ -76,7 +87,7 @@ func (m *Model2VecEmbedder) Embed(_ context.Context, text string) ([]float64, er
 		}
 		row := m.matrix[int(id)*m.dims : int(id)*m.dims+m.dims]
 		for i, v := range row {
-			sum[i] += float64(v)
+			sum[i] += v
 		}
 		count++
 	}
@@ -106,7 +117,7 @@ func LoadModel2VecEmbedder(modelDir string) (*Model2VecEmbedder, error) {
 		return nil, fmt.Errorf("load model2vec tokenizer: %w", err)
 	}
 
-	matrix, shape, err := loadSafetensorsF32(tensorPath, "embeddings")
+	matrix, shape, err := loadSafetensorsMatrix(tensorPath, "embeddings")
 	if err != nil {
 		return nil, fmt.Errorf("load model2vec embedding matrix: %w", err)
 	}
@@ -166,10 +177,15 @@ func DefaultModel2VecDir() (string, error) {
 	return filepath.Join(home, ".continuity", "models", Model2VecModelName), nil
 }
 
-// model2vecDownloadURLs returns the two artifact URLs for the pinned HF repo.
+// model2vecDownloadURLs returns the two artifact URLs this backend downloads
+// from: continuity's own GitHub release, not Hugging Face directly. We host
+// the int8-quantized matrix (~32MB, 4x smaller than the F32 original, with
+// measured-identical retrieval quality — see the package doc comment) plus
+// the unmodified tokenizer.json (byte-identical to the upstream bge-base
+// WordPiece tokenizer, so token ids are unaffected by the quantization).
 func model2vecDownloadURLs() (safetensorsURL, tokenizerURL string) {
-	base := "https://huggingface.co/" + model2vecHFRepo + "/resolve/main/"
-	return base + "model.safetensors", base + "tokenizer.json"
+	const base = "https://github.com/lazypower/continuity/releases/download/models-v1/"
+	return base + "potion-retrieval-32M.model.safetensors", base + "potion-retrieval-32M.tokenizer.json"
 }
 
 // EnsureModel2VecFiles downloads model.safetensors and tokenizer.json into
