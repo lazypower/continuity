@@ -22,13 +22,14 @@ import (
 
 // Server-side environment variables, read at serve start. These exist to make
 // hermetic subprocess tests possible (and pave the way for TFIDF CI coverage),
-// not as the production configuration surface — Phase 1 config.toml loading
-// remains the path for normal use.
+// and as an escape-hatch override for one-off testing — config.toml
+// ([embedder].backend etc.) is the persistent configuration surface for normal
+// use; see selectEmbedder for the full precedence between the two.
 const (
 	envServeDB       = "CONTINUITY_DB"       // overrides Database.Path
 	envServePort     = "CONTINUITY_PORT"     // overrides Server.Port (int)
 	envServeBind     = "CONTINUITY_BIND"     // overrides Server.Bind
-	envServeEmbedder = "CONTINUITY_EMBEDDER" // "tfidf" | "ollama" | "none" | "" (auto)
+	envServeEmbedder = "CONTINUITY_EMBEDDER" // "tfidf" | "ollama" | "model2vec" | "none" | "" (auto); wins over config [embedder].backend
 	envServeGC       = "CONTINUITY_GC"       // "off" (default) | "shadow" | "on"
 
 	// envServeExtractionAuto re-enables the deprecated automatic session-end
@@ -51,7 +52,10 @@ var serveCmd = &cobra.Command{
 }
 
 func runServe(cmd *cobra.Command, args []string) error {
-	cfg := config.Default()
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
 
 	// Check for ANTHROPIC_API_KEY env override
 	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
@@ -112,47 +116,25 @@ func runServe(cmd *cobra.Command, args []string) error {
 			embeddingModel = "nomic-embed-text"
 		}
 
-		choice := resolveEmbedderChoice(ollamaURL, embeddingModel)
-		switch choice {
-		case "ollama":
-			emb := engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768)
-			if eng != nil {
-				eng.SetEmbedder(emb)
-			}
-			fmt.Fprintf(os.Stderr, "  embedder: ollama (%s)\n", embeddingModel)
-		case "tfidf":
-			emb, tfidfErr := engine.NewHashEmbedder(0)
-			if tfidfErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: tfidf embedder init failed: %v\n", tfidfErr)
-			} else {
-				if eng != nil {
-					eng.SetEmbedder(emb)
-				}
-				fmt.Fprintf(os.Stderr, "  embedder: tfidf (hashed lexical, forced)\n")
-				fmt.Fprintln(os.Stderr, tfidfLexicalNotice)
-			}
-		case "none":
-			fmt.Fprintln(os.Stderr, "  embedder: none (forced; dedup-against-retracted gate inactive)")
-		default:
-			// auto: probe Ollama, fall back to the hashed lexical embedder
-			if engine.ProbeOllama(ollamaURL, embeddingModel) {
-				emb := engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768)
-				if eng != nil {
-					eng.SetEmbedder(emb)
-				}
-				fmt.Fprintf(os.Stderr, "  embedder: ollama (%s)\n", embeddingModel)
-			} else {
-				emb, tfidfErr := engine.NewHashEmbedder(0)
-				if tfidfErr != nil {
-					fmt.Fprintf(os.Stderr, "warning: tfidf embedder init failed: %v\n", tfidfErr)
-				} else {
-					if eng != nil {
-						eng.SetEmbedder(emb)
-					}
-					fmt.Fprintf(os.Stderr, "  embedder: tfidf (hashed lexical, fallback)\n")
-					fmt.Fprintln(os.Stderr, tfidfLexicalNotice)
-				}
-			}
+		declaredIdentity, _, identErr := db.VectorIdentity()
+		if identErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: read corpus vector identity failed: %v\n", identErr)
+			declaredIdentity = ""
+		}
+
+		emb, logLine := selectEmbedder(embedderSelectionInput{
+			EnvOverride:      strings.ToLower(strings.TrimSpace(os.Getenv(envServeEmbedder))),
+			ConfigBackend:    strings.ToLower(strings.TrimSpace(cfg.Embedder.Backend)),
+			DeclaredIdentity: declaredIdentity,
+			OllamaURL:        ollamaURL,
+			EmbeddingModel:   embeddingModel,
+		})
+		if emb != nil && eng != nil {
+			eng.SetEmbedder(emb)
+		}
+		fmt.Fprintln(os.Stderr, logLine)
+		if emb != nil && emb.Model() == "hashtf" {
+			fmt.Fprintln(os.Stderr, tfidfLexicalNotice)
 		}
 
 		// Reconcile the active embedder against the corpus's declared vector
@@ -314,23 +296,4 @@ func applyServeEnvOverrides(cfg *config.Config) error {
 		cfg.Extraction.Auto = enabled
 	}
 	return nil
-}
-
-// resolveEmbedderChoice translates the CONTINUITY_EMBEDDER env var into one of
-// {"ollama", "tfidf", "none", "auto"}. Unknown values fall back to "auto" with
-// a warning so a typo never silently bypasses the embedder. The ollamaURL and
-// embeddingModel arguments are unused today; they exist so future validation
-// (e.g. require Ollama reachable when forced) can land without a signature
-// change.
-func resolveEmbedderChoice(ollamaURL, embeddingModel string) string {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(envServeEmbedder)))
-	switch v {
-	case "", "auto":
-		return "auto"
-	case "ollama", "tfidf", "none":
-		return v
-	default:
-		fmt.Fprintf(os.Stderr, "warning: unrecognized %s=%q; falling back to auto\n", envServeEmbedder, v)
-		return "auto"
-	}
 }

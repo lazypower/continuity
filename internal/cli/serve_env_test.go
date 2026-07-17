@@ -86,39 +86,30 @@ func TestApplyServeEnvOverrides_WhitespaceIgnored(t *testing.T) {
 	}
 }
 
-func TestResolveEmbedderChoice(t *testing.T) {
+func TestNormalizeBackend(t *testing.T) {
 	cases := []struct {
 		in, want string
 	}{
 		{"", "auto"},
 		{"auto", "auto"},
-		{"AUTO", "auto"},
-		{"  tfidf  ", "tfidf"},
-		{"TFIDF", "tfidf"},
+		{"tfidf", "hashtf"},
+		{"hashtf", "hashtf"},
 		{"ollama", "ollama"},
 		{"none", "none"},
+		{"model2vec", "model2vec"},
 	}
 	for _, tc := range cases {
-		clearServeEnv(t)
-		t.Setenv(envServeEmbedder, tc.in)
-		got := resolveEmbedderChoice("ignored", "ignored")
-		if got != tc.want {
-			t.Errorf("resolveEmbedderChoice(env=%q) = %q, want %q", tc.in, got, tc.want)
+		if got := normalizeBackend(tc.in); got != tc.want {
+			t.Errorf("normalizeBackend(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }
 
-func TestResolveEmbedderChoice_UnknownFallsBackToAuto(t *testing.T) {
-	clearServeEnv(t)
-	t.Setenv(envServeEmbedder, "openai")
-	got := resolveEmbedderChoice("ignored", "ignored")
-	if got != "auto" {
-		t.Errorf("unknown value should fall back to auto; got %q", got)
-	}
-	// A typo MUST NOT silently translate to a different valid choice — verify
-	// at least that we didn't accept "openai" as a real selection.
-	if got == "openai" {
-		t.Error("resolveEmbedderChoice must not return non-canonical values")
+func TestNormalizeBackend_UnknownPassesThrough(t *testing.T) {
+	// Unknown values pass through unchanged so selectEmbedder can detect and
+	// warn on them rather than silently mis-selecting a known backend.
+	if got := normalizeBackend("openai"); got != "openai" {
+		t.Errorf("normalizeBackend(openai) = %q, want passthrough %q", got, "openai")
 	}
 }
 

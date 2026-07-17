@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/lazypower/continuity/internal/config"
 	"github.com/lazypower/continuity/internal/engine"
@@ -118,7 +119,11 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	}
 	defer db.Close()
 
-	emb, err := resolveActiveEmbedder(db, config.Default())
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	emb, err := resolveActiveEmbedder(db, cfg)
 	if err != nil {
 		return fmt.Errorf("resolve embedder: %w", err)
 	}
@@ -249,10 +254,14 @@ func runDoctorRepair(db *store.DB, emb engine.Embedder, apply bool, srv serverId
 	return nil
 }
 
-// resolveActiveEmbedder builds the embedder the server would use, by the same
-// env/probe logic as `serve` (resolveEmbedderChoice + ProbeOllama), so doctor
-// reports reality rather than a guess. Returns (nil, nil) for the "none"
-// choice. Read-only.
+// resolveActiveEmbedder builds the embedder `serve` would construct, by the
+// exact same precedence (selectEmbedder: env override > config
+// [embedder].backend > declared corpus identity > fresh-corpus default), so
+// doctor reports reality rather than a guess. Returns (nil, nil) when nothing
+// could be constructed (the "none" choice, or a failed construction — see
+// selectEmbedder's doc comment on why it never substitutes a different
+// embedder on failure). Read-only: never writes the corpus vector identity or
+// touches vectors.
 func resolveActiveEmbedder(db *store.DB, cfg config.Config) (engine.Embedder, error) {
 	ollamaURL := cfg.LLM.OllamaURL
 	if ollamaURL == "" {
@@ -263,19 +272,19 @@ func resolveActiveEmbedder(db *store.DB, cfg config.Config) (engine.Embedder, er
 		embeddingModel = "nomic-embed-text"
 	}
 
-	switch resolveEmbedderChoice(ollamaURL, embeddingModel) {
-	case "none":
-		return nil, nil
-	case "ollama":
-		return engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768), nil
-	case "tfidf":
-		return engine.NewHashEmbedder(0)
-	default: // auto: probe Ollama, fall back to the hashed lexical embedder
-		if engine.ProbeOllama(ollamaURL, embeddingModel) {
-			return engine.NewOllamaEmbedder(ollamaURL, embeddingModel, 768), nil
-		}
-		return engine.NewHashEmbedder(0)
+	declared, _, err := db.VectorIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("read corpus vector identity: %w", err)
 	}
+
+	emb, _ := selectEmbedder(embedderSelectionInput{
+		EnvOverride:      strings.ToLower(strings.TrimSpace(os.Getenv(envServeEmbedder))),
+		ConfigBackend:    strings.ToLower(strings.TrimSpace(cfg.Embedder.Backend)),
+		DeclaredIdentity: declared,
+		OllamaURL:        ollamaURL,
+		EmbeddingModel:   embeddingModel,
+	})
+	return emb, nil
 }
 
 func buildDoctorReport(emb engine.Embedder, leaves []store.MemNode, vectors []store.VectorRecord, declared string, srv serverIdentity) doctorReport {
