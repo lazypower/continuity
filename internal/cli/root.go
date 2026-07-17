@@ -36,4 +36,5 @@ func init() {
 	rootCmd.AddCommand(snapshotCmd)
 	rootCmd.AddCommand(doctorCmd)
 	rootCmd.AddCommand(mcpCmd)
+	rootCmd.AddCommand(embedderCmd)
 }
