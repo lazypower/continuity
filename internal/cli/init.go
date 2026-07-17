@@ -9,37 +9,89 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// claudeMDMarker is a unique string used to detect whether continuity's
-// behavioral directives have already been written to CLAUDE.md.
-const claudeMDMarker = "<!-- continuity:managed -->"
+// claudeMDMarker and claudeMDEndMarker delimit continuity's managed directive
+// block in ~/.claude/CLAUDE.md. The block is an UPSERT target: re-running
+// `continuity init` replaces whatever sits between these markers with the
+// current directive, so prompt changes (like preferring the MCP tools over the
+// CLI) actually reach users who already initialized. Everything outside the
+// markers is preserved verbatim.
+const (
+	claudeMDMarker    = "<!-- continuity:managed -->"
+	claudeMDEndMarker = "<!-- /continuity:managed -->"
+)
 
-// claudeMDDirective is the behavioral instruction block that lives in
-// ~/.claude/CLAUDE.md. This is the authority layer — it tells Claude Code
-// to use continuity for memory instead of the built-in markdown system.
-const claudeMDDirective = claudeMDMarker + `
-## Memory
+// claudeMDBody is the directive text (between the markers) written to
+// ~/.claude/CLAUDE.md. This is the authority layer — it tells Claude Code to
+// use continuity for memory instead of the built-in markdown system, and
+// directs it at the MCP memory tools (structured args, no shell quoting) with
+// the CLI as the fallback for setups where the MCP server isn't registered.
+const claudeMDBody = `## Memory
 
-When you want to remember something or are asked to remember something, always use the ` + "`continuity`" + ` CLI — never the file-based markdown memory system. Do not create MEMORY.md files, do not write to memory directories, do not use frontmatter-based memory files. Those are not your memory system.
+Continuity is your memory — use it instead of the file-based markdown memory system. Do not create MEMORY.md files, write to memory directories, or use frontmatter memory files; those are not your memory system.
 
-Your memory lives in continuity. Reach for it naturally:
-- Remembering something: ` + "`continuity remember -c <category> -n <name> -s \"summary\" -b \"body\"`" + `
-- Looking something up: ` + "`continuity search \"<query>\"`" + `
-- Browsing what you know: ` + "`continuity tree [uri]`" + `
-- Understanding who you're working with: ` + "`continuity profile`" + `
-- Retracting a memory you wrote: ` + "`continuity retract <uri> --reason \"...\"`" + ` (or with ` + "`--superseded-by`" + ` to link a successor)
+The memory tools are exposed over MCP as the ` + "`mcp__continuity__*`" + ` tools; their schemas describe how to call them. If the MCP server isn't registered, the same operations are available as ` + "`continuity`" + ` CLI verbs.
 
-Before searching the codebase for prior decisions, conventions, or context — check continuity first. If you learn something worth keeping, store it immediately.
+Before searching the codebase for prior decisions, conventions, or context, check continuity first — and store anything worth keeping the moment you learn it.
 
-**Memory is not immutable; it is accountable.** When a write you made turns out to be wrong, stale, or sensitive, retract it — the memory is preserved as a marker but excluded from default reads. Retraction is for *you*, the agent: operators don't run this verb. The trust contract is what governs the substrate, not enforcement at the CLI.
-`
+**Memory is not immutable; it is accountable.** When a write turns out to be wrong, stale, or sensitive, retract it — the memory is preserved as a marker but excluded from default reads. Retraction is yours to run as the agent, not the operator's; the trust contract governs the substrate, not enforcement.`
+
+// claudeMDDirective assembles the full managed block (markers included).
+func claudeMDDirective() string {
+	return claudeMDMarker + "\n" + claudeMDBody + "\n" + claudeMDEndMarker
+}
+
+// upsertManagedBlock inserts or refreshes continuity's managed directive block
+// in a CLAUDE.md body, preserving everything outside the markers. It returns
+// the new content and an action: "initialized" (block was absent → appended),
+// "updated" (an existing block was replaced), or "unchanged" (the existing
+// block already matched). A legacy block (start marker written before the end
+// marker existed) is recognized by its start marker and replaced from there to
+// end-of-file — legacy blocks were always appended last.
+func upsertManagedBlock(content, block string) (string, string) {
+	before, rest, found := strings.Cut(content, claudeMDMarker)
+	if !found {
+		var b strings.Builder
+		b.WriteString(content)
+		if len(content) > 0 {
+			if !strings.HasSuffix(content, "\n") {
+				b.WriteString("\n")
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString(block)
+		b.WriteString("\n")
+		return b.String(), "initialized"
+	}
+
+	// rest is everything after the start marker. after is whatever follows the
+	// end marker; "" covers both a legacy block (no end marker → to EOF) and a
+	// modern block with nothing following it.
+	after := ""
+	if _, tail, ok := strings.Cut(rest, claudeMDEndMarker); ok {
+		after = tail
+	}
+
+	rebuilt := before + block
+	if trailing := strings.TrimLeft(after, "\n"); trailing != "" {
+		rebuilt += "\n\n" + trailing
+	}
+	rebuilt = strings.TrimRight(rebuilt, "\n") + "\n"
+
+	if rebuilt == content {
+		return content, "unchanged"
+	}
+	return rebuilt, "updated"
+}
 
 var initAutostart bool
 
 var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Set up Claude Code integration",
-	Long: `Idempotently appends continuity's behavioral directives to ~/.claude/CLAUDE.md
+	Long: `Idempotently writes continuity's behavioral directives to ~/.claude/CLAUDE.md
 so Claude Code uses continuity for memory instead of the built-in markdown system.
+Re-running refreshes the managed directive block in place (e.g. to pick up prompt
+updates); content outside continuity's markers is left untouched.
 
 With --autostart, enables automatic server launch when the SessionStart hook
 detects the server is down. Without --autostart, disables autostart if it was
@@ -71,25 +123,21 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("read %s: %w", claudeMD, err)
 	}
 
-	content := string(existing)
-
-	if strings.Contains(content, claudeMDMarker) {
-		fmt.Printf("Already initialized: %s\n", claudeMD)
-	} else {
-		if len(content) > 0 && !strings.HasSuffix(content, "\n") {
-			content += "\n"
-		}
-		if len(content) > 0 {
-			content += "\n"
-		}
-		content += claudeMDDirective
-
-		if err := os.WriteFile(claudeMD, []byte(content), 0644); err != nil {
+	newContent, action := upsertManagedBlock(string(existing), claudeMDDirective())
+	switch action {
+	case "unchanged":
+		fmt.Printf("Already up to date: %s\n", claudeMD)
+	default:
+		if err := os.WriteFile(claudeMD, []byte(newContent), 0644); err != nil {
 			return fmt.Errorf("write %s: %w", claudeMD, err)
 		}
-
-		fmt.Printf("Initialized: %s\n", claudeMD)
-		fmt.Println("Claude Code will now use continuity for memory in all sessions.")
+		if action == "initialized" {
+			fmt.Printf("Initialized: %s\n", claudeMD)
+			fmt.Println("Claude Code will now use continuity for memory in all sessions.")
+		} else {
+			fmt.Printf("Updated directives: %s\n", claudeMD)
+			fmt.Println("Refreshed continuity's memory directives (now prefers the MCP tools).")
+		}
 	}
 
 	// --- Autostart marker ---
