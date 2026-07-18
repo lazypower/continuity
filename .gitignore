@@ -32,3 +32,4 @@ cmd/continuity/ui/
 # tiny, seeded images minted from real released binaries (not user data) and
 # feed the hermetic migration regression test. See scripts/gen-migration-fixtures.sh.
 !internal/store/testdata/migration/**/*.db
+.notes
