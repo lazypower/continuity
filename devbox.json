@@ -1,6 +1,6 @@
 {
   "packages": [
-    "go@1.24",
+    "go@1.26",
     "sqlite@latest",
     "nodejs@22"
   ],
