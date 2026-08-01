@@ -107,13 +107,25 @@ label, along with the address, category, your reason, and a fingerprint used to
 notice if the same content is written again. Retracted memories are excluded from
 normal reads and never injected into a session, even if they were pinned.
 
-That matters if you are retracting something sensitive. **Check the summary
-first** — if the thing you want gone is in it, retraction alone will not remove
-it:
+That matters if you are retracting something sensitive: if the thing you want
+gone is in the summary, retraction will not remove it.
+
+Which raises the harder question — **you did not write these memories, so how do
+you know what is in them?** The answer is to read them in bulk. `continuity tree`
+prints every memory's summary, which is the same text that gets injected into
+your sessions:
 
 ```bash
-continuity show mem://user/entities/old-server --layer summary
+continuity tree mem://user            # everything stored about you
+continuity tree mem://agent           # what the agent worked out for itself
 ```
+
+The web interface **Tree** tab shows the same thing, and **Cold Boot** shows the
+subset actually being injected right now.
+
+Nothing notifies you at the moment a memory is written. Reviewing is something
+you have to go and do — worth doing once after your first week, and any time you
+have been working near credentials or customer data.
 
 A **safety snapshot from a past upgrade may also still contain the original
 text**. Check `continuity snapshot list` and prune what you no longer need.
