@@ -106,6 +106,9 @@ func (s *Server) routes() {
 		r.Post("/sessions/{sessionID}/extract", s.handleExtractSession)
 		r.Post("/sessions/unmark-empty-extractions", s.handleUnmarkEmptyExtractions)
 
+		// Retention: reclaim spent observations + compact the file
+		r.Post("/prune", s.handlePrune)
+
 		// Phase 4: signal keywords
 		r.Post("/sessions/{sessionID}/signal", s.handleSignal)
 
@@ -168,6 +171,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Observation retention is engine-independent (see engine.RetentionCutoffs),
+	// so this reports even on installs running without an LLM. Surfacing the
+	// pile and the file size here is the early warning issue #72 never got: the
+	// growth was invisible until it manifested as an unrelated-looking timeout.
+	spentObservations, _ := engine.CountSpentObservations(s.db)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		// Existing fields, preserved for backward-compat.
@@ -183,6 +192,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"pending_extractions": pendingExtractions,
 		"gc_mode":             gcMode,
 		"gc_reclaimable":      gcReclaimable,
+		"spent_observations":  spentObservations,
+		"db_bytes":            s.db.SizeOnDisk(),
 		"pid":                 os.Getpid(),
 		"started_at":          s.started.Unix(),
 		"db_path":             s.db.Path,

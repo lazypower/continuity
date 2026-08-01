@@ -115,3 +115,169 @@ func TestGetSessionObservationCount(t *testing.T) {
 		t.Errorf("count = %d, want 2", count)
 	}
 }
+
+// --- retention -------------------------------------------------------------
+
+// seedObservation inserts an observation at an explicit created_at so retention
+// tests can place rows on either side of the grace horizon deterministically.
+func seedObservation(t *testing.T, db *DB, sessionID string, createdAt int64) {
+	t.Helper()
+	_, err := db.Exec(`
+		INSERT INTO observations (session_id, tool_name, tool_input, tool_response, created_at)
+		VALUES (?, 'Bash', '{}', 'out', ?)`, sessionID, createdAt)
+	if err != nil {
+		t.Fatalf("seed observation for %s: %v", sessionID, err)
+	}
+}
+
+// seedSession inserts a session row with explicit status/started_at.
+func seedSession(t *testing.T, db *DB, sessionID, status string, startedAt int64, extracted bool) {
+	t.Helper()
+	var extractedAt any
+	if extracted {
+		extractedAt = startedAt + 1000
+	}
+	_, err := db.Exec(`
+		INSERT INTO sessions (session_id, project, started_at, status, extracted_at)
+		VALUES (?, 'proj', ?, ?, ?)`, sessionID, startedAt, status, extractedAt)
+	if err != nil {
+		t.Fatalf("seed session %s: %v", sessionID, err)
+	}
+}
+
+// TestPruneSpentObservationsBuckets is the regression test for issue #72. The
+// original sketch keyed retention to extracted_at, which stranded roughly half
+// of a real database: extraction's content gate skips thin sessions without
+// ever marking them. Every bucket below must be reclaimed except the genuinely
+// in-flight one.
+func TestPruneSpentObservationsBuckets(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	const day = int64(24 * 60 * 60 * 1000)
+	now := int64(1_700_000_000_000)
+	graceCutoff := now - 14*day  // older than this is eligible
+	zombieCutoff := now - 30*day // active but started before this is a zombie
+	old := now - 20*day          // past grace
+	recent := now - 1*day        // inside grace
+
+	// Reclaimable: session finished and extraction ran — the classic spent case.
+	seedSession(t, db, "completed-extracted", "completed", now-40*day, true)
+	seedObservation(t, db, "completed-extracted", old)
+
+	// Reclaimable: session finished but extraction never ran (content gate
+	// skipped it). This is the 47% the extracted_at predicate would strand.
+	seedSession(t, db, "completed-unextracted", "completed", now-40*day, false)
+	seedObservation(t, db, "completed-unextracted", old)
+
+	// Reclaimable: no session row at all.
+	seedObservation(t, db, "orphaned", old)
+
+	// Reclaimable: left 'active' by a crashed client, started before the
+	// zombie horizon — it will never complete on its own.
+	seedSession(t, db, "zombie-active", "active", now-90*day, false)
+	seedObservation(t, db, "zombie-active", old)
+
+	// RETAINED: genuinely in flight — active and started inside the zombie
+	// horizon. Its context header can still be read.
+	seedSession(t, db, "live", "active", now-20*day, false)
+	seedObservation(t, db, "live", old)
+
+	// RETAINED: inside the grace window regardless of session state.
+	seedSession(t, db, "recent-completed", "completed", now-2*day, true)
+	seedObservation(t, db, "recent-completed", recent)
+
+	wantCount := int64(4)
+	got, err := db.CountSpentObservations(graceCutoff, zombieCutoff)
+	if err != nil {
+		t.Fatalf("CountSpentObservations: %v", err)
+	}
+	if got != wantCount {
+		t.Errorf("CountSpentObservations = %d, want %d", got, wantCount)
+	}
+
+	deleted, err := db.PruneSpentObservations(graceCutoff, zombieCutoff)
+	if err != nil {
+		t.Fatalf("PruneSpentObservations: %v", err)
+	}
+	if deleted != wantCount {
+		t.Errorf("PruneSpentObservations deleted %d, want %d", deleted, wantCount)
+	}
+
+	// The count and the delete must never diverge — they share one predicate.
+	after, err := db.CountSpentObservations(graceCutoff, zombieCutoff)
+	if err != nil {
+		t.Fatalf("CountSpentObservations after prune: %v", err)
+	}
+	if after != 0 {
+		t.Errorf("after prune, %d rows still spent — count and delete diverged", after)
+	}
+
+	for _, sess := range []string{"live", "recent-completed"} {
+		n, err := db.GetSessionObservationCount(sess)
+		if err != nil {
+			t.Fatalf("GetSessionObservationCount(%s): %v", sess, err)
+		}
+		if n != 1 {
+			t.Errorf("session %s retained %d observations, want 1", sess, n)
+		}
+	}
+	for _, sess := range []string{"completed-extracted", "completed-unextracted", "orphaned", "zombie-active"} {
+		n, err := db.GetSessionObservationCount(sess)
+		if err != nil {
+			t.Fatalf("GetSessionObservationCount(%s): %v", sess, err)
+		}
+		if n != 0 {
+			t.Errorf("session %s retained %d observations, want 0", sess, n)
+		}
+	}
+}
+
+// TestPruneSpentObservationsIsIdempotent guards the sweep running on a timer.
+func TestPruneSpentObservationsIsIdempotent(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	const day = int64(24 * 60 * 60 * 1000)
+	now := int64(1_700_000_000_000)
+	seedSession(t, db, "done", "completed", now-40*day, true)
+	seedObservation(t, db, "done", now-20*day)
+
+	first, err := db.PruneSpentObservations(now-14*day, now-30*day)
+	if err != nil {
+		t.Fatalf("first prune: %v", err)
+	}
+	second, err := db.PruneSpentObservations(now-14*day, now-30*day)
+	if err != nil {
+		t.Fatalf("second prune: %v", err)
+	}
+	if first != 1 || second != 0 {
+		t.Errorf("prune not idempotent: first=%d second=%d, want 1 and 0", first, second)
+	}
+}
+
+func TestVacuum(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	db.AddObservation("sess-001", "Bash", "{}", "out")
+	if err := db.Vacuum(); err != nil {
+		t.Fatalf("Vacuum: %v", err)
+	}
+	n, err := db.GetSessionObservationCount("sess-001")
+	if err != nil {
+		t.Fatalf("GetSessionObservationCount: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("vacuum lost data: count = %d, want 1", n)
+	}
+}

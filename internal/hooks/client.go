@@ -2,8 +2,11 @@ package hooks
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -13,7 +16,16 @@ import (
 const (
 	defaultBind = "127.0.0.1"
 	defaultPort = "37777"
+
+	// httpTimeout bounds hook calls. Hooks run inline in Claude Code's event
+	// loop, so a slow server must not become a slow editor — 5s is a latency
+	// budget, not a health signal.
 	httpTimeout = 5 * time.Second
+
+	// cliTimeout bounds interactive CLI calls. These block only a human at a
+	// terminal, so they can afford to wait out a slow query rather than
+	// reporting a perfectly healthy server as dead (issue #72).
+	cliTimeout = 30 * time.Second
 )
 
 // Client talks to the continuity server.
@@ -55,8 +67,20 @@ func NewClient() *Client {
 	}
 }
 
+// NewCLIClient creates a client for interactive CLI use. Same target, longer
+// patience — see cliTimeout.
+func NewCLIClient() *Client {
+	return &Client{
+		http:      &http.Client{Timeout: cliTimeout},
+		serverURL: ResolveServerURL(),
+	}
+}
+
 // ServerURL returns the resolved base URL this client targets.
 func (c *Client) ServerURL() string { return c.serverURL }
+
+// timeout returns the client's configured request timeout.
+func (c *Client) timeout() time.Duration { return c.http.Timeout }
 
 // Post sends a POST request with JSON body. Returns response body.
 func (c *Client) Post(path string, body []byte) ([]byte, error) {
@@ -96,10 +120,58 @@ func (c *Client) Get(path string) ([]byte, error) {
 
 // Healthy checks if the server is reachable.
 func (c *Client) Healthy() bool {
+	return c.CheckHealth() == nil
+}
+
+// CheckHealth probes the server and returns nil when it is reachable, or an
+// error that says which failure actually occurred.
+//
+// The distinction is load-bearing. Collapsing every transport error into "not
+// running" is what made issue #72 cost an afternoon: a healthy daemon answering
+// correctly — but slower than the client timeout — reported as a dead one,
+// sending the reporter after the port and the embedder while the real cause was
+// an unbounded table. A timeout means the server IS there and IS answering; it
+// just did not finish in time.
+func (c *Client) CheckHealth() error {
 	resp, err := c.http.Get(c.serverURL + "/api/health")
 	if err != nil {
-		return false
+		if IsTimeout(err) {
+			return fmt.Errorf("continuity server at %s is running but did not respond within %s — "+
+				"this usually means the database has grown large; try: continuity prune",
+				c.serverURL, c.timeout())
+		}
+		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
 	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("continuity server at %s is reachable but unhealthy (status %d)", c.serverURL, resp.StatusCode)
+	}
+	return nil
+}
+
+// DescribeError converts a request error from Post/Get into an operator-facing
+// message, preserving the slow-vs-dead distinction that CheckHealth draws.
+// Health can pass and a subsequent query still time out — /api/health answers
+// instantly regardless of table size, which is precisely why it stayed green
+// throughout issue #72.
+func (c *Client) DescribeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if IsTimeout(err) {
+		return fmt.Errorf("continuity server did not respond within %s — "+
+			"the server is running, but the query is slow; try: continuity prune (original: %w)",
+			c.timeout(), err)
+	}
+	return err
+}
+
+// IsTimeout reports whether err is a request timeout (client deadline or an
+// underlying network timeout) rather than a connection failure.
+func IsTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }

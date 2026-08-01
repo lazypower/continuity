@@ -62,9 +62,9 @@ func runShow(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --layer %q (valid: all, summary, body, detail)", showLayer)
 	}
 
-	client := hooks.NewClient()
-	if !client.Healthy() {
-		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
+	client := hooks.NewCLIClient()
+	if err := client.CheckHealth(); err != nil {
+		return err
 	}
 
 	params := url.Values{}
