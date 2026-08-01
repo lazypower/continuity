@@ -342,6 +342,34 @@ WHERE node_type = 'leaf'
   AND tombstoned_at IS NULL;
 `,
 	},
+	{
+		Version:     16,
+		Description: "sessions.last_active_at: when a session was last genuinely alive",
+		// Additive column + backfill. Observation retention needs to know whether
+		// a session is still in use, and neither existing column answers that:
+		// started_at is the wrong question (InitSession reactivates a resumed
+		// session without touching it, so a session resumed after months still
+		// looks ancient), and status alone can't distinguish "in use" from
+		// "abandoned by a crashed client that never fired Stop".
+		//
+		// Deriving liveness from MAX(observations.created_at) worked but was both
+		// a correlated subquery per sweep and wrong in the window between resume
+		// and the first new observation. A column names the concept directly.
+		//
+		// Backfill uses the best evidence already on the row: when the session
+		// ended, else its last recorded observation, else when it started.
+		SQL: `
+ALTER TABLE sessions ADD COLUMN last_active_at INTEGER;
+
+UPDATE sessions SET last_active_at = COALESCE(
+    ended_at,
+    (SELECT MAX(o.created_at) FROM observations o WHERE o.session_id = sessions.session_id),
+    started_at
+);
+
+CREATE INDEX idx_sessions_last_active ON sessions(status, last_active_at);
+`,
+	},
 }
 
 // headVersion is the highest schema version this binary knows how to apply.

@@ -116,25 +116,23 @@ func (db *DB) GetSessionObservationCount(sessionID string) (int, error) {
 // treating it as live. An observation with no session row at all is orphaned
 // and therefore not in flight.
 //
-// Liveness is measured from the session's LAST observation, not its started_at.
-// started_at is wrong twice over: InitSession reactivates a resumed session
-// without refreshing it, and a genuinely long-running session would cross the
-// horizon while still in use — either way an active session would start
-// shedding its own live history. Falling back to started_at covers a session
-// that has recorded no observations yet.
+// Liveness comes from sessions.last_active_at, which is stamped on session
+// init, on resume, and on every recorded tool use. Neither older column answers
+// the question: started_at is not refreshed when InitSession reactivates a
+// resumed session, and status alone cannot tell "in use" from "abandoned by a
+// client that crashed before firing Stop". Deriving it from
+// MAX(observations.created_at) instead was correct only after the resumed
+// session's first new observation landed — a sweep inside that window would
+// delete the history of a session the user had just reopened.
 //
-// liveSessionsSelect is evaluated once over the (small) set of active sessions
-// rather than correlated per observation row, which also keeps the count cheap
-// enough to serve from a health check.
+// Evaluated once over the (small, indexed) set of active sessions rather than
+// correlated per observation row, which keeps the count cheap.
 //
 // Bound parameter: zombie cutoff.
 const liveSessionsSelect = `
 	SELECT s.session_id FROM sessions s
 	WHERE s.status = 'active'
-	  AND COALESCE(
-	        (SELECT MAX(o2.created_at) FROM observations o2 WHERE o2.session_id = s.session_id),
-	        s.started_at
-	      ) >= ?`
+	  AND COALESCE(s.last_active_at, s.started_at) >= ?`
 
 // spentObservationsWhere binds, in order: zombie cutoff, grace cutoff.
 const spentObservationsWhere = `

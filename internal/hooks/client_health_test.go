@@ -116,14 +116,64 @@ func TestDescribeErrorOnSlowQuery(t *testing.T) {
 	}
 }
 
+// TestDescribeErrorPassesThroughNonTimeouts covers a real HTTP-level error from
+// a server that IS up: the message is the server's own and must survive intact.
 func TestDescribeErrorPassesThroughNonTimeouts(t *testing.T) {
-	c := newTestClient("http://127.0.0.1:1", time.Second)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, time.Second)
 	orig := errors.New("status 400: bad request")
 	if got := c.DescribeError(orig); got != orig {
-		t.Errorf("DescribeError rewrote a non-timeout error: %v", got)
+		t.Errorf("DescribeError rewrote a non-timeout error from a live server: %v", got)
 	}
 	if c.DescribeError(nil) != nil {
 		t.Error("DescribeError(nil) should be nil")
+	}
+}
+
+// TestDescribeErrorOnDeadDaemonIsActionable guards the regression Codex found
+// when prune dropped its CheckHealth precondition: a connection-refused error is
+// not a timeout, so without this the operator would see a raw
+// "dial tcp ...: connection refused" instead of what to actually do about it.
+func TestDescribeErrorOnDeadDaemonIsActionable(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	url := "http://" + ln.Addr().String()
+	ln.Close()
+
+	c := newTestClient(url, 2*time.Second)
+	_, postErr := c.Post("/api/prune", nil)
+	if postErr == nil {
+		t.Fatal("expected a dial error against a closed port")
+	}
+	described := c.DescribeError(postErr)
+	if !strings.Contains(described.Error(), "continuity serve") {
+		t.Errorf("dead-daemon error is not actionable: %q", described.Error())
+	}
+}
+
+// TestHealthyDoesNotPayForTheDialProbe pins the hook-latency boundary. Hooks
+// call Healthy() inline in Claude Code's event loop; a boolean gains nothing
+// from slow-vs-dead, so it must not spend a second probe on top of an already
+// elapsed timeout. Against an unroutable address the whole call must stay
+// close to the client timeout, not timeout + dialProbeTimeout.
+func TestHealthyDoesNotPayForTheDialProbe(t *testing.T) {
+	c := newTestClient("http://203.0.113.1:37777", 200*time.Millisecond)
+
+	start := time.Now()
+	if c.Healthy() {
+		t.Fatal("Healthy() = true against an unroutable address")
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond+dialProbeTimeout {
+		t.Errorf("Healthy() took %s — it appears to be paying for the dial probe "+
+			"on top of the request timeout, which slows every hook", elapsed)
 	}
 }
 

@@ -19,6 +19,7 @@ type Session struct {
 	ToolCount    int
 	ExtractedAt  *int64
 	Tone         *string
+	LastActiveAt *int64
 }
 
 // InitSession creates or resumes a session. If the session_id already exists
@@ -31,17 +32,23 @@ func (db *DB) InitSession(sessionID, project string) (*Session, error) {
 	// Try to find existing session in any status
 	var s Session
 	err := db.QueryRow(`
-		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone, last_active_at
 		FROM sessions WHERE session_id = ?
-	`, sessionID).Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone)
+	`, sessionID).Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone, &s.LastActiveAt)
 	if err == nil {
-		// Re-activate if not already active
-		if s.Status != "active" {
-			if _, err := db.Exec(`UPDATE sessions SET status = 'active' WHERE id = ?`, s.ID); err != nil {
-				return nil, fmt.Errorf("reactivate session: %w", err)
-			}
-			s.Status = "active"
+		// Re-activate if not already active. last_active_at is stamped on every
+		// init, not only on status changes: resuming a session is itself proof
+		// of life, and observation retention reads this column to decide whether
+		// a session is still in use. Without the stamp, a session resumed after
+		// months still looks ancient and a sweep landing before its first new
+		// observation would delete the history the user just came back for.
+		if _, err := db.Exec(`
+			UPDATE sessions SET status = 'active', last_active_at = ? WHERE id = ?
+		`, now, s.ID); err != nil {
+			return nil, fmt.Errorf("reactivate session: %w", err)
 		}
+		s.Status = "active"
+		s.LastActiveAt = &now
 		return &s, nil
 	}
 	if err != sql.ErrNoRows {
@@ -50,20 +57,21 @@ func (db *DB) InitSession(sessionID, project string) (*Session, error) {
 
 	// Create new session
 	result, err := db.Exec(`
-		INSERT INTO sessions (session_id, project, started_at, status)
-		VALUES (?, ?, ?, 'active')
-	`, sessionID, project, now)
+		INSERT INTO sessions (session_id, project, started_at, status, last_active_at)
+		VALUES (?, ?, ?, 'active', ?)
+	`, sessionID, project, now, now)
 	if err != nil {
 		return nil, fmt.Errorf("insert session: %w", err)
 	}
 
 	id, _ := result.LastInsertId()
 	return &Session{
-		ID:        id,
-		SessionID: sessionID,
-		Project:   project,
-		StartedAt: now,
-		Status:    "active",
+		ID:           id,
+		SessionID:    sessionID,
+		Project:      project,
+		StartedAt:    now,
+		Status:       "active",
+		LastActiveAt: &now,
 	}, nil
 }
 
@@ -71,9 +79,9 @@ func (db *DB) InitSession(sessionID, project string) (*Session, error) {
 func (db *DB) GetSession(sessionID string) (*Session, error) {
 	var s Session
 	err := db.QueryRow(`
-		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone, last_active_at
 		FROM sessions WHERE session_id = ?
-	`, sessionID).Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone)
+	`, sessionID).Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone, &s.LastActiveAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -117,7 +125,7 @@ func (db *DB) EndSession(sessionID string) error {
 // GetRecentSessions returns the most recent sessions, ordered by started_at DESC.
 func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 	rows, err := db.Query(`
-		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone, last_active_at
 		FROM sessions ORDER BY started_at DESC LIMIT ?
 	`, limit)
 	if err != nil {
@@ -128,7 +136,7 @@ func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 	var sessions []Session
 	for rows.Next() {
 		var s Session
-		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone); err != nil {
+		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone, &s.LastActiveAt); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		sessions = append(sessions, s)
@@ -139,7 +147,7 @@ func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 // GetSessionsSince returns all sessions started after the given timestamp, ordered by started_at ASC.
 func (db *DB) GetSessionsSince(sinceMs int64) ([]Session, error) {
 	rows, err := db.Query(`
-		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone, last_active_at
 		FROM sessions WHERE started_at >= ? ORDER BY started_at ASC
 	`, sinceMs)
 	if err != nil {
@@ -150,7 +158,7 @@ func (db *DB) GetSessionsSince(sinceMs int64) ([]Session, error) {
 	var sessions []Session
 	for rows.Next() {
 		var s Session
-		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone); err != nil {
+		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone, &s.LastActiveAt); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
 		sessions = append(sessions, s)
@@ -212,9 +220,9 @@ func (db *DB) SetSessionTone(sessionID, tone string) error {
 // IncrementToolCount increments the tool_count for a session.
 func (db *DB) IncrementToolCount(sessionID string) error {
 	_, err := db.Exec(`
-		UPDATE sessions SET tool_count = tool_count + 1
+		UPDATE sessions SET tool_count = tool_count + 1, last_active_at = ?
 		WHERE session_id = ? AND status = 'active'
-	`, sessionID)
+	`, time.Now().UnixMilli(), sessionID)
 	if err != nil {
 		return fmt.Errorf("increment tool count: %w", err)
 	}

@@ -231,6 +231,12 @@ func (s *Server) handleUnmarkEmptyExtractions(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// pruneWriteDeadline is how long a prune response may take to produce. It must
+// exceed the server's global WriteTimeout because VACUUM is the one endpoint
+// whose work is legitimately measured in minutes; it is matched by the CLI's
+// maintenance-client timeout so neither side abandons the other.
+const pruneWriteDeadline = 30 * time.Minute
+
 // handlePrune reclaims spent observations and optionally compacts the database
 // file. Routed through the server rather than run against the file directly
 // because the daemon owns the write connection — VACUUM from a second process
@@ -242,6 +248,16 @@ func (s *Server) handleUnmarkEmptyExtractions(w http.ResponseWriter, r *http.Req
 func (s *Server) handlePrune(w http.ResponseWriter, r *http.Request) {
 	dryRun := r.URL.Query().Get("dry_run") == "true"
 	doVacuum := r.URL.Query().Get("vacuum") != "false"
+
+	// The server's global WriteTimeout is 30s, but VACUUM on a multi-gigabyte
+	// database is minutes of work. Without extending the deadline the compaction
+	// would succeed while the response was discarded, leaving the operator with
+	// a transport error after waiting out a destructive maintenance operation.
+	if !dryRun && doVacuum {
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(pruneWriteDeadline)); err != nil {
+			log.Printf("prune: could not extend write deadline (%v) — a long VACUUM may not report back", err)
+		}
+	}
 
 	before := s.db.SizeOnDisk()
 

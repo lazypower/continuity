@@ -132,7 +132,15 @@ func PruneObservations(db *store.DB) (int64, error) {
 // refreshSpentGauge re-measures the reclaimable count for /api/health. Failure
 // is non-fatal — a stale gauge is a reporting inaccuracy, not a broken sweep.
 func refreshSpentGauge(db *store.DB) {
-	n, err := CountSpentObservations(db)
+	graceCutoff, zombieCutoff, enabled := RetentionCutoffs()
+	if !enabled {
+		graceCutoff, zombieCutoff = defaultCutoffs()
+	}
+	refreshSpentGaugeWith(db, graceCutoff, zombieCutoff)
+}
+
+func refreshSpentGaugeWith(db *store.DB, graceCutoff, zombieCutoff int64) {
+	n, err := db.CountSpentObservations(graceCutoff, zombieCutoff)
 	if err != nil {
 		log.Printf("retention: gauge refresh failed: %v", err)
 		return
@@ -168,6 +176,14 @@ func StartRetentionTimer(db *store.DB, stop <-chan struct{}) {
 func runObservationRetention(db *store.DB) {
 	grace, ok := observationGraceDuration()
 	if !ok {
+		// Retention is off — deliberately, or because the config was
+		// unparseable and we failed closed. This is exactly when the gauge
+		// matters most: nothing is reclaiming, so the pile only grows, and
+		// /api/health is the one place an operator will see it. Measure under
+		// the DEFAULT policy so the number answers "what would retention
+		// reclaim if it were on?".
+		graceCutoff, zombieCutoff := defaultCutoffs()
+		refreshSpentGaugeWith(db, graceCutoff, zombieCutoff)
 		return
 	}
 	pruned, err := PruneObservations(db)
@@ -178,4 +194,11 @@ func runObservationRetention(db *store.DB) {
 	if pruned > 0 {
 		log.Printf("retention: pruned %d observation(s) from sessions no longer in flight (grace: %dd)", pruned, int(grace.Hours()/24))
 	}
+}
+
+// defaultCutoffs returns the cutoffs implied by the built-in policy, ignoring
+// any operator override. Used to measure the gauge when retention is disabled.
+func defaultCutoffs() (graceCutoff, zombieCutoff int64) {
+	now := time.Now().UnixMilli()
+	return now - observationGrace.Milliseconds(), now - sessionZombieAge.Milliseconds()
 }

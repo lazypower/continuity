@@ -170,8 +170,20 @@ func (c *Client) Get(path string) ([]byte, error) {
 }
 
 // Healthy checks if the server is reachable.
+//
+// Deliberately does NOT run the dial probe that CheckHealth uses. Hooks call
+// this inline in Claude Code's event loop, and a boolean answer gains nothing
+// from distinguishing slow-from-dead — either way the server is unusable right
+// now. Paying a second 2s probe on top of an already-elapsed 5s timeout would
+// make a black-holed target cost the editor 7s per hook instead of 5s. The
+// distinction is only worth buying where a human reads the reason.
 func (c *Client) Healthy() bool {
-	return c.CheckHealth() == nil
+	resp, err := c.http.Get(c.serverURL + "/api/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 // CheckHealth probes the server and returns nil when it is reachable, or an
@@ -213,10 +225,20 @@ func (c *Client) DescribeError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if IsTimeout(err) && c.isListening() {
-		return fmt.Errorf("continuity server did not respond within %s — "+
-			"the server is running, but the query is slow; try: continuity prune (original: %w)",
-			c.timeout(), err)
+	if IsTimeout(err) {
+		if c.isListening() {
+			return fmt.Errorf("continuity server did not respond within %s — "+
+				"the server is running, but the query is slow; try: continuity prune (original: %w)",
+				c.timeout(), err)
+		}
+		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
+	}
+	// A connection failure is the common dead-daemon case and arrives here as a
+	// raw dial error. Callers that skip CheckHealth (prune, deliberately — see
+	// runPrune) would otherwise surface "dial tcp ...: connection refused"
+	// instead of something actionable.
+	if !c.isListening() {
+		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
 	}
 	return err
 }

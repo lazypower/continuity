@@ -130,16 +130,25 @@ func seedObservation(t *testing.T, db *DB, sessionID string, createdAt int64) {
 	}
 }
 
-// seedSession inserts a session row with explicit status/started_at.
+// seedSession inserts a session row whose last_active_at equals started_at —
+// i.e. a session that has shown no sign of life since it began.
 func seedSession(t *testing.T, db *DB, sessionID, status string, startedAt int64, extracted bool) {
+	t.Helper()
+	seedSessionActive(t, db, sessionID, status, startedAt, startedAt, extracted)
+}
+
+// seedSessionActive inserts a session with an explicit last_active_at, so tests
+// can distinguish a long-running session from an abandoned one that merely
+// started at the same time.
+func seedSessionActive(t *testing.T, db *DB, sessionID, status string, startedAt, lastActiveAt int64, extracted bool) {
 	t.Helper()
 	var extractedAt any
 	if extracted {
 		extractedAt = startedAt + 1000
 	}
 	_, err := db.Exec(`
-		INSERT INTO sessions (session_id, project, started_at, status, extracted_at)
-		VALUES (?, 'proj', ?, ?, ?)`, sessionID, startedAt, status, extractedAt)
+		INSERT INTO sessions (session_id, project, started_at, status, extracted_at, last_active_at)
+		VALUES (?, 'proj', ?, ?, ?, ?)`, sessionID, startedAt, status, extractedAt, lastActiveAt)
 	if err != nil {
 		t.Fatalf("seed session %s: %v", sessionID, err)
 	}
@@ -304,7 +313,7 @@ func TestLongRunningSessionKeepsItsObservations(t *testing.T) {
 	// Started 90 days ago — well past the zombie horizon — but still active and
 	// still recording tool use as of an hour ago. This is a resumed or
 	// long-lived session, not a crashed one.
-	seedSession(t, db, "long-running", "active", now-90*day, false)
+	seedSessionActive(t, db, "long-running", "active", now-90*day, now-(day/24), false)
 	seedObservation(t, db, "long-running", now-60*day) // old, but session is live
 	seedObservation(t, db, "long-running", now-1*day)  // recent activity
 	seedObservation(t, db, "long-running", now-(day/24))

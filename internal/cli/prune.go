@@ -56,7 +56,13 @@ func runPrune(cmd *cobra.Command, args []string) error {
 	// database so large that requests are slow, so gating it behind a probe
 	// that can itself time out would make the fix unreachable on exactly the
 	// installs that need it. Post directly; DescribeError explains a failure.
-	client := hooks.NewMaintenanceClient()
+	// --dry-run only reads a count, so it keeps the ordinary CLI budget; there
+	// is no reason for a read-only preview to be able to hang for 30 minutes
+	// against a wedged daemon.
+	client := hooks.NewCLIClient()
+	if !pruneDryRun {
+		client = hooks.NewMaintenanceClient()
+	}
 
 	params := url.Values{}
 	if pruneDryRun {
