@@ -2,16 +2,14 @@ package store
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"time"
 )
 
-// maxToolFieldSize is the maximum size of tool_input and tool_response stored in the DB.
-// Prevents bloat — Phase 2 extraction processes full transcript anyway.
-const maxToolFieldSize = 10 * 1024 // 10KB
-
 // Observation represents a single tool use recorded during a session.
+//
+// ToolInput and ToolResponse are retained on the struct and in the schema, but
+// are no longer populated — see AddObservation.
 type Observation struct {
 	ID           int64
 	SessionID    string
@@ -21,22 +19,39 @@ type Observation struct {
 	CreatedAt    int64
 }
 
-// AddObservation stores a tool use observation. Truncates large fields to prevent DB bloat.
-func (db *DB) AddObservation(sessionID, toolName, toolInput, toolResponse string) error {
-	if len(toolInput) > maxToolFieldSize {
-		log.Printf("observation: tool_input truncated for session %s: %d → %d bytes", sessionID, len(toolInput), maxToolFieldSize)
-		toolInput = toolInput[:maxToolFieldSize]
-	}
-	if len(toolResponse) > maxToolFieldSize {
-		log.Printf("observation: tool_response truncated for session %s: %d → %d bytes", sessionID, len(toolResponse), maxToolFieldSize)
-		toolResponse = toolResponse[:maxToolFieldSize]
-	}
-
+// AddObservation records that a tool ran. It deliberately does NOT persist the
+// tool's input or its response.
+//
+// Those two columns used to hold the full call and its result, truncated at
+// 10KB each — so a Read's response was file contents and a Bash call's was
+// command output, written to disk on every PostToolUse hook at roughly 230MB
+// per active user per month (issue #72).
+//
+// Nothing ever read them. Memory extraction reads the session transcript, not
+// this table. The only production reader of `observations` is a COUNT(*) behind
+// the "N tool uses recorded this session" line in the injected context, and
+// even that number is already maintained independently on sessions.tool_count.
+// GetObservations and GetRecentObservations, the two functions that return the
+// content, have no callers outside tests.
+//
+// The payload existed to serve RFC.md's promise of browsable per-session
+// history at mem://sessions/<id>/observations. That promise was withdrawn (see
+// the revision note in RFC.md §4.3); the write path outlived it. The name is
+// inherited from claude-mem, where an "observation" was a DISTILLED MEMORY that
+// the viewer paginated — the justification for persisting it came from that
+// meaning and survived onto this one, which is raw capture.
+//
+// Writing data nothing reads is cost without benefit, and the cost is paid in
+// disk and in whatever the user's own tool traffic happened to contain. The
+// columns stay so the schema is unchanged and old rows still read back; new
+// rows carry empty strings. Removing the table, and the retention machinery
+// that exists only to bound it, is a deliberate follow-up.
+func (db *DB) AddObservation(sessionID, toolName string) error {
 	now := time.Now().UnixMilli()
 	_, err := db.Exec(`
 		INSERT INTO observations (session_id, tool_name, tool_input, tool_response, created_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, sessionID, toolName, toolInput, toolResponse, now)
+		VALUES (?, ?, '', '', ?)
+	`, sessionID, toolName, now)
 	if err != nil {
 		return fmt.Errorf("add observation: %w", err)
 	}

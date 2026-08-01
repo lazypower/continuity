@@ -235,7 +235,8 @@ stale row claims.
 
 ## Observation retention
 
-Observations — raw `tool_input`/`tool_response` records from `PostToolUse` —
+Observations — tool-name records from `PostToolUse`; the `tool_input` and
+`tool_response` columns survive in the schema but are no longer written —
 are **not** memories, and retention is deliberately not modelled on the GC
 sweep. GC destroys memories, so it ships off; observations are raw scaffolding
 whose only reader is the live session's own context header

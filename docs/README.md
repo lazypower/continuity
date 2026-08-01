@@ -21,10 +21,10 @@ machine and refuses anything else.
 - **Memories** — short written notes: your preferences, decisions, techniques,
   and a profile of how you like to work. These are what get added to Claude's
   instructions.
-- **Tool-call records** — a log of every action your agent takes, including the
-  input it was given and the response it got back. **These can contain file
-  contents, command output, and any secrets that passed through a tool.** They
-  exist to build the current session's context, and they are
+- **Tool-call records** — the *name* of each tool your agent runs, and when.
+  Arguments and output are **not** stored: nothing reads them, so keeping them
+  would mean writing file contents and command output to disk for no reason.
+  These records exist to count activity in the current session, and are
   [deleted automatically](guides/keeping-it-healthy.md#observation-retention)
   once their session finishes and they are 14 days old.
 

@@ -81,7 +81,10 @@ func (s *Server) handleAddObservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.db.AddObservation(sessionID, req.ToolName, req.ToolInput, req.ToolResponse); err != nil {
+	// ToolInput and ToolResponse are still accepted on the wire so an older hook
+	// binary keeps working, but they are deliberately not persisted — nothing
+	// reads them. See store.AddObservation.
+	if err := s.db.AddObservation(sessionID, req.ToolName); err != nil {
 		log.Printf("add observation: %v", err)
 		jsonError(w, "internal error", http.StatusInternalServerError)
 		return

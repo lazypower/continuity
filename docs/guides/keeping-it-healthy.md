@@ -39,9 +39,10 @@ You do not need to schedule any of this.
 
 ## Observation retention
 
-Every tool call your agent makes is recorded as an **observation** — the file it
-edited, the command it ran. These exist to build the current session's context.
-Once a session is finished, they are spent.
+Every tool call your agent makes is recorded as an **observation** — just the
+tool's name and the time it ran, not its arguments or output. These exist to
+count activity in the current session. Once a session is finished, they are
+spent.
 
 They used to accumulate forever. On one normal single-user install they reached
 **331,966 records and 1 GB** in about four and a half months, against 3 MB of

@@ -133,11 +133,14 @@ deleted tool-call records.
 
 **This release deletes old tool-call records on the first start.**
 
-Every action your agent takes is recorded — the tool it used, the input it was
-given, and the response it got back. That means these records **can contain file
-contents, command output, and anything else that passed through a tool**,
-including secrets that appeared in a command or a file. They exist to build the
-current session's context and nothing reads them afterwards.
+Every action your agent takes is recorded. Until this release, that meant the
+tool's arguments and its output too — **so older records can contain file
+contents and command output**, whatever your own tool calls happened to return.
+Nothing ever read them.
+
+**From v0.11.0 only the tool's name and timestamp are stored.** New records
+carry no arguments or output at all. The cleanup below is what clears the old
+ones.
 
 They used to accumulate forever. On one normal single-user install they reached
 331,966 records and about 1 GB in four and a half months. Your own numbers will

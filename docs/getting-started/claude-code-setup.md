@@ -32,10 +32,10 @@ event below that already exists, append Continuity's entry to that event's
 existing array — do not overwrite it, or you will silently disable whatever else
 was wired to that event.
 
-**What this records:** once `PostToolUse` is enabled, every tool call your agent
-makes is written to the database, including the input it was given and the
-response it returned. Those records are deleted automatically after 14 days —
-see [What gets remembered](../guides/what-gets-remembered.md).
+**What this records:** once `PostToolUse` is enabled, Continuity writes down the
+*name* of each tool your agent runs, and when. Arguments and output are not
+stored. Those records are deleted automatically after 14 days — see
+[What gets remembered](../guides/what-gets-remembered.md).
 
 ```json
 {

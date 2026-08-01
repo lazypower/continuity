@@ -345,6 +345,8 @@ These are the hook path. You normally do not call them by hand.
 |---|---|---|---|
 | `POST /api/sessions/init` | `{"session_id":"…","project":"…"}` | `200` `{"session_id","status","tool_count"}` | `400` invalid JSON or missing `session_id`; `500` |
 | `POST /api/sessions/{id}/observations` | `{"tool_name","tool_input","tool_response"}` | `201` `{"status":"ok"}` | `400` unreadable or invalid JSON; `500` |
+
+> `tool_input` and `tool_response` are still **accepted** on this route so an older hook binary keeps working, but they are **not stored**. Only `tool_name` and a timestamp are persisted.
 | `POST /api/sessions/{id}/complete` | empty | `200` `{"status":"completed"}` | never fails — a session that was not active returns `200` `{"status":"ok"}` |
 | `POST /api/sessions/{id}/end` | empty | `200` `{"status":"ended"}` | `500` |
 

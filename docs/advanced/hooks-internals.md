@@ -112,7 +112,8 @@ a failed init still exits 0.
 
 Skips meta-tools that generate noise rather than observations — `TodoRead`,
 `TodoWrite`, `Thinking`, `TaskList`, `TaskCreate`, `TaskGet`, `TaskUpdate` —
-then POSTs the raw `tool_input` and `tool_response` JSON as strings to
+then POSTs the tool name — along with `tool_input` and `tool_response`, which
+the server accepts for wire compatibility and discards without storing — to
 `/api/sessions/{id}/observations`.
 
 Server-side, each field is truncated at **10 KB** with a log line, and the

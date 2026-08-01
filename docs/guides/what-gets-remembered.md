@@ -23,14 +23,19 @@ By default, memories are created two ways:
    capture. The phrase has to appear near the start of a normal-length message,
    so a stray "remember this" buried in a giant paste will not trigger it.
 
-Raw tool calls are recorded separately as **observations** — temporary records
-used to assemble the current session's context, not memories. Each one holds the
-tool used, the input it was given, and the response it returned, so **they can
-contain file contents, command output, and any secrets that passed through a
-tool**.
+Tool activity is recorded separately as **observations** — temporary records
+used to assemble the current session's context, not memories. Each one holds
+**only the tool's name and the time it ran.** The arguments it was given and the
+output it returned are not stored.
 
-They are deleted automatically: once the session that produced them has
-finished, and the record is at least **14 days** old. Records from sessions still
+That is deliberate. Those fields used to be written and were read by nothing,
+which meant file contents and command output landed on disk for no reason. If
+you are on a database written by a version before v0.11.0, older records may
+still hold that material; it ages out under the same rule below, and
+`continuity prune` clears it immediately.
+
+Records are deleted automatically once the session that produced them has
+finished and the record is at least **14 days** old. Records from sessions still
 running are never touched. See [Keeping it
 healthy](keeping-it-healthy.md#observation-retention) to change or disable that.
 
