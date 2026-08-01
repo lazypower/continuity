@@ -163,7 +163,34 @@ func assertSnapshotNetEngaged(t *testing.T, dbPath string) {
 // assertV5Baseline checks the v5 seed survived the upgrade: every category node
 // is readable over HTTP with category/uri intact, and the session + observation
 // rows came through. Shared by all three fixtures (each layers on top of v5).
+//
+// Assumes observation retention is OFF, which HermeticEnv pins by default —
+// fixtures are seeded at a frozen timestamp far outside the grace window, so a
+// booting server with retention enabled would legitimately reclaim them. The
+// memory half is split out as assertV5Memories so the retention-on upgrade test
+// can assert "memories survived AND observations were reclaimed" on one boot.
 func assertV5Baseline(t *testing.T, serverURL, dbPath string) {
+	t.Helper()
+	assertV5Memories(t, serverURL, dbPath)
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	var obsCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM observations WHERE session_id = ?`,
+		"v5-test-session").Scan(&obsCount); err != nil {
+		t.Fatalf("obs count: %v", err)
+	}
+	if obsCount != 1 {
+		t.Errorf("observation count = %d, want 1", obsCount)
+	}
+}
+
+// assertV5Memories checks everything the upgrade must preserve regardless of
+// retention: the seeded memory nodes and the session row itself.
+func assertV5Memories(t *testing.T, serverURL, dbPath string) {
 	t.Helper()
 	for i, cat := range seedV5Categories {
 		uri := fmt.Sprintf("mem://user/%s/v5-seed-%d", cat, i)
@@ -189,14 +216,6 @@ func assertV5Baseline(t *testing.T, serverURL, dbPath string) {
 	}
 	if msgCount != 7 {
 		t.Errorf("session.message_count = %d, want 7", msgCount)
-	}
-	var obsCount int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM observations WHERE session_id = ?`,
-		"v5-test-session").Scan(&obsCount); err != nil {
-		t.Fatalf("obs count: %v", err)
-	}
-	if obsCount != 1 {
-		t.Errorf("observation count = %d, want 1", obsCount)
 	}
 }
 
@@ -345,4 +364,85 @@ func TestMigrationFixtureE2E_IdempotentReboot(t *testing.T) {
 	assertRawSchema(t, dbPath, headVersion())
 	assertV5Baseline(t, serverURL2, dbPath)
 	assertTombstone(t, dbPath)
+}
+
+// TestMigrationFixtureE2E_V8FromV050_WithRetentionEnabled is the combined-boot
+// test: a real v0.5.0-era database taking migrations 9→head AND its first
+// observation-retention sweep on the SAME startup.
+//
+// This is the upgrade path an actual reporter is on — issue #72 was filed from
+// v0.5.0 — and every other fixture test deliberately isolates it away, because
+// HermeticEnv pins retention off so fixtures seeded at a frozen timestamp aren't
+// reclaimed mid-test. That isolation is right for testing migrations, but it
+// means the interaction itself went uncovered: migrations run inside the same
+// process, against the same database, as a sweep that deletes most of a table.
+//
+// What must hold together on one boot:
+//   - schema reaches head (a migration is not disrupted by the sweep)
+//   - every seeded memory and the session row survive (retention touches only
+//     observations; the cardinal sin is losing a memory)
+//   - the fixture's observation IS reclaimed (retention actually ran — this
+//     failing means the sweep silently no-op'd behind the migration)
+//   - the database is structurally intact afterwards
+func TestMigrationFixtureE2E_V8FromV050_WithRetentionEnabled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("migration fixture e2e: skipped under -short")
+	}
+	_, dbPath := loadFixtureCopy(t, 8)
+	assertRawSchema(t, dbPath, 8)
+
+	bin := testharness.BuildContinuityBinary(t)
+	workDir := filepath.Dir(dbPath)
+	serverURL, env := testharness.HermeticEnv(t, workDir, dbPath, 0)
+	// Override HermeticEnv's retention=off. os/exec keeps the LAST occurrence of
+	// a duplicated key, so appending wins — same mechanism the snapshot opt-out
+	// clear above relies on.
+	env = append(env, EnvNoMigrationSnapshot+"=", "CONTINUITY_OBSERVATION_RETENTION_DAYS=14")
+	srv := testharness.StartServeProcess(t, bin, env)
+	t.Cleanup(srv.Stop)
+	testharness.WaitForReady(t, serverURL+"/api/health")
+
+	// The migration completed despite the sweep running on the same boot.
+	assertRawSchema(t, dbPath, headVersion())
+
+	// Memories, sessions, moments, tone and tombstones are all untouched.
+	assertV5Memories(t, serverURL, dbPath)
+	assertMomentAndTone(t, dbPath)
+	assertTombstone(t, dbPath)
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+
+	// Retention actually ran. The fixture's observation belongs to a completed
+	// session stamped far outside the grace window, so it is spent by definition.
+	var obsCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM observations WHERE session_id = ?`,
+		"v5-test-session").Scan(&obsCount); err != nil {
+		t.Fatalf("obs count: %v", err)
+	}
+	if obsCount != 0 {
+		t.Errorf("observation count = %d, want 0 — the retention sweep did not run "+
+			"on the upgrade boot", obsCount)
+	}
+
+	// migration 16's backfill reached every pre-existing session, including ones
+	// the sweep just reclaimed observations from.
+	var nullActive int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sessions WHERE last_active_at IS NULL`).Scan(&nullActive); err != nil {
+		t.Fatalf("last_active_at check: %v", err)
+	}
+	if nullActive != 0 {
+		t.Errorf("%d session(s) have NULL last_active_at after migration 16", nullActive)
+	}
+
+	var integrity string
+	if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil {
+		t.Fatalf("integrity_check: %v", err)
+	}
+	if integrity != "ok" {
+		t.Errorf("integrity_check = %q after migrate + sweep on one boot", integrity)
+	}
 }
