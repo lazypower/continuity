@@ -37,4 +37,5 @@ func init() {
 	rootCmd.AddCommand(doctorCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(embedderCmd)
+	rootCmd.AddCommand(pruneCmd)
 }

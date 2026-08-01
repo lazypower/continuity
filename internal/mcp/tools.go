@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/lazypower/continuity/internal/hooks"
 )
 
 // toolDef is one MCP tool: its advertised schema plus a handler that returns the
@@ -478,8 +480,14 @@ func (s *Server) get(path string) ([]byte, error) {
 // daemonError translates a transport failure into the same guidance the CLI
 // gives when the server is down, while leaving genuine HTTP-level errors intact.
 func (s *Server) daemonError(err error) error {
-	if !s.client.Healthy() {
-		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
+	// A timeout means the daemon answered — just slowly. Probing health here
+	// would report it as absent, since /api/health stays fast no matter how
+	// large the tables have grown (issue #72).
+	if hooks.IsTimeout(err) {
+		return s.client.DescribeError(err)
+	}
+	if healthErr := s.client.CheckHealth(); healthErr != nil {
+		return healthErr
 	}
 	return err
 }

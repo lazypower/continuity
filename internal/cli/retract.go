@@ -56,9 +56,9 @@ func runRetract(cmd *cobra.Command, args []string) error {
 	// Non-blocking skew preflight: surface a stale server before we write.
 	warnIfSkewed()
 
-	client := hooks.NewClient()
-	if !client.Healthy() {
-		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
+	client := hooks.NewCLIClient()
+	if err := client.CheckHealth(); err != nil {
+		return err
 	}
 
 	payload := map[string]string{

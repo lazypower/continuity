@@ -2,9 +2,13 @@ package hooks
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -13,7 +17,27 @@ import (
 const (
 	defaultBind = "127.0.0.1"
 	defaultPort = "37777"
+
+	// httpTimeout bounds hook calls. Hooks run inline in Claude Code's event
+	// loop, so a slow server must not become a slow editor — 5s is a latency
+	// budget, not a health signal.
 	httpTimeout = 5 * time.Second
+
+	// cliTimeout bounds interactive CLI calls. These block only a human at a
+	// terminal, so they can afford to wait out a slow query rather than
+	// reporting a perfectly healthy server as dead (issue #72).
+	cliTimeout = 30 * time.Second
+
+	// maintenanceTimeout bounds long-running maintenance calls. VACUUM on a
+	// multi-gigabyte database is minutes of work, and the command says so — a
+	// 30s budget would abandon the request while the daemon kept compacting,
+	// leaving the operator with a timeout error and no result for an operation
+	// that actually succeeded.
+	maintenanceTimeout = 30 * time.Minute
+
+	// dialProbeTimeout bounds the "is anything listening?" TCP probe used to
+	// tell a slow server from an absent one.
+	dialProbeTimeout = 2 * time.Second
 )
 
 // Client talks to the continuity server.
@@ -55,8 +79,59 @@ func NewClient() *Client {
 	}
 }
 
+// NewCLIClient creates a client for interactive CLI use. Same target, longer
+// patience — see cliTimeout.
+func NewCLIClient() *Client {
+	return &Client{
+		http:      &http.Client{Timeout: cliTimeout},
+		serverURL: ResolveServerURL(),
+	}
+}
+
+// NewMaintenanceClient creates a client for long-running maintenance commands
+// (prune/VACUUM). Same target, minutes of patience — see maintenanceTimeout.
+func NewMaintenanceClient() *Client {
+	return &Client{
+		http:      &http.Client{Timeout: maintenanceTimeout},
+		serverURL: ResolveServerURL(),
+	}
+}
+
 // ServerURL returns the resolved base URL this client targets.
 func (c *Client) ServerURL() string { return c.serverURL }
+
+// isListening reports whether anything accepts a TCP connection at the client's
+// target address. This is what makes "slow" distinguishable from "dead": a
+// request timeout alone proves nothing, because DNS timeouts, black-holed
+// addresses, and unroutable hosts all time out with no server involved. A
+// successful dial is positive evidence that something is there to be slow.
+//
+// Unknown/unparseable targets return false — claiming a server is running is
+// the assertion that needs evidence, so absent evidence we do not make it.
+func (c *Client) isListening() bool {
+	u, err := url.Parse(c.serverURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Host
+	if u.Port() == "" {
+		switch u.Scheme {
+		case "https":
+			host = net.JoinHostPort(u.Hostname(), "443")
+		default:
+			host = net.JoinHostPort(u.Hostname(), "80")
+		}
+	}
+	conn, err := net.DialTimeout("tcp", host, dialProbeTimeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// timeout returns the client's configured request timeout.
+func (c *Client) timeout() time.Duration { return c.http.Timeout }
 
 // Post sends a POST request with JSON body. Returns response body.
 func (c *Client) Post(path string, body []byte) ([]byte, error) {
@@ -95,11 +170,85 @@ func (c *Client) Get(path string) ([]byte, error) {
 }
 
 // Healthy checks if the server is reachable.
+//
+// Deliberately does NOT run the dial probe that CheckHealth uses. Hooks call
+// this inline in Claude Code's event loop, and a boolean answer gains nothing
+// from distinguishing slow-from-dead — either way the server is unusable right
+// now. Paying a second 2s probe on top of an already-elapsed 5s timeout would
+// make a black-holed target cost the editor 7s per hook instead of 5s. The
+// distinction is only worth buying where a human reads the reason.
 func (c *Client) Healthy() bool {
 	resp, err := c.http.Get(c.serverURL + "/api/health")
 	if err != nil {
 		return false
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
+}
+
+// CheckHealth probes the server and returns nil when it is reachable, or an
+// error that says which failure actually occurred.
+//
+// The distinction is load-bearing. Collapsing every transport error into "not
+// running" is what made issue #72 cost an afternoon: a healthy daemon answering
+// correctly — but slower than the client timeout — reported as a dead one,
+// sending the reporter after the port and the embedder while the real cause was
+// an unbounded table. A timeout means the server IS there and IS answering; it
+// just did not finish in time.
+func (c *Client) CheckHealth() error {
+	resp, err := c.http.Get(c.serverURL + "/api/health")
+	if err != nil {
+		// A timeout alone does not prove a server exists — only a successful
+		// dial does. Without that check, a black-holed CONTINUITY_URL or a DNS
+		// timeout would be reported as "running but slow", which is the same
+		// misdiagnosis as issue #72 pointed the other way.
+		if IsTimeout(err) && c.isListening() {
+			return fmt.Errorf("continuity server at %s is running but did not respond within %s — "+
+				"this usually means the database has grown large; try: continuity prune",
+				c.serverURL, c.timeout())
+		}
+		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("continuity server at %s is reachable but unhealthy (status %d)", c.serverURL, resp.StatusCode)
+	}
+	return nil
+}
+
+// DescribeError converts a request error from Post/Get into an operator-facing
+// message, preserving the slow-vs-dead distinction that CheckHealth draws.
+// Health can pass and a subsequent query still time out — /api/health answers
+// instantly regardless of table size, which is precisely why it stayed green
+// throughout issue #72.
+func (c *Client) DescribeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if IsTimeout(err) {
+		if c.isListening() {
+			return fmt.Errorf("continuity server did not respond within %s — "+
+				"the server is running, but the query is slow; try: continuity prune (original: %w)",
+				c.timeout(), err)
+		}
+		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
+	}
+	// A connection failure is the common dead-daemon case and arrives here as a
+	// raw dial error. Callers that skip CheckHealth (prune, deliberately — see
+	// runPrune) would otherwise surface "dial tcp ...: connection refused"
+	// instead of something actionable.
+	if !c.isListening() {
+		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
+	}
+	return err
+}
+
+// IsTimeout reports whether err is a request timeout (client deadline or an
+// underlying network timeout) rather than a connection failure.
+func IsTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }

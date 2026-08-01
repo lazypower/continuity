@@ -231,6 +231,84 @@ func (s *Server) handleUnmarkEmptyExtractions(w http.ResponseWriter, r *http.Req
 	})
 }
 
+// pruneWriteDeadline is how long a prune response may take to produce. It must
+// exceed the server's global WriteTimeout because VACUUM is the one endpoint
+// whose work is legitimately measured in minutes; it is matched by the CLI's
+// maintenance-client timeout so neither side abandons the other.
+const pruneWriteDeadline = 30 * time.Minute
+
+// handlePrune reclaims spent observations and optionally compacts the database
+// file. Routed through the server rather than run against the file directly
+// because the daemon owns the write connection — VACUUM from a second process
+// would contend with it.
+//
+// dry_run reports what would be reclaimed without deleting. vacuum=false skips
+// compaction, which is the slow half and needs free space roughly equal to the
+// current file size.
+func (s *Server) handlePrune(w http.ResponseWriter, r *http.Request) {
+	dryRun := r.URL.Query().Get("dry_run") == "true"
+	doVacuum := r.URL.Query().Get("vacuum") != "false"
+
+	// The server's global WriteTimeout is 30s, but VACUUM on a multi-gigabyte
+	// database is minutes of work. Without extending the deadline the compaction
+	// would succeed while the response was discarded, leaving the operator with
+	// a transport error after waiting out a destructive maintenance operation.
+	if !dryRun && doVacuum {
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(pruneWriteDeadline)); err != nil {
+			log.Printf("prune: could not extend write deadline (%v) — a long VACUUM may not report back", err)
+		}
+	}
+
+	before := s.db.SizeOnDisk()
+
+	if dryRun {
+		n, err := engine.CountSpentObservations(s.db)
+		if err != nil {
+			log.Printf("prune dry-run: %v", err)
+			jsonError(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		encodeJSON(w, map[string]any{
+			"status":       "ok",
+			"dry_run":      true,
+			"reclaimable":  n,
+			"bytes_before": before,
+		})
+		return
+	}
+
+	pruned, err := engine.PruneObservations(s.db)
+	if err != nil {
+		log.Printf("prune: %v", err)
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	vacuumed := false
+	if doVacuum {
+		if err := s.db.Vacuum(); err != nil {
+			// The delete already succeeded and is the durable half — report it
+			// rather than failing the whole call over reclaiming file space.
+			log.Printf("prune: vacuum failed after pruning %d observation(s): %v", pruned, err)
+		} else {
+			vacuumed = true
+		}
+	}
+
+	after := s.db.SizeOnDisk()
+	log.Printf("prune: reclaimed %d observation(s), %d → %d bytes (vacuum: %t)", pruned, before, after, vacuumed)
+
+	w.Header().Set("Content-Type", "application/json")
+	encodeJSON(w, map[string]any{
+		"status":       "ok",
+		"pruned":       pruned,
+		"vacuumed":     vacuumed,
+		"bytes_before": before,
+		"bytes_after":  after,
+	})
+}
+
 func (s *Server) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	uri := r.URL.Query().Get("uri")
 	if uri == "" {

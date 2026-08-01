@@ -106,6 +106,9 @@ func (s *Server) routes() {
 		r.Post("/sessions/{sessionID}/extract", s.handleExtractSession)
 		r.Post("/sessions/unmark-empty-extractions", s.handleUnmarkEmptyExtractions)
 
+		// Retention: reclaim spent observations + compact the file
+		r.Post("/prune", s.handlePrune)
+
 		// Phase 4: signal keywords
 		r.Post("/sessions/{sessionID}/signal", s.handleSignal)
 
@@ -168,6 +171,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Read the gauge cached by the last retention sweep rather than measuring
+	// here. Health MUST stay O(1): a health check that scales with table size
+	// would recreate the very failure this surfaces — and worse, `continuity
+	// prune` would become unreachable on exactly the databases that need it.
+	// A few hours of staleness is the right trade for a constant-time probe.
+	spentObservations := engine.SpentObservationsGauge()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		// Existing fields, preserved for backward-compat.
@@ -183,6 +193,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"pending_extractions": pendingExtractions,
 		"gc_mode":             gcMode,
 		"gc_reclaimable":      gcReclaimable,
+		"spent_observations":  spentObservations,
+		"db_bytes":            s.db.SizeOnDisk(),
 		"pid":                 os.Getpid(),
 		"started_at":          s.started.Unix(),
 		"db_path":             s.db.Path,

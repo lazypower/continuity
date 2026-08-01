@@ -308,6 +308,13 @@ func HermeticEnv(t *testing.T, workDir string, dbPath string, port int) (string,
 		"CONTINUITY_BIND=127.0.0.1",
 		"CONTINUITY_EMBEDDER=tfidf",
 		"CONTINUITY_URL="+serverURL,
+		// Pin observation retention off. Fixtures seed observations at a frozen
+		// timestamp (store.seedConst), which is always older than the grace
+		// window, so a booting server would reclaim them mid-test and the
+		// failure would surface as "migration lost data" rather than "retention
+		// ran". Retention has its own tests; e2e tests should not depend on
+		// ambient wall-clock policy.
+		"CONTINUITY_OBSERVATION_RETENTION_DAYS=off",
 	)
 	return serverURL, env
 }

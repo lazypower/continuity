@@ -39,9 +39,9 @@ var unpinCmd = &cobra.Command{
 }
 
 func runPin(cmd *cobra.Command, args []string) error {
-	client := hooks.NewClient()
-	if !client.Healthy() {
-		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
+	client := hooks.NewCLIClient()
+	if err := client.CheckHealth(); err != nil {
+		return err
 	}
 
 	// No argument → list current pins.
@@ -84,9 +84,9 @@ func runUnpin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid URI %q: must start with mem://", uri)
 	}
 
-	client := hooks.NewClient()
-	if !client.Healthy() {
-		return fmt.Errorf("continuity server is not running — start it with: continuity serve")
+	client := hooks.NewCLIClient()
+	if err := client.CheckHealth(); err != nil {
+		return err
 	}
 
 	warnIfSkewed()
