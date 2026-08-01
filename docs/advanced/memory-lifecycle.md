@@ -6,6 +6,11 @@ What happens to a memory over time: how relevance decays, which categories the c
 
 **Audience:** engineer · **Read time:** ~9 min
 
+<p align="center">
+  <img src="../assets/memory-lifecycle.svg" alt="The life of one memory: captured, stored at three sizes, surfaced in sessions, relevance fading over 90 days without use and resetting when read, and retraction erasing the body while keeping a receipt." width="820" />
+</p>
+
+
 Four separate mechanisms act on stored data on a schedule. They are easy to
 conflate and they are not the same thing:
 

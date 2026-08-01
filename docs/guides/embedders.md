@@ -7,6 +7,11 @@ using, and how to change it safely.
 
 **Audience:** operator · **Read time:** ~3 min
 
+<p align="center">
+  <img src="../assets/embedder-selection.svg" alt="How Continuity picks a search backend at startup: environment variable first, then the config file, then the method your existing memories were built with, then the built-in default for a fresh database." width="820" />
+</p>
+
+
 ---
 
 ## What this is
@@ -22,11 +27,11 @@ ships with three, and you almost certainly do not need to change the one you hav
 
 ## The three options
 
-| Backend | Setup | Finds meaning? | Notes |
+| Backend | Name in commands | Setup | Finds meaning? |
 |---|---|---|---|
-| **Built-in semantic** (default) | none | yes | Downloads a ~33 MB model file once, then runs inside Continuity. No separate service. |
-| **Ollama** | install Ollama, pull a model | yes, best quality | The strongest option, and what the project is developed against. Requires a separate service running. |
-| **Keyword fallback** | none | no | Matches on shared words only. Used automatically if the download fails. |
+| **Built-in semantic** (default) | `model2vec` | none | yes — downloads a ~33 MB model file once, then runs inside Continuity |
+| **Ollama** | `ollama` | install [Ollama](https://ollama.com), then `ollama pull nomic-embed-text` | yes, best quality — needs Ollama running |
+| **Keyword fallback** | `hashtf` | none | no — matches shared words only; used automatically if the download fails |
 
 **New installs get the built-in semantic backend.** The first time it is used it
 downloads a model file to `~/.continuity/models/`. If you are offline on first
@@ -75,8 +80,10 @@ the tree still browses, your profile still loads. New memories are stored withou
 search entries and get filled in once you resolve the mismatch. **Nothing is
 lost.**
 
-The usual way to end up here is changing the setting by hand, or installing
-Ollama after having run without it.
+The usual way to end up here is editing the setting by hand, or setting the
+`CONTINUITY_EMBEDDER` environment variable. Simply installing Ollama does **not**
+do this — Continuity matches whatever your memories were built with and will not
+switch you on its own.
 
 ## Switching backends
 
@@ -89,8 +96,19 @@ continuity restart
 ```
 
 It checks the new engine actually works before changing anything, takes a safety
-copy of your database, rebuilds every memory's search entry, and saves the
-setting. On a large memory tree this takes a few minutes.
+copy of your database into `~/.continuity/snapshots/`, rebuilds every memory's
+search entry, and saves the setting. On a large memory tree this takes a few
+minutes.
+
+Confirm it worked — you want `match: yes` again:
+
+```bash
+continuity embedder status
+```
+
+That safety copy is a full database copy and nothing expires it. Once you are
+satisfied, reclaim the space with `continuity snapshot list` and
+`continuity snapshot prune`.
 
 > **Editing `config.toml` by hand does not do this.** It changes which engine
 > Continuity picks on next start, but leaves your existing memories built with

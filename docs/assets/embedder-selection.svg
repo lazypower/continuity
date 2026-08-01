@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 720" width="820" height="720" role="img" aria-labelledby="title desc">
+  <title id="title">How Continuity chooses a search backend at startup</title>
+  <desc id="desc">A top-to-bottom decision flow with four steps, checked in order, where the first match wins. Step one: if the CONTINUITY_EMBEDDER environment variable names a backend, use exactly that one. Step two: otherwise, if config.toml sets embedder backend, use that. Step three: otherwise, if this database already declares the search method it was indexed with, use the matching backend, so an existing install is never silently downgraded. Step four: otherwise the database is fresh, and the built-in model2vec default is used; if its files cannot be downloaded on a first run, Continuity falls back to keyword search for that session. Finally, if the chosen backend does not match what the database was indexed with, search is disabled and an error is shown rather than returning unreliable results.</desc>
+
+  <style>
+    :root {
+      --ink: #1c1c1c;
+      --muted: #5c6370;
+      --line: #9aa2af;
+      --fill: #ffffff;
+      --accent: #2f6f4f;
+      --accent-fill: #eaf4ee;
+      --store: #3c5a86;
+      --store-fill: #e9eff8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #e6e6e6;
+        --muted: #a0a8b4;
+        --line: #6b7583;
+        --fill: #1a1c20;
+        --accent: #7fc79d;
+        --accent-fill: #1e2a24;
+        --store: #8fb0dd;
+        --store-fill: #1c2430;
+      }
+    }
+    .box { fill: var(--fill); stroke: var(--line); stroke-width: 1.5; rx: 6; }
+    .box-accent { fill: var(--accent-fill); stroke: var(--accent); stroke-width: 1.5; rx: 6; }
+    .box-store { fill: var(--store-fill); stroke: var(--store); stroke-width: 1.5; rx: 6; }
+    .t { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; fill: var(--ink); }
+    .t-title { font-size: 14px; font-weight: 600; }
+    .t-sub { font-size: 11.5px; fill: var(--muted); }
+    .t-edge { font-size: 11px; fill: var(--muted); }
+    .edge { stroke: var(--line); stroke-width: 1.5; fill: none; }
+    .edge-accent { stroke: var(--accent); stroke-width: 1.75; fill: none; }
+    .dash { stroke-dasharray: 5 4; }
+  </style>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line)"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+
+  <text class="t t-title" x="410" y="34" text-anchor="middle">How Continuity picks a search backend at startup</text>
+  <text class="t t-sub" x="410" y="56" text-anchor="middle">Checked in this order every time the service starts. The first match wins.</text>
+
+  <!-- Step 1 -->
+  <rect class="box" x="60" y="82" width="300" height="76"/>
+  <text class="t t-title" x="80" y="108">1. Environment variable</text>
+  <text class="t t-sub" x="80" y="128">Is CONTINUITY_EMBEDDER set to a</text>
+  <text class="t t-sub" x="80" y="145">backend name?</text>
+  <path class="edge-accent" d="M 362 120 L 456 120" marker-end="url(#arrow-accent)"/>
+  <text class="t t-edge" x="409" y="112" text-anchor="middle">yes</text>
+  <rect class="box-accent" x="460" y="82" width="300" height="76"/>
+  <text class="t t-title" x="480" y="108">Use exactly that backend</text>
+  <text class="t t-sub" x="480" y="128">Beats everything below it. A name</text>
+  <text class="t t-sub" x="480" y="145">nobody recognises is warned and skipped.</text>
+  <path class="edge" d="M 210 158 L 210 200" marker-end="url(#arrow)"/>
+  <text class="t t-edge" x="222" y="184">no</text>
+
+  <!-- Step 2 -->
+  <rect class="box" x="60" y="202" width="300" height="76"/>
+  <text class="t t-title" x="80" y="228">2. Configuration file</text>
+  <text class="t t-sub" x="80" y="248">Does config.toml set the backend</text>
+  <text class="t t-sub" x="80" y="265">under [embedder]?</text>
+  <path class="edge-accent" d="M 362 240 L 456 240" marker-end="url(#arrow-accent)"/>
+  <text class="t t-edge" x="409" y="232" text-anchor="middle">yes</text>
+  <rect class="box-accent" x="460" y="202" width="300" height="76"/>
+  <text class="t t-title" x="480" y="228">Use that backend</text>
+  <text class="t t-sub" x="480" y="248">The saved form of the same choice —</text>
+  <text class="t t-sub" x="480" y="265">what `continuity embedder use` writes.</text>
+  <path class="edge" d="M 210 278 L 210 320" marker-end="url(#arrow)"/>
+  <text class="t t-edge" x="222" y="304">no</text>
+
+  <!-- Step 3 -->
+  <rect class="box" x="60" y="322" width="300" height="76"/>
+  <text class="t t-title" x="80" y="348">3. What this database uses</text>
+  <text class="t t-sub" x="80" y="368">Has this database already declared the</text>
+  <text class="t t-sub" x="80" y="385">search method it was built with?</text>
+  <path class="edge-accent" d="M 362 360 L 456 360" marker-end="url(#arrow-accent)"/>
+  <text class="t t-edge" x="409" y="352" text-anchor="middle">yes</text>
+  <rect class="box-store" x="460" y="322" width="300" height="76"/>
+  <text class="t t-title" x="480" y="348">Use the matching backend</text>
+  <text class="t t-sub" x="480" y="368">An existing install is never silently</text>
+  <text class="t t-sub" x="480" y="385">moved to a different search method.</text>
+  <path class="edge" d="M 210 398 L 210 440" marker-end="url(#arrow)"/>
+  <text class="t t-edge" x="222" y="424">no</text>
+
+  <!-- Step 4 -->
+  <rect class="box" x="60" y="442" width="300" height="76"/>
+  <text class="t t-title" x="80" y="468">4. Fresh database</text>
+  <text class="t t-sub" x="80" y="488">Nothing indexed yet, nothing chosen —</text>
+  <text class="t t-sub" x="80" y="505">a brand new install.</text>
+  <path class="edge-accent" d="M 362 480 L 456 480" marker-end="url(#arrow-accent)"/>
+  <rect class="box-accent" x="460" y="442" width="300" height="76"/>
+  <text class="t t-title" x="480" y="468">Built-in default (model2vec)</text>
+  <text class="t t-sub" x="480" y="488">Runs on your machine. If its files cannot</text>
+  <text class="t t-sub" x="480" y="505">be fetched, keyword search for this run.</text>
+
+  <!-- mismatch route -->
+  <path class="edge dash" d="M 762 120 L 790 120 L 790 634 L 744 634" marker-end="url(#arrow)"/>
+  <path class="edge dash" d="M 762 240 L 790 240"/>
+
+  <!-- mismatch outcome -->
+  <rect class="box-store" x="60" y="572" width="680" height="124"/>
+  <text class="t t-title" x="80" y="600">If the chosen backend does not match the database</text>
+  <text class="t t-sub" x="80" y="622">Continuity refuses to search rather than hand back unreliable results.</text>
+  <text class="t t-sub" x="80" y="640">Startup prints a warning and search stays off until you switch back, or re-index</text>
+  <text class="t t-sub" x="80" y="658">the database with `continuity doctor --repair-vectors`.</text>
+  <text class="t t-sub" x="80" y="680">Steps 1 and 2 can land you here. Step 3 exists so the automatic path never does.</text>
+</svg>

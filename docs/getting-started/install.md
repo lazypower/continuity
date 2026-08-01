@@ -8,8 +8,8 @@ Get the `continuity` program onto your machine and confirm it runs.
 
 ---
 
-Continuity is a single program with no runtime dependencies. No Docker, no
-Node.js, no Python.
+Continuity is a single program. Nothing else needs to be installed for it to run
+— no Docker, no Node.js, no Python.
 
 ## Pick one
 
@@ -50,6 +50,12 @@ continuity version
 continuity v0.11.0 (commit: 4afa791, built: 2026-08-01)
 ```
 
+Your version and commit will differ — any output here means the install worked.
+If you get `command not found`, the binary is not on your `PATH`. Homebrew puts
+it in `/opt/homebrew/bin` (Apple Silicon), `/usr/local/bin` (Intel macOS and
+Linux); the install script uses `/usr/local/bin`. Add that directory to `PATH`
+in your shell profile.
+
 ## Start the server
 
 ```bash
@@ -68,8 +74,11 @@ search method downloads a ~33 MB model file once, into
 `~/.continuity/models/`. If you are offline, Continuity falls back to simple
 keyword matching for now and tells you so.
 
-Leave that running and open a second terminal, or better, set it up to run on its
-own:
+Leave that running and open a second terminal.
+
+**Or run it as a managed service instead** — recommended, and what most people
+want. Only one server can hold the port, so **stop the foreground one first**
+(`Ctrl-C` in that terminal):
 
 ```bash
 continuity install-service

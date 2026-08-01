@@ -25,8 +25,17 @@ Hooks are commands Claude Code runs automatically at fixed points — when a
 session starts, when you send a message, after each tool call, and when the
 session ends.
 
-Add this to `~/.claude/settings.json`. If the file already has a `"hooks"` key,
-merge these in rather than replacing it:
+Add this to `~/.claude/settings.json`.
+
+**If the file already has a `"hooks"` key, merge rather than replace.** For each
+event below that already exists, append Continuity's entry to that event's
+existing array — do not overwrite it, or you will silently disable whatever else
+was wired to that event.
+
+**What this records:** once `PostToolUse` is enabled, every tool call your agent
+makes is written to the database, including the input it was given and the
+response it returned. Those records are deleted automatically after 14 days —
+see [What gets remembered](../guides/what-gets-remembered.md).
 
 ```json
 {
@@ -105,28 +114,42 @@ crash.
 For anything long-lived, prefer `continuity install-service`, which is properly
 managed. Run `continuity init` without the flag to turn autostart off again.
 
-## The one-step alternative
+## The plugin bundle
 
-Everything above ships as a Claude Code plugin — hooks and MCP registration in a
-single install. Try it locally with:
+Steps 1 and 2 — hooks and MCP registration, though **not** the directives — also
+ship as a Claude Code plugin. It lives in the source repository rather than in
+the installed binary, so it is only useful if you have the repo checked out:
 
 ```bash
-claude --plugin-dir ./plugin
+git clone https://github.com/lazypower/continuity.git
+claude --plugin-dir ./continuity/plugin
 ```
+
+That loads it for one invocation, for trying it out. For a permanent setup, use
+the three steps above.
 
 ## Check it worked
 
-Restart Claude Code, start a session, and ask your agent what it remembers about
-you. On a fresh install the honest answer is "nothing yet" — that is fine. What
-matters is that it does not error.
+Restart Claude Code and start a session. Then verify each connection separately —
+they fail independently, so a single check would not tell you much.
 
-To confirm the session is being seen:
+**Hooks are firing.** A session from the last few minutes should be listed:
 
 ```bash
 continuity timeline
 ```
 
-A session recorded in the last few minutes means the hooks are firing.
+**MCP tools are registered.** In Claude Code, run `/mcp` — `continuity` should
+appear with its six tools.
+
+**Directives are in place.** The managed block should be present:
+
+```bash
+grep -c "continuity:managed" ~/.claude/CLAUDE.md    # expect 2 — start and end markers
+```
+
+Asking your agent what it remembers about you is a reasonable smoke test, but on
+a fresh install the honest answer is "nothing yet".
 
 ---
 

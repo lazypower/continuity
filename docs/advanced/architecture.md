@@ -6,6 +6,10 @@ How Continuity's processes divide up the work, how they reach the single SQLite 
 
 **Audience:** engineer · **Read time:** ~8 min
 
+<p align="center">
+  <img src="../assets/architecture.svg" alt="Claude Code reaches the Continuity daemon through hooks and MCP tools; the CLI and web interface reach it over HTTP. The daemon owns a single SQLite database, runs the search backend in-process, and optionally calls out to an LLM provider." width="760" />
+</p>
+
 ## One binary, four roles
 
 There is exactly one executable. Which role it plays is decided by the

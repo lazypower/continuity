@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 450" width="980" height="450" role="img" aria-labelledby="title desc">
+  <title id="title">What Continuity does at each point of a Claude Code session</title>
+  <desc id="desc">A left-to-right timeline of one Claude Code session with five hook points. At SessionStart, saved memories are loaded into the agent's context and nothing is written. At UserPromptSubmit, a trigger phrase such as "remember this", "always use" or "the fix was" saves a memory immediately; this is the only point where a memory is written automatically. At PostToolUse, every tool call is saved as a raw activity note, which is not a memory. At Stop, the turn is marked finished and the transcript is offered for automatic extraction, which is declined by default. At SessionEnd, the session is marked closed and the transcript is offered once more, also declined by default. Automatic end-of-session extraction is off unless the operator sets extraction.auto to true in config.toml, so memories are written when you ask for them.</desc>
+
+  <style>
+    :root {
+      --ink: #1c1c1c;
+      --muted: #5c6370;
+      --line: #9aa2af;
+      --fill: #ffffff;
+      --accent: #2f6f4f;
+      --accent-fill: #eaf4ee;
+      --store: #3c5a86;
+      --store-fill: #e9eff8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #e6e6e6;
+        --muted: #a0a8b4;
+        --line: #6b7583;
+        --fill: #1a1c20;
+        --accent: #7fc79d;
+        --accent-fill: #1e2a24;
+        --store: #8fb0dd;
+        --store-fill: #1c2430;
+      }
+    }
+    .box { fill: var(--fill); stroke: var(--line); stroke-width: 1.5; rx: 6; }
+    .box-accent { fill: var(--accent-fill); stroke: var(--accent); stroke-width: 1.5; rx: 6; }
+    .box-store { fill: var(--store-fill); stroke: var(--store); stroke-width: 1.5; rx: 6; }
+    .t { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; fill: var(--ink); }
+    .t-title { font-size: 14px; font-weight: 600; }
+    .t-sub { font-size: 11.5px; fill: var(--muted); }
+    .t-edge { font-size: 11px; fill: var(--muted); }
+    .edge { stroke: var(--line); stroke-width: 1.5; fill: none; }
+    .edge-accent { stroke: var(--accent); stroke-width: 1.75; fill: none; }
+    .dash { stroke-dasharray: 5 4; }
+  </style>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line)"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+
+  <text class="t t-title" x="490" y="32" text-anchor="middle">One Claude Code session, start to finish</text>
+  <text class="t t-edge" x="946" y="56" text-anchor="end">time →</text>
+
+  <!-- timeline -->
+  <path class="edge-accent" d="M 30 68 L 944 68" marker-end="url(#arrow-accent)"/>
+  <circle cx="114" cy="68" r="6" fill="var(--accent)"/>
+  <circle cx="302" cy="68" r="6" fill="var(--accent)"/>
+  <circle cx="490" cy="68" r="6" fill="var(--accent)"/>
+  <circle cx="678" cy="68" r="6" fill="var(--accent)"/>
+  <circle cx="866" cy="68" r="6" fill="var(--accent)"/>
+  <path class="edge" d="M 114 74 L 114 88"/>
+  <path class="edge" d="M 302 74 L 302 88"/>
+  <path class="edge" d="M 490 74 L 490 88"/>
+  <path class="edge" d="M 678 74 L 678 88"/>
+  <path class="edge" d="M 866 74 L 866 88"/>
+
+  <!-- 1. SessionStart -->
+  <rect class="box-store" x="30" y="88" width="168" height="52"/>
+  <text class="t t-title" x="114" y="110" text-anchor="middle">SessionStart</text>
+  <text class="t t-sub" x="114" y="129" text-anchor="middle">session opens</text>
+  <rect class="box" x="30" y="152" width="168" height="160"/>
+  <text class="t t-sub" x="114" y="176" text-anchor="middle">Saved memories are</text>
+  <text class="t t-sub" x="114" y="193" text-anchor="middle">loaded into the agent's</text>
+  <text class="t t-sub" x="114" y="210" text-anchor="middle">context.</text>
+  <text class="t t-sub" x="114" y="244" text-anchor="middle">Read-only — nothing is</text>
+  <text class="t t-sub" x="114" y="261" text-anchor="middle">written at this point.</text>
+
+  <!-- 2. UserPromptSubmit -->
+  <rect class="box-store" x="218" y="88" width="168" height="52"/>
+  <text class="t t-title" x="302" y="110" text-anchor="middle">UserPromptSubmit</text>
+  <text class="t t-sub" x="302" y="129" text-anchor="middle">you send a message</text>
+  <rect class="box-accent" x="218" y="152" width="168" height="160"/>
+  <text class="t t-sub" x="302" y="176" text-anchor="middle">The only automatic</text>
+  <text class="t t-sub" x="302" y="193" text-anchor="middle">write point in a session.</text>
+  <text class="t t-sub" x="302" y="227" text-anchor="middle">Trigger phrases save</text>
+  <text class="t t-sub" x="302" y="244" text-anchor="middle">right away: "remember</text>
+  <text class="t t-sub" x="302" y="261" text-anchor="middle">this", "always use",</text>
+  <text class="t t-sub" x="302" y="278" text-anchor="middle">"the fix was".</text>
+  <text class="t t-sub" x="302" y="299" text-anchor="middle">Short messages only.</text>
+
+  <!-- 3. PostToolUse -->
+  <rect class="box-store" x="406" y="88" width="168" height="52"/>
+  <text class="t t-title" x="490" y="110" text-anchor="middle">PostToolUse</text>
+  <text class="t t-sub" x="490" y="129" text-anchor="middle">after each tool call</text>
+  <rect class="box" x="406" y="152" width="168" height="160"/>
+  <text class="t t-sub" x="490" y="176" text-anchor="middle">Every tool call is saved</text>
+  <text class="t t-sub" x="490" y="193" text-anchor="middle">as a raw activity note.</text>
+  <text class="t t-sub" x="490" y="227" text-anchor="middle">Housekeeping tools like</text>
+  <text class="t t-sub" x="490" y="244" text-anchor="middle">to-do lists are skipped.</text>
+  <text class="t t-sub" x="490" y="278" text-anchor="middle">Activity notes are</text>
+  <text class="t t-sub" x="490" y="295" text-anchor="middle">not memories.</text>
+
+  <!-- 4. Stop -->
+  <rect class="box-store" x="594" y="88" width="168" height="52"/>
+  <text class="t t-title" x="678" y="110" text-anchor="middle">Stop</text>
+  <text class="t t-sub" x="678" y="129" text-anchor="middle">end of each turn</text>
+  <rect class="box" x="594" y="152" width="168" height="160"/>
+  <text class="t t-sub" x="678" y="176" text-anchor="middle">Marks the turn finished.</text>
+  <text class="t t-sub" x="678" y="193" text-anchor="middle">Fires after every turn,</text>
+  <text class="t t-sub" x="678" y="210" text-anchor="middle">not only at the end.</text>
+  <text class="t t-sub" x="678" y="244" text-anchor="middle">Offers the transcript for</text>
+  <text class="t t-sub" x="678" y="261" text-anchor="middle">automatic extraction —</text>
+  <text class="t t-sub" x="678" y="278" text-anchor="middle">declined by default.</text>
+
+  <!-- 5. SessionEnd -->
+  <rect class="box-store" x="782" y="88" width="168" height="52"/>
+  <text class="t t-title" x="866" y="110" text-anchor="middle">SessionEnd</text>
+  <text class="t t-sub" x="866" y="129" text-anchor="middle">session closes</text>
+  <rect class="box" x="782" y="152" width="168" height="160"/>
+  <text class="t t-sub" x="866" y="176" text-anchor="middle">Marks the session closed.</text>
+  <text class="t t-sub" x="866" y="210" text-anchor="middle">Offers the transcript one</text>
+  <text class="t t-sub" x="866" y="227" text-anchor="middle">last time — also</text>
+  <text class="t t-sub" x="866" y="244" text-anchor="middle">declined by default.</text>
+  <text class="t t-sub" x="866" y="278" text-anchor="middle">No memories written here.</text>
+
+  <!-- callout -->
+  <rect class="box-accent" x="30" y="334" width="920" height="86"/>
+  <text class="t t-title" x="490" y="360" text-anchor="middle">Automatic end-of-session extraction is OFF by default.</text>
+  <text class="t t-sub" x="490" y="381" text-anchor="middle">Memories are written when you ask: a trigger phrase above, `continuity remember`, or the agent's own save tool.</text>
+  <text class="t t-sub" x="490" y="400" text-anchor="middle">Stop and SessionEnd only offer the transcript — Continuity declines it unless extraction.auto = true is set in config.toml.</text>
+</svg>

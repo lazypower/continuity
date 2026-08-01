@@ -9,8 +9,7 @@ setting might not be taking effect.
 
 ---
 
-Continuity works with no configuration at all. This page is for when you want to
-change something.
+Continuity works with no configuration at all.
 
 ## Two places settings live
 
@@ -37,11 +36,17 @@ under a service manager.
 
 ```bash
 CONTINUITY_PORT=37778
-CONTINUITY_DB=/tmp/scratch.db
+CONTINUITY_DB=~/continuity-scratch.db
 CONTINUITY_OBSERVATION_RETENTION_DAYS=off
 ```
 
 **Environment variables always win** over the config file.
+
+A bare assignment only affects the shell you typed it in. For a background
+service, put it in the service definition — the `EnvironmentVariables` block of
+`~/Library/LaunchAgents/com.continuity.server.plist` on macOS, or an
+`Environment=` line in `~/.config/systemd/user/continuity.service` on Linux —
+then restart.
 
 ## The rule that trips people up
 
@@ -64,10 +69,18 @@ config file, and set it somewhere every shell sees it.
 | `[server].port` / `CONTINUITY_PORT` | `37777` | Port already in use |
 | `[llm].provider` | `claude-cli` | Use the Anthropic API or a local Ollama model instead |
 | `[embedder].backend` | `auto` | Change how search works — **but see the warning below** |
-| `[extraction].auto` | `false` | Turn on automatic session-end memory extraction |
+| `[extraction].auto` | `false` | Turn on automatic memory creation at session end — see the warning below |
 | `CONTINUITY_OBSERVATION_RETENTION_DAYS` | `14` | Keep raw tool-call records longer, or forever |
 
 The full list is in the [configuration reference](../reference/configuration.md).
+
+> **Turning on `[extraction].auto` has costs worth knowing.** Every qualifying
+> session gets sent to your configured model to decide what is worth
+> remembering. That means session-derived text goes to whichever provider you
+> use — and if that is the Anthropic API rather than your Claude subscription,
+> it is billed per token. It is off by default because its usefulness is
+> unmeasured and its writes are indistinguishable from ones you authored. See
+> [Extraction](../advanced/extraction.md).
 
 > **Do not change `[embedder].backend` by hand.** It changes which search engine
 > Continuity uses but leaves your existing memories built with the old one, which

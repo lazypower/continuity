@@ -6,6 +6,11 @@ What each of the five hooks does, why a hook can never fail your session, and th
 
 **Audience:** engineer · **Read time:** ~9 min
 
+<p align="center">
+  <img src="../assets/session-lifecycle.svg" alt="What fires at each of the five hook points during one Claude Code session: memory is injected at session start, trigger phrases save immediately on submit, each tool call is recorded, and end-of-session extraction is declined by default." width="820" />
+</p>
+
+
 ## The shape of a hook
 
 Claude Code writes a JSON object on stdin, runs `continuity hook <event>`, and

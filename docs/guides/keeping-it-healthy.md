@@ -21,14 +21,10 @@ changes anything**. If it says healthy, you are done.
 
 For a live view, open the web interface:
 
-```bash
-open http://localhost:37777
-```
+Open <http://localhost:37777> in a browser (`open` on macOS, `xdg-open` on Linux).
 
 The **Health** tab gives you a plain-language verdict, how much of your memory is
-fresh versus fading, and a "needs attention" list. The **Cold Boot** tab is the
-most useful screen in the product: it shows you *exactly* what your agent wakes
-up with at the start of a session, verbatim, with an approximate token count.
+fresh versus fading, and a "needs attention" list.
 
 ## What runs automatically
 
@@ -59,11 +55,21 @@ running are removed after 14 days.** This is on by default.
 **Your memories are never touched by this.** Memories, their search entries, your
 sessions, summaries and relational profile are all unaffected.
 
-To change or disable it:
+To change or disable it, set `CONTINUITY_OBSERVATION_RETENTION_DAYS` to `off` or
+to a number of days. **The server has to see it**, and a bare assignment in your
+shell will not reach a background service:
+
+- **Service install** — add it to the service definition and reload. On macOS
+  that is the `EnvironmentVariables` block of
+  `~/Library/LaunchAgents/com.continuity.server.plist`; on Linux, an
+  `Environment=` line in `~/.config/systemd/user/continuity.service`.
+- **Started by hand** — `CONTINUITY_OBSERVATION_RETENTION_DAYS=off continuity serve`
+
+Then restart, and confirm it took effect — `spent_observations` will climb
+instead of staying near zero:
 
 ```bash
-CONTINUITY_OBSERVATION_RETENTION_DAYS=off   # never delete
-CONTINUITY_OBSERVATION_RETENTION_DAYS=90    # keep for 90 days instead of 14
+curl -s localhost:37777/api/health
 ```
 
 If you set this to something Continuity cannot understand, it **disables

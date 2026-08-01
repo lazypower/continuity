@@ -11,8 +11,6 @@ deliberately does not capture.
 
 ## What does *not* get captured
 
-Start here, because it is the opposite of what most people assume.
-
 Continuity does **not** read your session transcript and decide on its own what
 was important. That behavior exists, but it is **off by default** and has to be
 turned on deliberately. See [Extraction](../advanced/extraction.md) for why.
@@ -25,10 +23,20 @@ By default, memories are created two ways:
    capture. The phrase has to appear near the start of a normal-length message,
    so a stray "remember this" buried in a giant paste will not trigger it.
 
-Raw tool calls — every file you edited, every command run — are recorded
-separately as **observations**. Those are working scaffolding for the current
-session, not memories, and they are [deleted on a
-schedule](keeping-it-healthy.md#observation-retention).
+Raw tool calls are recorded separately as **observations** — temporary records
+used to assemble the current session's context, not memories. Each one holds the
+tool used, the input it was given, and the response it returned, so **they can
+contain file contents, command output, and any secrets that passed through a
+tool**.
+
+They are deleted automatically: once the session that produced them has
+finished, and the record is at least **14 days** old. Records from sessions still
+running are never touched. See [Keeping it
+healthy](keeping-it-healthy.md#observation-retention) to change or disable that.
+
+Your session transcript itself is not copied into the database. Continuity reads
+the transcript file Claude Code already writes, and only when you explicitly ask
+it to.
 
 ## The categories
 
@@ -64,7 +72,7 @@ of a lot of things cheaply and pull the full text only when it needs it.
 
 | Level | Limit | Used for |
 |---|---|---|
-| Summary | 200 characters | Injected into every session; the only thing search results show |
+| Summary | 200 characters | What gets injected when a memory is surfaced, and the only thing search results show |
 | Body | 2,000 characters | Shown when a memory is opened |
 | Detail | 40,000 characters | Full content, fetched on demand only |
 

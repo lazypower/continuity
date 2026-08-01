@@ -14,12 +14,15 @@ Symptoms you are likely to hit, what causes each one, and what to type.
 continuity server is not running (start it with: continuity serve)
 ```
 
-**If the server really is stopped**, start it, or install it as a service so it
-starts on login:
+**If the server really is stopped**, pick one of these — they are alternatives,
+not steps. Only one server can hold the port:
 
 ```bash
-continuity serve
-continuity install-service      # starts on login, restarts on crash
+continuity serve                # run it in this terminal, for now
+```
+
+```bash
+continuity install-service      # run it as a managed service, on login
 ```
 
 **If the server is running**, the usual cause is a database that has grown large
@@ -120,6 +123,11 @@ continuity: memory cue found but the message is too long to fire as an
 immediate signal — it will still be considered at session end
 ```
 
+**That message overstates what happens.** It dates from when sessions were
+processed automatically at the end. Automatic end-of-session capture is off by
+default, so unless you have deliberately turned it on, nothing will be saved.
+Say it again in a shorter message, or store it directly.
+
 To store something directly, regardless of length, ask your agent to use its
 `remember` tool, or run:
 
@@ -133,9 +141,12 @@ continuity remember -c preferences -n my-slug \
 This is expected. Automatic end-of-session memory creation is **off by default** —
 see [Extraction](../advanced/extraction.md) for the reasoning.
 
-To extract one session by hand:
+To extract one session by hand, find its ID and pass it. `--force` overrides
+both the off-by-default gate and the check that skips already-processed
+sessions:
 
 ```bash
+continuity timeline            # recent sessions, newest last
 continuity extract <session-id> --force
 ```
 

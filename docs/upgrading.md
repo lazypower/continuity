@@ -7,6 +7,11 @@ start, and the automatic safety copy does not cover all of it.
 
 **Audience:** operator · **Read time:** ~6 min
 
+<p align="center">
+  <img src="assets/upgrade-flow.svg" alt="What happens on the first start after an upgrade: a safety copy only when the update rewrites existing records, then the database format update, then automatic cleanup, with disk space reclaimed only by running prune yourself." width="820" />
+</p>
+
+
 ---
 
 ## Does this upgrade delete anything?

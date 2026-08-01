@@ -9,12 +9,8 @@ and from the web interface.
 
 ---
 
-Most of the time you never do this. Your agent reads and writes memory on its
-own. These are the tools for when you want to look yourself — to check what it
-knows, find something you told it months ago, or confirm it captured what you
-meant.
-
-All of these need the server running.
+Your agent reads and writes memory on its own. These are the tools for when you
+want to look yourself. All of them need the server running.
 
 ## Search
 
@@ -51,9 +47,11 @@ continuity show mem://user/preferences/devbox-tooling
 You can drop the `mem://` prefix. To see only one level of detail, use `--layer
 summary`, `--layer body`, or `--layer detail`.
 
-> **Reading a memory counts as using it.** It resets that memory's relevance,
-> which keeps it from fading. Search results do not — being listed is not the
-> same as being read. See [Memory lifecycle](../advanced/memory-lifecycle.md).
+> **Opening a memory counts as using it**, which resets its relevance and keeps
+> it from fading. That applies to `continuity show`, the MCP `show` tool, and
+> expanding a card in the web interface. Being *listed* does not count — search
+> results, `tree`, and session injection all leave relevance alone. See
+> [Memory lifecycle](../advanced/memory-lifecycle.md).
 
 ## Browse the tree
 
@@ -75,9 +73,7 @@ It is the thing that makes a returning agent feel like it knows you. Add
 
 ## The web interface
 
-```bash
-open http://localhost:37777
-```
+Open <http://localhost:37777> in a browser (`open` on macOS, `xdg-open` on Linux).
 
 Five tabs:
 
@@ -89,11 +85,10 @@ Five tabs:
 | **Profile** | The relational profile, rendered |
 | **Cold Boot** | Exactly what your agent wakes up with, verbatim, with a token count |
 
-**Cold Boot is the one to look at first.** Everything else describes your memory;
-that tab shows you the actual text injected into your agent at the start of a
-session. If your agent is not behaving the way you expect, this is where you find
-out what it was actually told. Viewing it does not consume anything — you can
-open it as often as you like.
+**Cold Boot is the one to look at first.** If your agent is not behaving the way
+you expect, this is where you find out what it was actually told. Opening the tab
+is free in both senses: it costs no model tokens, and it does not mark anything
+as used or advance the rotation of which moments appear next.
 
 The interface is read-mostly. You can pin and unpin; you cannot create, edit, or
 retract a memory from it.
@@ -106,8 +101,24 @@ If Continuity captured something wrong, stale, or private:
 continuity retract mem://user/entities/old-server --reason "decommissioned"
 ```
 
-The content is erased but the record stays, marked retracted and excluded from
-normal reads. If something replaced it, link them so the history stays intact:
+**This cannot be undone**, and it does not erase everything. The body and the
+full detail are blanked. **The 200-character summary is kept** as the receipt's
+label, along with the address, category, your reason, and a fingerprint used to
+notice if the same content is written again. Retracted memories are excluded from
+normal reads and never injected into a session, even if they were pinned.
+
+That matters if you are retracting something sensitive. **Check the summary
+first** — if the thing you want gone is in it, retraction alone will not remove
+it:
+
+```bash
+continuity show mem://user/entities/old-server --layer summary
+```
+
+A **safety snapshot from a past upgrade may also still contain the original
+text**. Check `continuity snapshot list` and prune what you no longer need.
+
+If something replaced it, link them so the history stays intact:
 
 ```bash
 continuity retract mem://user/events/old-plan \

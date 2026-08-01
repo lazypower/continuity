@@ -13,7 +13,8 @@ with.
 
 In a Claude Code session, say something worth keeping, with a trigger phrase:
 
-> Remember this: always use devbox for tooling in this project.
+> Remember this: I always want dependencies pinned to exact versions, never
+> ranges.
 
 Phrases like **"remember this"**, **"always use"**, **"never use"**, **"the fix
 was"** and **"root cause was"** save immediately, without waiting for the session
@@ -25,21 +26,21 @@ trigger buried in a long paste is ignored on purpose.
 In a terminal:
 
 ```bash
-continuity search "devbox"
+continuity search "dependency versions"
 ```
 
 ```
-1. [0.412] mem://user/preferences/devbox-tooling
-   Always use devbox for tooling in this project.
+1. [0.412] mem://user/preferences/pinned-dependency-versions
+   Always pin dependencies to exact versions, never ranges.
 ```
 
-If it is there, capture is working end to end.
+The number is a match score — higher is a closer match. The `mem://` string is
+that memory's address; you will use it to pin things below. If your memory shows
+up, it travelled from Claude Code into Continuity's database.
 
 ## See what your agent wakes up with
 
-```bash
-open http://localhost:37777
-```
+Open <http://localhost:37777> in a browser (`open` on macOS, `xdg-open` on Linux).
 
 Go to the **Cold Boot** tab. This is the verbatim text added to your agent's
 instructions at the start of a session, with an approximate token count. Nothing
@@ -58,10 +59,9 @@ Looking at this tab does not consume anything. Open it as often as you like.
 
 ## Start a new session
 
-Close the session and start a fresh one. Ask your agent what it knows about your
-tooling preferences. It should answer from memory, without you re-explaining.
-
-That is the whole point of the product. Everything else is maintenance.
+End the session with `/exit`, then start Claude Code again. Ask your agent how it
+should handle dependency versions. It should answer from memory, without you
+re-explaining.
 
 ## Pin the things that must never be missed
 
@@ -69,11 +69,16 @@ Most memories surface when they are relevant. For the handful that must appear
 every single time:
 
 ```bash
-continuity pin mem://user/preferences/devbox-tooling
+continuity pin mem://user/preferences/pinned-dependency-versions
 ```
 
 There is a cap of seven, deliberately — the list has to stay short enough to be
 read. Check the Cold Boot tab afterwards to see it in place.
+
+> Pin things that are true **everywhere**. A pinned memory is injected into every
+> session in every project, so a rule that only applies to one repository will
+> follow you into all the others. Leave those unpinned — they surface when they
+> are relevant.
 
 ## What now
 

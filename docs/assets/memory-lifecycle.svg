@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 660" width="960" height="660" role="img" aria-labelledby="title desc">
+  <title id="title">The life of one memory in Continuity</title>
+  <desc id="desc">A flow showing the six stages in the life of a single memory. First it is captured, either because you deliberately saved it or because a trigger phrase fired; nothing is captured silently. Second it is stored at three sizes: a summary of up to 200 characters, a body of up to 2,000 characters, and a full detail of up to 40,000 characters, with longer text trimmed to fit. Third it is surfaced, loaded at the start of a session, found by search, or opened on demand. Fourth, its relevance fades on a 90-day half-life when it is not used, following a curve that flattens onto a floor rather than reaching zero, so fading never deletes anything. Fifth, deliberately opening a memory resets its relevance to full, while merely appearing in a list of search results does not count as use, and profile, preferences, feedback and moments never fade at all. Sixth, retraction erases the body and the full detail while keeping the one-line summary, the reason, and the time as an accountable record.</desc>
+
+  <style>
+    :root {
+      --ink: #1c1c1c;
+      --muted: #5c6370;
+      --line: #9aa2af;
+      --fill: #ffffff;
+      --accent: #2f6f4f;
+      --accent-fill: #eaf4ee;
+      --store: #3c5a86;
+      --store-fill: #e9eff8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #e6e6e6;
+        --muted: #a0a8b4;
+        --line: #6b7583;
+        --fill: #1a1c20;
+        --accent: #7fc79d;
+        --accent-fill: #1e2a24;
+        --store: #8fb0dd;
+        --store-fill: #1c2430;
+      }
+    }
+    .box { fill: var(--fill); stroke: var(--line); stroke-width: 1.5; rx: 6; }
+    .box-accent { fill: var(--accent-fill); stroke: var(--accent); stroke-width: 1.5; rx: 6; }
+    .box-store { fill: var(--store-fill); stroke: var(--store); stroke-width: 1.5; rx: 6; }
+    .t { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; fill: var(--ink); }
+    .t-title { font-size: 14px; font-weight: 600; }
+    .t-sub { font-size: 11.5px; fill: var(--muted); }
+    .t-edge { font-size: 11px; fill: var(--muted); }
+    .edge { stroke: var(--line); stroke-width: 1.5; fill: none; }
+    .edge-accent { stroke: var(--accent); stroke-width: 1.75; fill: none; }
+    .dash { stroke-dasharray: 5 4; }
+  </style>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line)"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+
+  <text class="t t-title" x="480" y="34" text-anchor="middle">The life of one memory</text>
+
+  <!-- 1. Captured -->
+  <rect class="box-accent" x="40" y="60" width="250" height="124"/>
+  <text class="t t-title" x="60" y="88">1. Captured</text>
+  <text class="t t-sub" x="60" y="110">You ask the agent to remember it,</text>
+  <text class="t t-sub" x="60" y="128">or a trigger phrase fires during</text>
+  <text class="t t-sub" x="60" y="146">a session.</text>
+  <text class="t t-sub" x="60" y="168">Nothing is captured silently.</text>
+  <path class="edge-accent" d="M 292 122 L 346 122" marker-end="url(#arrow-accent)"/>
+
+  <!-- 2. Stored -->
+  <rect class="box-store" x="350" y="60" width="290" height="124"/>
+  <text class="t t-title" x="370" y="88">2. Stored at three sizes</text>
+  <text class="t t-sub" x="370" y="110">summary — up to 200 characters</text>
+  <text class="t t-sub" x="370" y="128">body — up to 2,000 characters</text>
+  <text class="t t-sub" x="370" y="146">detail — up to 40,000 characters</text>
+  <text class="t t-sub" x="370" y="168">Anything longer is trimmed to fit.</text>
+  <path class="edge-accent" d="M 642 122 L 696 122" marker-end="url(#arrow-accent)"/>
+
+  <!-- 3. Surfaced -->
+  <rect class="box-accent" x="700" y="60" width="220" height="124"/>
+  <text class="t t-title" x="720" y="88">3. Surfaced</text>
+  <text class="t t-sub" x="720" y="110">Loaded at session start.</text>
+  <text class="t t-sub" x="720" y="128">Found by search.</text>
+  <text class="t t-sub" x="720" y="146">Opened on demand by</text>
+  <text class="t t-sub" x="720" y="164">you or the agent.</text>
+
+  <!-- route down to the decay panel -->
+  <path class="edge" d="M 810 186 L 810 208 L 300 208 L 300 228" marker-end="url(#arrow)"/>
+
+  <!-- 4. Decay panel -->
+  <rect class="box" x="40" y="230" width="520" height="220"/>
+  <text class="t t-title" x="60" y="258">4. Relevance fades when it is not used</text>
+  <text class="t t-sub" x="60" y="278">Half of a memory's relevance is gone after 90 days without use.</text>
+
+  <path class="edge" d="M 90 292 L 90 400 L 528 400"/>
+  <path class="edge-accent" d="M 90 300 C 130 322 165 338 198 350 C 235 363 270 371 305 375 C 345 381 385 386 413 388 C 430 389 448 390 461 390 L 520 390"/>
+  <path class="edge dash" d="M 198 350 L 198 400"/>
+  <path class="edge dash" d="M 90 390 L 520 390"/>
+  <text class="t t-edge" x="84" y="304" text-anchor="end">full</text>
+  <text class="t t-edge" x="84" y="394" text-anchor="end">floor</text>
+  <text class="t t-edge" x="90" y="416" text-anchor="middle">day 0</text>
+  <text class="t t-edge" x="198" y="416" text-anchor="middle">90 days</text>
+  <text class="t t-edge" x="512" y="416" text-anchor="middle">1 year</text>
+  <text class="t t-sub" x="60" y="438">The curve flattens onto a floor — fading never deletes anything.</text>
+
+  <path class="edge" d="M 562 340 L 596 340" marker-end="url(#arrow)"/>
+
+  <!-- 5. Reset panel -->
+  <rect class="box-accent" x="600" y="230" width="320" height="220"/>
+  <text class="t t-title" x="620" y="258">5. Opening it resets relevance</text>
+  <text class="t t-sub" x="620" y="282">Deliberately opening a memory —</text>
+  <text class="t t-sub" x="620" y="300">`continuity show`, or the agent reading</text>
+  <text class="t t-sub" x="620" y="318">it in full — puts relevance back to full.</text>
+  <text class="t t-sub" x="620" y="346">Turning up in a list of search results</text>
+  <text class="t t-sub" x="620" y="364">does not count as use.</text>
+  <text class="t t-sub" x="620" y="392">Profile, preferences, feedback and</text>
+  <text class="t t-sub" x="620" y="410">moments never fade at all — the clock</text>
+  <text class="t t-sub" x="620" y="428">does not apply to them.</text>
+
+  <path class="edge" d="M 760 452 L 760 468 L 480 468 L 480 486" marker-end="url(#arrow)"/>
+
+  <!-- 6. Retraction -->
+  <rect class="box-store" x="40" y="488" width="880" height="112"/>
+  <text class="t t-title" x="60" y="516">6. Retraction — for a memory that should not have been written</text>
+  <text class="t t-sub" x="60" y="540">`continuity retract` erases the body and the full detail. The one-line summary stays behind as a receipt, together with the reason</text>
+  <text class="t t-sub" x="60" y="558">given and the time it happened, so the record is accountable rather than erased.</text>
+  <text class="t t-sub" x="60" y="582">From then on the memory is left out of search, browsing and session context. This is the only path that removes content.</text>
+
+  <text class="t t-sub" x="480" y="632" text-anchor="middle">Fading changes how a memory ranks. It never removes it. Deleting content is always a deliberate act.</text>
+</svg>
