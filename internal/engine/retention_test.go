@@ -20,8 +20,17 @@ func TestObservationGraceDurationEnv(t *testing.T) {
 		{name: "off disables", env: "off", wantOK: false},
 		{name: "zero disables", env: "0", wantOK: false},
 		{name: "false disables", env: "false", wantOK: false},
-		{name: "garbage falls back to default", env: "banana", wantDays: 14, wantOK: true},
-		{name: "negative falls back to default", env: "-5", wantDays: 14, wantOK: true},
+		// Unparseable input must fail CLOSED. An operator typing "of" while
+		// reaching for "off" is trying to STOP deletion; answering with the
+		// destructive default is the worst available reading, and the boot
+		// sweep runs immediately so a log line arrives too late to intervene.
+		{name: "garbage disables", env: "banana", wantOK: false},
+		{name: "off typo disables", env: "of", wantOK: false},
+		{name: "negative disables", env: "-5", wantOK: false},
+		// A value meant to retain MORE must never delete more: an unclamped
+		// day count overflows time.Duration into a negative grace, putting the
+		// cutoff in the future and making everything immediately reclaimable.
+		{name: "absurd day count clamps", env: "106752", wantDays: maxRetentionDays, wantOK: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -72,26 +81,52 @@ func TestRetentionDisabledLeavesRowsAlone(t *testing.T) {
 	}
 }
 
-// TestStartDecayTimerRunsObservationRetention is the wiring test. The store
-// package proves the predicate; this proves the sweep is actually connected to
-// the timer, which is the part a refactor could silently drop.
-func TestStartDecayTimerRunsObservationRetention(t *testing.T) {
+// TestStartRetentionTimerSweepsAtBoot is the wiring test. The store package
+// proves the predicate; this proves the sweep is actually connected to a timer,
+// which is the part a refactor could silently drop.
+//
+// Critically, StartRetentionTimer takes a *store.DB and no Engine. serve starts
+// the decay timer only when an LLM is configured; retention must not inherit
+// that condition, because an install with no LLM records observations at
+// exactly the same rate.
+func TestStartRetentionTimerSweepsAtBoot(t *testing.T) {
 	t.Setenv(retentionEnvVar, "14")
 
 	db := newRetentionTestDB(t)
 	seedSpentObservation(t, db, "old-session")
 
-	e := &Engine{DB: db, stopCh: make(chan struct{})}
-	e.StartDecayTimer()
-	defer e.Stop()
+	stop := make(chan struct{})
+	StartRetentionTimer(db, stop)
+	defer close(stop)
 
 	count, err := db.GetSessionObservationCount("old-session")
 	if err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if count != 0 {
-		t.Errorf("observation count = %d after StartDecayTimer, want 0 — "+
-			"observation retention is not wired into the decay pass", count)
+		t.Errorf("observation count = %d after StartRetentionTimer, want 0 — "+
+			"the boot sweep did not run", count)
+	}
+}
+
+// TestRetentionGaugeIsRefreshedBySweep pins the /api/health contract: health
+// reads a cached gauge rather than measuring, so the sweep must be what keeps
+// it current. A health check whose cost scaled with table size would recreate
+// the original failure and make `continuity prune` unreachable.
+func TestRetentionGaugeIsRefreshedBySweep(t *testing.T) {
+	t.Setenv(retentionEnvVar, "14")
+
+	db := newRetentionTestDB(t)
+	// Two spent rows on a live session's sibling, so something remains
+	// reclaimable after we deliberately measure a non-zero state.
+	seedSpentObservation(t, db, "old-a")
+
+	spentObservationsGauge.Store(-1) // poison, so a stale read is detectable
+	if _, err := PruneObservations(db); err != nil {
+		t.Fatalf("PruneObservations: %v", err)
+	}
+	if got := SpentObservationsGauge(); got != 0 {
+		t.Errorf("gauge = %d after a sweep that reclaimed everything, want 0", got)
 	}
 }
 

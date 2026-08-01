@@ -140,6 +140,38 @@ func TestIsTimeout(t *testing.T) {
 	}
 }
 
+// TestTimeoutAgainstNothingListeningIsStillDead guards the opposite-direction
+// regression. IsTimeout alone does not prove a server exists: a black-holed
+// CONTINUITY_URL, an unroutable host, or a DNS timeout all time out with no
+// server involved. Claiming "running but slow" there is the same misdiagnosis
+// as issue #72, just pointed the other way — so the claim requires a successful
+// dial as positive evidence.
+func TestTimeoutAgainstNothingListeningIsStillDead(t *testing.T) {
+	// 203.0.113.0/24 is TEST-NET-3 (RFC 5737) — reserved for documentation and
+	// guaranteed not to route, so connecting hangs until the deadline.
+	c := newTestClient("http://203.0.113.1:37777", 100*time.Millisecond)
+
+	err := c.CheckHealth()
+	if err == nil {
+		t.Fatal("CheckHealth returned nil against an unroutable address")
+	}
+	if !strings.Contains(err.Error(), "is not running") {
+		t.Errorf("an unreachable server was reported as running-but-slow: %q", err.Error())
+	}
+
+	described := c.DescribeError(&timeoutError{})
+	if strings.Contains(described.Error(), "the server is running") {
+		t.Errorf("DescribeError asserted a server exists without evidence: %q", described.Error())
+	}
+}
+
+// timeoutError is a minimal net.Error that reports as a timeout.
+type timeoutError struct{}
+
+func (*timeoutError) Error() string   { return "simulated i/o timeout" }
+func (*timeoutError) Timeout() bool   { return true }
+func (*timeoutError) Temporary() bool { return true }
+
 // TestCLIClientIsMorePatientThanHookClient pins the split: hooks run inline in
 // Claude Code's event loop and must stay fast, while a human at a terminal can
 // wait out a slow query rather than being told the server is down.

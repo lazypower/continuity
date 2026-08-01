@@ -52,10 +52,11 @@ type pruneResponse struct {
 }
 
 func runPrune(cmd *cobra.Command, args []string) error {
-	client := hooks.NewCLIClient()
-	if err := client.CheckHealth(); err != nil {
-		return err
-	}
+	// Deliberately no CheckHealth precondition. prune is the remedy for a
+	// database so large that requests are slow, so gating it behind a probe
+	// that can itself time out would make the fix unreachable on exactly the
+	// installs that need it. Post directly; DescribeError explains a failure.
+	client := hooks.NewMaintenanceClient()
 
 	params := url.Values{}
 	if pruneDryRun {

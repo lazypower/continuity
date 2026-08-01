@@ -110,21 +110,36 @@ func (db *DB) GetSessionObservationCount(sessionID string) (int, error) {
 // them extracted. Keying retention to extracted_at would couple two unrelated
 // things and strand every unextractable session's rows forever.
 //
-// "In flight" is the mechanism: a session row that is still 'active' AND was
-// started recently enough to be plausibly alive. A session left 'active' by a
-// crashed or killed client never completes, so past the zombie horizon we stop
+// "In flight" is the mechanism: a session row still marked 'active' whose most
+// recent activity is inside the zombie horizon. A session left 'active' by a
+// crashed or killed client never completes, so past that horizon we stop
 // treating it as live. An observation with no session row at all is orphaned
 // and therefore not in flight.
 //
-// Bound parameters, in order: grace cutoff, zombie cutoff.
+// Liveness is measured from the session's LAST observation, not its started_at.
+// started_at is wrong twice over: InitSession reactivates a resumed session
+// without refreshing it, and a genuinely long-running session would cross the
+// horizon while still in use — either way an active session would start
+// shedding its own live history. Falling back to started_at covers a session
+// that has recorded no observations yet.
+//
+// liveSessionsSelect is evaluated once over the (small) set of active sessions
+// rather than correlated per observation row, which also keeps the count cheap
+// enough to serve from a health check.
+//
+// Bound parameter: zombie cutoff.
+const liveSessionsSelect = `
+	SELECT s.session_id FROM sessions s
+	WHERE s.status = 'active'
+	  AND COALESCE(
+	        (SELECT MAX(o2.created_at) FROM observations o2 WHERE o2.session_id = s.session_id),
+	        s.started_at
+	      ) >= ?`
+
+// spentObservationsWhere binds, in order: zombie cutoff, grace cutoff.
 const spentObservationsWhere = `
-	o.created_at < ?
-	AND NOT EXISTS (
-	    SELECT 1 FROM sessions s
-	    WHERE s.session_id = o.session_id
-	      AND s.status = 'active'
-	      AND s.started_at >= ?
-	)`
+	session_id NOT IN (` + liveSessionsSelect + `)
+	AND created_at < ?`
 
 // CountSpentObservations reports how many rows the sweep would reclaim right
 // now (same predicate, no delete), so a growing pile is visible in /api/health
@@ -132,8 +147,8 @@ const spentObservationsWhere = `
 func (db *DB) CountSpentObservations(graceCutoffMs, zombieCutoffMs int64) (int64, error) {
 	var n int64
 	err := db.QueryRow(`
-		SELECT COUNT(*) FROM observations o WHERE `+spentObservationsWhere,
-		graceCutoffMs, zombieCutoffMs).Scan(&n)
+		SELECT COUNT(*) FROM observations WHERE `+spentObservationsWhere,
+		zombieCutoffMs, graceCutoffMs).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("count spent observations: %w", err)
 	}
@@ -150,10 +165,8 @@ func (db *DB) CountSpentObservations(graceCutoffMs, zombieCutoffMs int64) (int64
 // returned to the filesystem. Callers wanting the space back must VACUUM.
 func (db *DB) PruneSpentObservations(graceCutoffMs, zombieCutoffMs int64) (int64, error) {
 	result, err := db.Exec(`
-		DELETE FROM observations WHERE id IN (
-		    SELECT o.id FROM observations o WHERE `+spentObservationsWhere+`
-		)`,
-		graceCutoffMs, zombieCutoffMs)
+		DELETE FROM observations WHERE `+spentObservationsWhere,
+		zombieCutoffMs, graceCutoffMs)
 	if err != nil {
 		return 0, fmt.Errorf("prune spent observations: %w", err)
 	}

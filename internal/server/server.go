@@ -171,11 +171,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Observation retention is engine-independent (see engine.RetentionCutoffs),
-	// so this reports even on installs running without an LLM. Surfacing the
-	// pile and the file size here is the early warning issue #72 never got: the
-	// growth was invisible until it manifested as an unrelated-looking timeout.
-	spentObservations, _ := engine.CountSpentObservations(s.db)
+	// Read the gauge cached by the last retention sweep rather than measuring
+	// here. Health MUST stay O(1): a health check that scales with table size
+	// would recreate the very failure this surfaces — and worse, `continuity
+	// prune` would become unreachable on exactly the databases that need it.
+	// A few hours of staleness is the right trade for a constant-time probe.
+	spentObservations := engine.SpentObservationsGauge()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{

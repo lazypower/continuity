@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -26,6 +27,17 @@ const (
 	// terminal, so they can afford to wait out a slow query rather than
 	// reporting a perfectly healthy server as dead (issue #72).
 	cliTimeout = 30 * time.Second
+
+	// maintenanceTimeout bounds long-running maintenance calls. VACUUM on a
+	// multi-gigabyte database is minutes of work, and the command says so — a
+	// 30s budget would abandon the request while the daemon kept compacting,
+	// leaving the operator with a timeout error and no result for an operation
+	// that actually succeeded.
+	maintenanceTimeout = 30 * time.Minute
+
+	// dialProbeTimeout bounds the "is anything listening?" TCP probe used to
+	// tell a slow server from an absent one.
+	dialProbeTimeout = 2 * time.Second
 )
 
 // Client talks to the continuity server.
@@ -76,8 +88,47 @@ func NewCLIClient() *Client {
 	}
 }
 
+// NewMaintenanceClient creates a client for long-running maintenance commands
+// (prune/VACUUM). Same target, minutes of patience — see maintenanceTimeout.
+func NewMaintenanceClient() *Client {
+	return &Client{
+		http:      &http.Client{Timeout: maintenanceTimeout},
+		serverURL: ResolveServerURL(),
+	}
+}
+
 // ServerURL returns the resolved base URL this client targets.
 func (c *Client) ServerURL() string { return c.serverURL }
+
+// isListening reports whether anything accepts a TCP connection at the client's
+// target address. This is what makes "slow" distinguishable from "dead": a
+// request timeout alone proves nothing, because DNS timeouts, black-holed
+// addresses, and unroutable hosts all time out with no server involved. A
+// successful dial is positive evidence that something is there to be slow.
+//
+// Unknown/unparseable targets return false — claiming a server is running is
+// the assertion that needs evidence, so absent evidence we do not make it.
+func (c *Client) isListening() bool {
+	u, err := url.Parse(c.serverURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Host
+	if u.Port() == "" {
+		switch u.Scheme {
+		case "https":
+			host = net.JoinHostPort(u.Hostname(), "443")
+		default:
+			host = net.JoinHostPort(u.Hostname(), "80")
+		}
+	}
+	conn, err := net.DialTimeout("tcp", host, dialProbeTimeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
 
 // timeout returns the client's configured request timeout.
 func (c *Client) timeout() time.Duration { return c.http.Timeout }
@@ -135,7 +186,11 @@ func (c *Client) Healthy() bool {
 func (c *Client) CheckHealth() error {
 	resp, err := c.http.Get(c.serverURL + "/api/health")
 	if err != nil {
-		if IsTimeout(err) {
+		// A timeout alone does not prove a server exists — only a successful
+		// dial does. Without that check, a black-holed CONTINUITY_URL or a DNS
+		// timeout would be reported as "running but slow", which is the same
+		// misdiagnosis as issue #72 pointed the other way.
+		if IsTimeout(err) && c.isListening() {
 			return fmt.Errorf("continuity server at %s is running but did not respond within %s — "+
 				"this usually means the database has grown large; try: continuity prune",
 				c.serverURL, c.timeout())
@@ -158,7 +213,7 @@ func (c *Client) DescribeError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if IsTimeout(err) {
+	if IsTimeout(err) && c.isListening() {
 		return fmt.Errorf("continuity server did not respond within %s — "+
 			"the server is running, but the query is slow; try: continuity prune (original: %w)",
 			c.timeout(), err)

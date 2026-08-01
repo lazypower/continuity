@@ -205,6 +205,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 		eng.StartDecayTimer()
 	}
 
+	// Observation retention is deliberately NOT inside the eng != nil guard.
+	// The decay/GC timer needs an Engine because it acts on memories; retention
+	// is pure storage hygiene, and an install with no LLM configured records
+	// observations at exactly the same rate. Gating it on the Engine would leave
+	// those installs growing without bound — the original issue #72 failure.
+	retentionStop := make(chan struct{})
+	engine.StartRetentionTimer(db, retentionStop)
+
 	// The listener is bound: this is a genuine "the new schema boots and
 	// serves" signal. Tick retention now, then surface what's still retained.
 	// Deliberately not in store.Open, so CLI subcommands that inspect or prune
@@ -258,6 +266,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	<-done
 	close(rollupStop)
+	close(retentionStop)
 	fmt.Fprintln(os.Stderr, "\nshutting down...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

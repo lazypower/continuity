@@ -176,10 +176,12 @@ func TestPruneSpentObservationsBuckets(t *testing.T) {
 	// Reclaimable: no session row at all.
 	seedObservation(t, db, "orphaned", old)
 
-	// Reclaimable: left 'active' by a crashed client, started before the
-	// zombie horizon — it will never complete on its own.
+	// Reclaimable: left 'active' by a crashed client and silent ever since.
+	// Liveness is judged by last activity, so this needs an observation older
+	// than the zombie horizon — an active session that recorded something 20
+	// days ago is still live under a 30-day horizon, by design.
 	seedSession(t, db, "zombie-active", "active", now-90*day, false)
-	seedObservation(t, db, "zombie-active", old)
+	seedObservation(t, db, "zombie-active", now-60*day)
 
 	// RETAINED: genuinely in flight — active and started inside the zombie
 	// horizon. Its context header can still be read.
@@ -279,5 +281,85 @@ func TestVacuum(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("vacuum lost data: count = %d, want 1", n)
+	}
+}
+
+// TestLongRunningSessionKeepsItsObservations is the regression test for the
+// zombie-horizon bug. Liveness must be measured from the session's most recent
+// activity, not its started_at: InitSession reactivates a resumed session
+// without refreshing started_at, and a genuinely long-running session would
+// otherwise cross the horizon and start shedding its own live history.
+func TestLongRunningSessionKeepsItsObservations(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	const day = int64(24 * 60 * 60 * 1000)
+	now := int64(1_700_000_000_000)
+	graceCutoff := now - 14*day
+	zombieCutoff := now - 30*day
+
+	// Started 90 days ago — well past the zombie horizon — but still active and
+	// still recording tool use as of an hour ago. This is a resumed or
+	// long-lived session, not a crashed one.
+	seedSession(t, db, "long-running", "active", now-90*day, false)
+	seedObservation(t, db, "long-running", now-60*day) // old, but session is live
+	seedObservation(t, db, "long-running", now-1*day)  // recent activity
+	seedObservation(t, db, "long-running", now-(day/24))
+
+	// A genuinely abandoned session: active, but nothing recorded in 60 days.
+	seedSession(t, db, "crashed", "active", now-90*day, false)
+	seedObservation(t, db, "crashed", now-60*day)
+
+	deleted, err := db.PruneSpentObservations(graceCutoff, zombieCutoff)
+	if err != nil {
+		t.Fatalf("PruneSpentObservations: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted %d rows, want 1 (only the crashed session's)", deleted)
+	}
+
+	live, err := db.GetSessionObservationCount("long-running")
+	if err != nil {
+		t.Fatalf("count long-running: %v", err)
+	}
+	if live != 3 {
+		t.Errorf("long-running session kept %d observations, want 3 — a live "+
+			"session lost history to the zombie horizon", live)
+	}
+
+	dead, err := db.GetSessionObservationCount("crashed")
+	if err != nil {
+		t.Fatalf("count crashed: %v", err)
+	}
+	if dead != 0 {
+		t.Errorf("crashed session kept %d observations, want 0", dead)
+	}
+}
+
+// TestSessionWithNoObservationsFallsBackToStartedAt covers the COALESCE arm:
+// an active session that has recorded nothing yet is judged by its start time.
+func TestSessionWithNoObservationsFallsBackToStartedAt(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	const day = int64(24 * 60 * 60 * 1000)
+	now := int64(1_700_000_000_000)
+
+	// Freshly started, nothing recorded yet, but an old orphan row exists.
+	seedSession(t, db, "fresh", "active", now-1*day, false)
+	seedObservation(t, db, "orphan", now-20*day)
+
+	deleted, err := db.PruneSpentObservations(now-14*day, now-30*day)
+	if err != nil {
+		t.Fatalf("PruneSpentObservations: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted %d, want 1 (the orphan only)", deleted)
 	}
 }

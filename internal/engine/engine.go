@@ -131,7 +131,6 @@ func (e *Engine) StartDecayTimer() {
 		log.Printf("decay: updated %d nodes", updated)
 	}
 	e.runGCSweep()
-	e.runObservationRetention()
 
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
@@ -146,7 +145,6 @@ func (e *Engine) StartDecayTimer() {
 					log.Printf("decay: updated %d nodes", updated)
 				}
 				e.runGCSweep()
-				e.runObservationRetention()
 			case <-e.stopCh:
 				return
 			}
