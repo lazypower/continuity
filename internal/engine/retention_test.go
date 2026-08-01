@@ -1,11 +1,52 @@
 package engine
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/lazypower/continuity/internal/store"
 )
+
+// TestRetentionSweepLog pins the upgrade breadcrumb (issue #72). A user
+// upgrading into this build watches tens of thousands of rows disappear on
+// first boot; the terse daily line does not explain that, and the explanation
+// must NOT fire on the routine sweeps that follow forever after.
+func TestRetentionSweepLog(t *testing.T) {
+	tests := []struct {
+		name        string
+		pruned      int64
+		wantLines   int
+		wantExplain bool
+	}{
+		{"nothing reclaimed is silent", 0, 0, false},
+		{"routine sweep stays terse", 2400, 1, false},
+		{"just under threshold stays terse", largeReclaimThreshold - 1, 1, false},
+		{"at threshold explains", largeReclaimThreshold, 2, true},
+		{"upgrade backlog explains", 331966, 2, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lines := retentionSweepLog(tt.pruned, 14)
+			if len(lines) != tt.wantLines {
+				t.Fatalf("got %d line(s), want %d: %v", len(lines), tt.wantLines, lines)
+			}
+			if !tt.wantExplain {
+				return
+			}
+			// The breadcrumb is only useful if it carries the three things a
+			// surprised user needs: what happened, where to read about it, and
+			// how to turn it off.
+			explain := lines[1]
+			for _, want := range []string{"issues/72", retentionEnvVar, "continuity prune"} {
+				if !strings.Contains(explain, want) {
+					t.Errorf("explanation missing %q:\n%s", want, explain)
+				}
+			}
+		})
+	}
+}
 
 func TestObservationGraceDurationEnv(t *testing.T) {
 	tests := []struct {

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -36,6 +37,18 @@ const (
 	// one that just ended, immediately reclaimable. A config meant to retain
 	// MORE must never delete more.
 	maxRetentionDays = 3650
+
+	// largeReclaimThreshold is where a sweep stops looking like routine daily
+	// hygiene and starts looking like a backlog being cleared for the first
+	// time — the upgrade case. Issue #72 measured ~2,400 observations/day on a
+	// normal single-user install, so a daily sweep reclaims low thousands; an
+	// order of magnitude past that is a catch-up, not a steady state.
+	//
+	// Keyed off the size of the sweep itself, deliberately. The alternative —
+	// a persisted "have we explained this yet?" marker — is a schema change
+	// that can be lost on a restored database and would explain the upgrade to
+	// someone who never upgraded.
+	largeReclaimThreshold = 50_000
 )
 
 // retentionEnvVar lets an operator widen, tighten, or disable retention without
@@ -191,9 +204,35 @@ func runObservationRetention(db *store.DB) {
 		log.Printf("retention: observation prune failed: %v", err)
 		return
 	}
-	if pruned > 0 {
-		log.Printf("retention: pruned %d observation(s) from sessions no longer in flight (grace: %dd)", pruned, int(grace.Hours()/24))
+	for _, line := range retentionSweepLog(pruned, int(grace.Hours()/24)) {
+		log.Print(line)
 	}
+}
+
+// retentionSweepLog builds the log lines for one sweep. Pure and table-tested:
+// the interesting behaviour is a threshold, and proving it through the database
+// would mean seeding largeReclaimThreshold rows to observe a string.
+//
+// Routine sweeps stay a single terse line — this runs daily, forever, and an
+// explanation repeated every day is noise that trains people to skip the line.
+// The backlog case is the one where a user is watching bulk deletion they did
+// not ask for, so that is where the explanation, the issue, and the opt-out go.
+func retentionSweepLog(pruned int64, graceDays int) []string {
+	if pruned <= 0 {
+		return nil
+	}
+	lines := []string{
+		fmt.Sprintf("retention: pruned %d observation(s) from sessions no longer in flight (grace: %dd)", pruned, graceDays),
+	}
+	if pruned >= largeReclaimThreshold {
+		lines = append(lines,
+			fmt.Sprintf("retention: that was a one-time catch-up — these observations predate this build's "+
+				"retention path (background: https://github.com/lazypower/continuity/issues/72). Routine sweeps "+
+				"reclaim far less. Memories, vectors and the relational profile are untouched. Disk is not "+
+				"returned to the filesystem until you run 'continuity prune'; set %s=off to disable retention, "+
+				"or to a day count to widen the window.", retentionEnvVar))
+	}
+	return lines
 }
 
 // defaultCutoffs returns the cutoffs implied by the built-in policy, ignoring
