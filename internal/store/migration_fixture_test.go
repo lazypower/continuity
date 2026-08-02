@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -424,8 +425,33 @@ func TestMigrationFixtureE2E_V8FromV050_WithRetentionEnabled(t *testing.T) {
 		t.Fatalf("obs count: %v", err)
 	}
 	if obsCount != 0 {
-		t.Errorf("observation count = %d, want 0 — the retention sweep did not run "+
-			"on the upgrade boot", obsCount)
+		// Dump what the server actually logged. The sweep runs synchronously
+		// before the listener serves, so by the time /api/health answered it had
+		// already either pruned, logged a failure, or found nothing spent —
+		// stderr is the only thing that distinguishes those, and without it this
+		// failure is unactionable from a CI log.
+		var live struct {
+			status       string
+			lastActiveAt any
+			startedAt    int64
+		}
+		_ = db.QueryRow(
+			`SELECT status, last_active_at, started_at FROM sessions WHERE session_id = ?`,
+			"v5-test-session",
+		).Scan(&live.status, &live.lastActiveAt, &live.startedAt)
+		var obsCreated int64
+		_ = db.QueryRow(
+			`SELECT created_at FROM observations WHERE session_id = ? LIMIT 1`,
+			"v5-test-session",
+		).Scan(&obsCreated)
+
+		t.Errorf("observation count = %d, want 0 — the retention sweep left a spent row.\n"+
+			"  session: status=%q last_active_at=%v started_at=%d\n"+
+			"  observation created_at=%d\n"+
+			"  now=%d (grace horizon is 14d, zombie horizon 30d)\n"+
+			"--- server stderr ---\n%s",
+			obsCount, live.status, live.lastActiveAt, live.startedAt,
+			obsCreated, time.Now().UnixMilli(), srv.Stderr())
 	}
 
 	// migration 16's backfill reached every pre-existing session, including ones

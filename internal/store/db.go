@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 
@@ -36,7 +37,7 @@ func Open(path string) (*DB, error) {
 	// permissions on creation, so pre-existing dirs/files need explicit chmod.
 	hardenPermissions(dir, path)
 
-	sqlDB, err := sql.Open("sqlite", path)
+	sqlDB, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -70,7 +71,7 @@ func OpenNoMigrate(path string) (*DB, error) {
 	}
 	hardenPermissions(dir, path)
 
-	sqlDB, err := sql.Open("sqlite", path)
+	sqlDB, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -123,18 +124,46 @@ func hardenPermissions(dir, dbPath string) {
 	}
 }
 
+// connPragmas are CONNECTION-scoped and must be carried in the DSN so every
+// pooled connection gets them.
+//
+// They used to be issued as db.Exec("PRAGMA ...") after opening. database/sql
+// runs that on whichever pooled connection happens to serve the call, and every
+// connection opened afterwards silently reverted to SQLite's defaults. The
+// visible symptom was boot-time writers losing to each other: with
+// busy_timeout defaulting to 0, a connection that found the write lock held
+// returned SQLITE_BUSY instantly instead of waiting, so the observation
+// retention sweep, the snapshot retention tick, and the metrics rollup could
+// each fail while the background vector backfill held the lock — each one
+// logging and giving up. Retention failing that way is the quiet version of
+// issue #72: growth stops being bounded and only a log line says so.
+//
+// foreign_keys is the more dangerous half. SQLite defaults it OFF, so most
+// connections were not enforcing referential integrity at all.
+//
+// journal_mode is deliberately absent: WAL is persisted in the database file,
+// so it is set once in configurePragmas rather than per connection.
+const connPragmas = "_pragma=busy_timeout(5000)" +
+	"&_pragma=foreign_keys(1)" +
+	"&_pragma=synchronous(NORMAL)" +
+	"&_pragma=mmap_size(268435456)" // 256MB
+
+// dsn builds the connection string for an on-disk database. The path is escaped
+// through url.URL so paths containing spaces, '?' or '#' cannot corrupt the
+// query string.
+func dsn(path string) string {
+	u := url.URL{Scheme: "file", Path: path}
+	u.RawQuery = connPragmas
+	return u.String()
+}
+
+// configurePragmas applies the pragmas that are NOT connection-scoped.
+// Connection-scoped ones ride the DSN — see connPragmas.
 func (db *DB) configurePragmas() error {
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA foreign_keys=ON",
-		"PRAGMA mmap_size=268435456", // 256MB
-		"PRAGMA busy_timeout=5000",
-	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			return fmt.Errorf("pragma %q: %w", p, err)
-		}
+	// WAL is recorded in the database header, so this persists for every
+	// connection and every future process.
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return fmt.Errorf("pragma journal_mode: %w", err)
 	}
 	return nil
 }
