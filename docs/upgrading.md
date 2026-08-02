@@ -133,10 +133,10 @@ deleted tool-call records.
 
 **This release deletes old tool-call records on the first start.**
 
-Every action your agent takes is recorded. Until this release, that meant the
-tool's arguments and its output too — **so older records can contain file
-contents and command output**, whatever your own tool calls happened to return.
-Nothing ever read them.
+Every action your agent takes is recorded. Previous versions also retained the
+tool's arguments and its response — depending on the tool, those responses could
+include information such as command output or file contents. Nothing ever read
+them.
 
 **From v0.11.0 only the tool's name and timestamp are stored.** New records
 carry no arguments or output at all. The cleanup below is what clears the old
