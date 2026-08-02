@@ -4,11 +4,14 @@ import "fmt"
 
 // Config holds all continuity configuration.
 // Phase 0: types and defaults only. Phase 1 adds Load() with TOML parsing.
+// Hook behavior is deliberately absent here. Hooks are configured where Claude
+// Code reads them — ~/.claude/settings.json, or plugin/hooks/hooks.json — and a
+// second, inert copy of those knobs in config.toml only teaches operators to
+// tune a file nothing reads.
 type Config struct {
 	Server     ServerConfig     `toml:"server"`
 	Database   DatabaseConfig   `toml:"database"`
 	LLM        LLMConfig        `toml:"llm"`
-	Hooks      HooksConfig      `toml:"hooks"`
 	Extraction ExtractionConfig `toml:"extraction"`
 	Embedder   EmbedderConfig   `toml:"embedder"`
 }
@@ -23,18 +26,12 @@ type DatabaseConfig struct {
 }
 
 type LLMConfig struct {
-	Provider       string `toml:"provider"`    // "claude-cli", "anthropic", "ollama"
-	Model          string `toml:"model"`       // e.g. "haiku", "sonnet"
-	MergeModel     string `toml:"merge_model"` // model for merge decisions
+	Provider       string `toml:"provider"` // "claude-cli", "anthropic", "ollama"
+	Model          string `toml:"model"`    // e.g. "haiku", "sonnet"
 	OllamaURL      string `toml:"ollama_url"`
 	OllamaModel    string `toml:"ollama_model"`    // e.g. "llama3.2"
 	EmbeddingModel string `toml:"embedding_model"` // e.g. "nomic-embed-text"
 	AnthropicKey   string `toml:"anthropic_key"`
-}
-
-type HooksConfig struct {
-	Enabled bool `toml:"enabled"`
-	Timeout int  `toml:"timeout"` // seconds
 }
 
 // ExtractionConfig governs automatic memory extraction.
@@ -81,13 +78,8 @@ func Default() Config {
 			Path: "", // resolved at runtime via store.DefaultDBPath()
 		},
 		LLM: LLMConfig{
-			Provider:   "claude-cli",
-			Model:      "haiku",
-			MergeModel: "sonnet",
-		},
-		Hooks: HooksConfig{
-			Enabled: true,
-			Timeout: 120,
+			Provider: "claude-cli",
+			Model:    "haiku",
 		},
 		Extraction: ExtractionConfig{
 			// Auto session extraction is off by default (deprecated, high-noise).

@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 690" width="860" height="690" role="img" aria-labelledby="title desc">
+  <title id="title">What happens on the first start after an upgrade</title>
+  <desc id="desc">A top-to-bottom flow of the first start after a Continuity upgrade. Step one asks whether the update rewrites records that already exist. If it does, a complete safety copy of the database is written beside it first, and that copy is deleted automatically after three clean starts. If the update only adds things, such as a new table or a new column, no safety copy is taken at all — the branch that surprises people. Both paths then reach step two, where the database format is updated. Step three runs routine cleanup: tool-call records from sessions that finished more than fourteen days ago are deleted, and memory relevance is aged by the clock, while memories themselves are never deleted. A final note explains that deleting records does not shrink the database file, so reclaiming disk space needs a separate manual run of continuity prune.</desc>
+
+  <style>
+    :root {
+      --ink: #1c1c1c;
+      --muted: #5c6370;
+      --line: #9aa2af;
+      --fill: #ffffff;
+      --accent: #2f6f4f;
+      --accent-fill: #eaf4ee;
+      --store: #3c5a86;
+      --store-fill: #e9eff8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #e6e6e6;
+        --muted: #a0a8b4;
+        --line: #6b7583;
+        --fill: #1a1c20;
+        --accent: #7fc79d;
+        --accent-fill: #1e2a24;
+        --store: #8fb0dd;
+        --store-fill: #1c2430;
+      }
+    }
+    .box { fill: var(--fill); stroke: var(--line); stroke-width: 1.5; rx: 6; }
+    .box-accent { fill: var(--accent-fill); stroke: var(--accent); stroke-width: 1.5; rx: 6; }
+    .box-store { fill: var(--store-fill); stroke: var(--store); stroke-width: 1.5; rx: 6; }
+    .t { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; fill: var(--ink); }
+    .t-title { font-size: 14px; font-weight: 600; }
+    .t-sub { font-size: 11.5px; fill: var(--muted); }
+    .t-edge { font-size: 11px; fill: var(--muted); }
+    .edge { stroke: var(--line); stroke-width: 1.5; fill: none; }
+    .edge-accent { stroke: var(--accent); stroke-width: 1.75; fill: none; }
+    .dash { stroke-dasharray: 5 4; }
+  </style>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line)"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+
+  <text class="t t-title" x="430" y="34" text-anchor="middle">The first start after an upgrade</text>
+  <text class="t t-sub" x="430" y="56" text-anchor="middle">All of this happens before Continuity answers its first request.</text>
+
+  <!-- Step 1: the question -->
+  <rect class="box" x="60" y="86" width="380" height="80"/>
+  <text class="t t-title" x="80" y="112">1. Safety copy — taken only sometimes</text>
+  <text class="t t-sub" x="80" y="134">Does this update rewrite records that already</text>
+  <text class="t t-sub" x="80" y="152">exist, or does it only add new ones?</text>
+
+  <!-- additive branch -->
+  <path class="edge dash" d="M 442 126 L 496 126" marker-end="url(#arrow)"/>
+  <text class="t t-edge" x="469" y="118" text-anchor="middle">adds only</text>
+  <rect class="box-store" x="500" y="80" width="320" height="92"/>
+  <text class="t t-title" x="520" y="106">No safety copy is taken at all</text>
+  <text class="t t-sub" x="520" y="126">Updates that only ADD something —</text>
+  <text class="t t-sub" x="520" y="144">a new table, a new column — skip the</text>
+  <text class="t t-sub" x="520" y="162">copy entirely. This one surprises people.</text>
+
+  <!-- rewrite branch -->
+  <path class="edge-accent" d="M 250 166 L 250 206" marker-end="url(#arrow-accent)"/>
+  <text class="t t-edge" x="262" y="190">rewrites existing records</text>
+  <rect class="box-accent" x="60" y="208" width="380" height="92"/>
+  <text class="t t-title" x="80" y="234">Full safety copy taken first</text>
+  <text class="t t-sub" x="80" y="254">A complete copy of the database is written</text>
+  <text class="t t-sub" x="80" y="272">beside it. It is deleted automatically after</text>
+  <text class="t t-sub" x="80" y="290">three clean starts.</text>
+  <path class="edge-accent" d="M 250 300 L 250 344" marker-end="url(#arrow-accent)"/>
+
+  <!-- rejoin from the additive branch -->
+  <path class="edge dash" d="M 660 172 L 660 392 L 444 392" marker-end="url(#arrow)"/>
+
+  <!-- Step 2 -->
+  <rect class="box" x="60" y="346" width="380" height="92"/>
+  <text class="t t-title" x="80" y="372">2. Database format updated</text>
+  <text class="t t-sub" x="80" y="392">Both paths arrive here. The update either</text>
+  <text class="t t-sub" x="80" y="410">completes in full or is rolled back — it</text>
+  <text class="t t-sub" x="80" y="428">never lands half applied.</text>
+  <path class="edge" d="M 250 438 L 250 476" marker-end="url(#arrow)"/>
+
+  <!-- Step 3 -->
+  <rect class="box" x="60" y="478" width="380" height="132"/>
+  <text class="t t-title" x="80" y="506">3. Routine cleanup runs</text>
+  <text class="t t-sub" x="80" y="528">Tool-call records are deleted once their</text>
+  <text class="t t-sub" x="80" y="546">session finished more than 14 days ago.</text>
+  <text class="t t-sub" x="80" y="568">Memory relevance is aged by the clock.</text>
+  <text class="t t-sub" x="80" y="590">Memories themselves are never deleted.</text>
+
+  <path class="edge" d="M 442 544 L 496 544" marker-end="url(#arrow)"/>
+
+  <!-- disk space callout -->
+  <rect class="box-store" x="500" y="478" width="320" height="132"/>
+  <text class="t t-title" x="520" y="506">Disk space is not returned yet</text>
+  <text class="t t-sub" x="520" y="528">Deleting records frees space inside the</text>
+  <text class="t t-sub" x="520" y="546">file, but the file itself stays the same</text>
+  <text class="t t-sub" x="520" y="564">size on disk.</text>
+  <text class="t t-sub" x="520" y="586">Run `continuity prune` yourself to</text>
+  <text class="t t-sub" x="520" y="604">compact it. Nothing does it for you.</text>
+
+  <text class="t t-sub" x="430" y="646" text-anchor="middle">Cleanup is not an upgrade step alone — it also runs once a day while Continuity is up.</text>
+  <text class="t t-sub" x="430" y="664" text-anchor="middle">If a safety copy is required but cannot be written, the upgrade stops rather than proceeding without one.</text>
+</svg>

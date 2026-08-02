@@ -115,8 +115,6 @@ func applyKV(cfg *Config, section, key, val string) {
 			cfg.LLM.Provider = val
 		case "model":
 			cfg.LLM.Model = val
-		case "merge_model":
-			cfg.LLM.MergeModel = val
 		case "ollama_url":
 			cfg.LLM.OllamaURL = val
 		case "ollama_model":
@@ -125,15 +123,6 @@ func applyKV(cfg *Config, section, key, val string) {
 			cfg.LLM.EmbeddingModel = val
 		case "anthropic_key":
 			cfg.LLM.AnthropicKey = val
-		}
-	case "hooks":
-		switch key {
-		case "enabled":
-			cfg.Hooks.Enabled = parseBoolLoose(val)
-		case "timeout":
-			if n, err := parseIntStrict(val); err == nil {
-				cfg.Hooks.Timeout = n
-			}
 		}
 	case "extraction":
 		if key == "auto" {

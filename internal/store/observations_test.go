@@ -1,7 +1,6 @@
 package store
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -12,7 +11,7 @@ func TestAddObservation(t *testing.T) {
 	}
 	defer db.Close()
 
-	err = db.AddObservation("sess-001", "Bash", `{"command":"ls"}`, "file1 file2")
+	err = db.AddObservation("sess-001", "Bash")
 	if err != nil {
 		t.Fatalf("AddObservation: %v", err)
 	}
@@ -27,34 +26,44 @@ func TestAddObservation(t *testing.T) {
 	if obs[0].ToolName != "Bash" {
 		t.Errorf("ToolName = %q, want Bash", obs[0].ToolName)
 	}
-	if obs[0].ToolInput != `{"command":"ls"}` {
-		t.Errorf("ToolInput = %q", obs[0].ToolInput)
-	}
-	if obs[0].ToolResponse != "file1 file2" {
-		t.Errorf("ToolResponse = %q", obs[0].ToolResponse)
-	}
 }
 
-func TestAddObservationTruncation(t *testing.T) {
+// TestAddObservationNeverPersistsToolContent is the privacy guard.
+//
+// These rows used to carry the full tool call and its result — file contents,
+// command output, and any credential that passed through a tool — written on
+// every PostToolUse hook and read by nothing. The store must have no way to
+// persist that material, so the API takes no argument that could carry it.
+//
+// If someone restores those parameters, this test fails. It exists so the
+// justification has to be re-argued rather than reintroduced by habit.
+func TestAddObservationNeverPersistsToolContent(t *testing.T) {
 	db, err := OpenMemory()
 	if err != nil {
 		t.Fatalf("OpenMemory: %v", err)
 	}
 	defer db.Close()
 
-	bigInput := strings.Repeat("i", 20*1024)    // 20KB
-	bigResponse := strings.Repeat("r", 20*1024) // 20KB
-	err = db.AddObservation("sess-001", "Bash", bigInput, bigResponse)
-	if err != nil {
+	if err := db.AddObservation("sess-001", "Bash"); err != nil {
 		t.Fatalf("AddObservation: %v", err)
 	}
 
-	obs, _ := db.GetObservations("sess-001")
-	if len(obs[0].ToolInput) != maxToolFieldSize {
-		t.Errorf("ToolInput length = %d, want %d", len(obs[0].ToolInput), maxToolFieldSize)
+	// Read the columns directly rather than through the struct: the schema
+	// keeps them for compatibility with rows written by older builds, so the
+	// contract is that NEW rows are empty, not that the columns are gone.
+	var input, response string
+	err = db.QueryRow(
+		`SELECT tool_input, tool_response FROM observations WHERE session_id = ?`,
+		"sess-001",
+	).Scan(&input, &response)
+	if err != nil {
+		t.Fatalf("read columns: %v", err)
 	}
-	if len(obs[0].ToolResponse) != maxToolFieldSize {
-		t.Errorf("ToolResponse length = %d, want %d", len(obs[0].ToolResponse), maxToolFieldSize)
+	if input != "" {
+		t.Errorf("tool_input = %q, want empty — tool arguments must never reach disk", input)
+	}
+	if response != "" {
+		t.Errorf("tool_response = %q, want empty — tool output must never reach disk", response)
 	}
 }
 
@@ -81,9 +90,9 @@ func TestGetRecentObservations(t *testing.T) {
 	}
 	defer db.Close()
 
-	db.AddObservation("sess-001", "Bash", "{}", "out1")
-	db.AddObservation("sess-001", "Read", "{}", "out2")
-	db.AddObservation("sess-002", "Edit", "{}", "out3")
+	db.AddObservation("sess-001", "Bash")
+	db.AddObservation("sess-001", "Read")
+	db.AddObservation("sess-002", "Edit")
 
 	obs, err := db.GetRecentObservations(2)
 	if err != nil {
@@ -103,9 +112,9 @@ func TestGetSessionObservationCount(t *testing.T) {
 	}
 	defer db.Close()
 
-	db.AddObservation("sess-001", "Bash", "{}", "out1")
-	db.AddObservation("sess-001", "Read", "{}", "out2")
-	db.AddObservation("sess-002", "Edit", "{}", "out3")
+	db.AddObservation("sess-001", "Bash")
+	db.AddObservation("sess-001", "Read")
+	db.AddObservation("sess-002", "Edit")
 
 	count, err := db.GetSessionObservationCount("sess-001")
 	if err != nil {
@@ -280,7 +289,7 @@ func TestVacuum(t *testing.T) {
 	}
 	defer db.Close()
 
-	db.AddObservation("sess-001", "Bash", "{}", "out")
+	db.AddObservation("sess-001", "Bash")
 	if err := db.Vacuum(); err != nil {
 		t.Fatalf("Vacuum: %v", err)
 	}

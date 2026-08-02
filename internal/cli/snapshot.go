@@ -73,11 +73,20 @@ func runSnapshotList(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(snaps) == 0 {
-		fmt.Println("no migration safety snapshots retained")
+	untracked, err := db.UntrackedSnapshots()
+	if err != nil {
+		return err
+	}
+	if len(snaps) == 0 && len(untracked) == 0 {
+		fmt.Println("no snapshots retained")
 		return nil
 	}
-	fmt.Printf("%d migration safety snapshot(s) retained:\n", len(snaps))
+	if len(snaps) == 0 {
+		fmt.Println("no migration safety snapshots retained")
+	}
+	if len(snaps) > 0 {
+		fmt.Printf("%d migration safety snapshot(s) retained:\n", len(snaps))
+	}
 	for _, s := range snaps {
 		fmt.Printf("\n  %s\n", s.Path)
 		fmt.Printf("    pre-version:    %d\n", s.PreVersion)
@@ -86,6 +95,27 @@ func runSnapshotList(cmd *cobra.Command, args []string) error {
 		fmt.Printf("    boots since:    %d (auto-deletes after %d)\n",
 			s.BootsSince, store.SnapshotRetentionBoots)
 	}
+	if len(untracked) > 0 {
+		var total int64
+		for _, u := range untracked {
+			total += u.Bytes
+		}
+		fmt.Printf("\n%d untracked snapshot file(s), %s total:\n", len(untracked), humanBytes(total))
+		for _, u := range untracked {
+			fmt.Printf("  %s  (%s)\n", u.Path, humanBytes(u.Bytes))
+		}
+		// Say only what the absence of a tracking row actually proves. Most of
+		// these are repair or compost copies, which record no row by design —
+		// but a migration snapshot whose row failed to record lands here too,
+		// and that one IS a rollback point. Naming the likely case as the
+		// certain case would talk an operator into deleting their only way back.
+		fmt.Println("\nThese have no tracking record, so nothing ages them out.")
+		fmt.Println("Usually they are one-off copies taken before a repair or reclaim.")
+		fmt.Println("One may also be a migration rollback point whose record was lost —")
+		fmt.Println("check the date against your last upgrade before removing it.")
+		fmt.Println("Remove them with: continuity snapshot prune")
+	}
+
 	fmt.Println()
 	fmt.Println("To restore from a snapshot, stop the server and:")
 	// Print the DB actually opened, not a hardcoded default — with

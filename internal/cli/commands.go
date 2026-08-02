@@ -15,14 +15,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// stubRun returns a RunE that prints a not-yet-implemented message to stderr
-// and exits 0 (hooks must never crash Claude Code).
-func stubRun(name string) func(*cobra.Command, []string) {
-	return func(cmd *cobra.Command, args []string) {
-		fmt.Fprintf(os.Stderr, "%s: not yet implemented\n", name)
-	}
-}
-
 var hookCmd = &cobra.Command{
 	Use:   "hook",
 	Short: "Handle Claude Code hook events",
@@ -418,10 +410,8 @@ func runDedup(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// --- import command (still a stub) ---
-
-var importCmd = &cobra.Command{
-	Use:   "import",
-	Short: "Import from claude-mem database (not yet implemented)",
-	Run:   stubRun("import"),
-}
+// The claude-mem `import` command is not implemented and is deliberately not
+// registered. It shipped for a long time as a stub that printed "not yet
+// implemented" and exited 0 — a verb in `--help` that answers nothing. When the
+// migration is actually built it can return as a working command; advertising
+// it before then only costs operators the time it takes to try it.

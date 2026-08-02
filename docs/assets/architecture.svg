@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" width="760" height="430" role="img" aria-labelledby="title desc">
+  <title id="title">Continuity architecture</title>
+  <desc id="desc">Claude Code connects to the Continuity daemon through hooks and MCP tools. The CLI and web interface also connect to the daemon. The daemon owns a single SQLite database and calls out to an LLM provider for memory summaries.</desc>
+
+  <style>
+    :root {
+      --ink: #1c1c1c;
+      --muted: #5c6370;
+      --line: #9aa2af;
+      --fill: #ffffff;
+      --accent: #2f6f4f;
+      --accent-fill: #eaf4ee;
+      --store: #3c5a86;
+      --store-fill: #e9eff8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --ink: #e6e6e6;
+        --muted: #a0a8b4;
+        --line: #6b7583;
+        --fill: #1a1c20;
+        --accent: #7fc79d;
+        --accent-fill: #1e2a24;
+        --store: #8fb0dd;
+        --store-fill: #1c2430;
+      }
+    }
+    .box { fill: var(--fill); stroke: var(--line); stroke-width: 1.5; rx: 6; }
+    .box-accent { fill: var(--accent-fill); stroke: var(--accent); stroke-width: 1.5; rx: 6; }
+    .box-store { fill: var(--store-fill); stroke: var(--store); stroke-width: 1.5; rx: 6; }
+    .t { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; fill: var(--ink); }
+    .t-title { font-size: 14px; font-weight: 600; }
+    .t-sub { font-size: 11.5px; fill: var(--muted); }
+    .t-edge { font-size: 11px; fill: var(--muted); }
+    .edge { stroke: var(--line); stroke-width: 1.5; fill: none; }
+    .edge-accent { stroke: var(--accent); stroke-width: 1.75; fill: none; }
+    .dash { stroke-dasharray: 5 4; }
+  </style>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line)"/>
+    </marker>
+    <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+
+  <!-- Claude Code -->
+  <rect class="box-accent" x="30" y="40" width="180" height="88"/>
+  <text class="t t-title" x="120" y="72" text-anchor="middle">Claude Code</text>
+  <text class="t t-sub" x="120" y="93" text-anchor="middle">your editing session</text>
+  <text class="t t-sub" x="120" y="110" text-anchor="middle">hooks + MCP tools</text>
+
+  <!-- hooks edge -->
+  <path class="edge-accent" d="M 210 70 L 300 70" marker-end="url(#arrow-accent)"/>
+  <text class="t t-edge" x="255" y="62" text-anchor="middle">hooks</text>
+
+  <!-- MCP edge -->
+  <path class="edge-accent" d="M 210 100 L 300 100" marker-end="url(#arrow-accent)"/>
+  <text class="t t-edge" x="255" y="118" text-anchor="middle">MCP</text>
+
+  <!-- Daemon -->
+  <rect class="box-accent" x="300" y="30" width="200" height="110"/>
+  <text class="t t-title" x="400" y="62" text-anchor="middle">continuity serve</text>
+  <text class="t t-sub" x="400" y="83" text-anchor="middle">background daemon</text>
+  <text class="t t-sub" x="400" y="100" text-anchor="middle">127.0.0.1:37777</text>
+  <text class="t t-sub" x="400" y="120" text-anchor="middle">local connections only</text>
+
+  <!-- CLI -->
+  <rect class="box" x="30" y="185" width="180" height="66"/>
+  <text class="t t-title" x="120" y="213" text-anchor="middle">continuity CLI</text>
+  <text class="t t-sub" x="120" y="233" text-anchor="middle">search · tree · prune · doctor</text>
+  <path class="edge" d="M 210 214 L 340 214 L 340 142" marker-end="url(#arrow)"/>
+
+  <!-- Web UI -->
+  <rect class="box" x="30" y="290" width="180" height="66"/>
+  <text class="t t-title" x="120" y="318" text-anchor="middle">web interface</text>
+  <text class="t t-sub" x="120" y="338" text-anchor="middle">health · tree · cold boot</text>
+  <path class="edge" d="M 210 320 L 380 320 L 380 142" marker-end="url(#arrow)"/>
+
+  <!-- SQLite -->
+  <rect class="box-store" x="560" y="30" width="175" height="110"/>
+  <text class="t t-title" x="647" y="62" text-anchor="middle">SQLite</text>
+  <text class="t t-sub" x="647" y="83" text-anchor="middle">continuity.db</text>
+  <text class="t t-sub" x="647" y="101" text-anchor="middle">memories + vectors</text>
+  <text class="t t-sub" x="647" y="119" text-anchor="middle">tool-call records</text>
+  <path class="edge" d="M 500 85 L 558 85" marker-end="url(#arrow)"/>
+
+  <!-- Embedder -->
+  <rect class="box" x="560" y="185" width="175" height="66"/>
+  <text class="t t-title" x="647" y="211" text-anchor="middle">search backend</text>
+  <text class="t t-sub" x="647" y="231" text-anchor="middle">runs locally</text>
+  <path class="edge" d="M 460 142 L 460 218 L 558 218" marker-end="url(#arrow)"/>
+
+  <!-- LLM -->
+  <rect class="box" x="560" y="290" width="175" height="80"/>
+  <text class="t t-title" x="647" y="316" text-anchor="middle">LLM provider</text>
+  <text class="t t-sub" x="647" y="336" text-anchor="middle">summaries + profiling</text>
+  <text class="t t-sub" x="647" y="354" text-anchor="middle">optional</text>
+  <path class="edge dash" d="M 420 142 L 420 328 L 558 328" marker-end="url(#arrow)"/>
+
+  <text class="t t-sub" x="400" y="410" text-anchor="middle">Everything stays on your machine except calls to a hosted LLM provider (dashed).</text>
+</svg>

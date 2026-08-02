@@ -91,9 +91,11 @@ backend = "ollama"
 	if cfg.LLM.Provider != "ollama" || cfg.LLM.Model != "sonnet" {
 		t.Errorf("llm section = %+v", cfg.LLM)
 	}
-	if cfg.Hooks.Enabled != false || cfg.Hooks.Timeout != 42 {
-		t.Errorf("hooks section = %+v", cfg.Hooks)
-	}
+	// The fixture still carries a [hooks] section. It is no longer a known
+	// section — hooks are configured in ~/.claude/settings.json — and reaching
+	// this line at all proves the retired keys are ignored rather than treated
+	// as an error. An operator upgrading with the old block in config.toml must
+	// not get a startup failure for it.
 	if !cfg.Extraction.Auto {
 		t.Error("extraction.auto = false, want true")
 	}

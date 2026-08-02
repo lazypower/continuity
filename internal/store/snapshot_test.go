@@ -769,6 +769,109 @@ func TestSnapshot_PruneNoOpOnEmpty(t *testing.T) {
 // stranded-file case that arises when recording fails after a migration commits
 // or a superseded-file delete fails. Tracked-only pruning would leak these full
 // DB copies forever, contradicting prune's promise to reclaim the safety net.
+// TestSnapshot_RepairSnapshotsAreVisibleAndReclaimable pins the naming contract
+// between the code that writes snapshots and the code that reclaims them.
+//
+// SnapshotNow records no tracking row by design, so a repair or compost copy is
+// only ever reachable through the untracked-file scan. That scan used to
+// hardcode "continuity-pre-v", which SnapshotNow's names never match — so every
+// `doctor --repair-vectors --apply` and `embedder use` left a FULL database copy
+// on disk that `snapshot list` could not see and `snapshot prune` would not
+// remove. One real install carried a 322 MB orphan beside a 22 MB database.
+func TestSnapshot_RepairSnapshotsAreVisibleAndReclaimable(t *testing.T) {
+	t.Setenv(EnvNoMigrationSnapshot, "")
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	buildSnapshotDBAtVersion(t, dbPath, 8)
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Exactly what `embedder use` and `doctor --repair-vectors --apply` do.
+	repairPath, err := db.SnapshotNow("pre-repair-vectors")
+	if err != nil {
+		t.Fatalf("SnapshotNow: %v", err)
+	}
+	if _, err := os.Stat(repairPath); err != nil {
+		t.Fatalf("repair snapshot not on disk: %v", err)
+	}
+
+	// It must be VISIBLE. Reporting "no snapshots retained" while a full
+	// database copy sits in the directory we just read is the bug.
+	untracked, err := db.UntrackedSnapshots()
+	if err != nil {
+		t.Fatalf("UntrackedSnapshots: %v", err)
+	}
+	var found bool
+	for _, u := range untracked {
+		if u.Path == repairPath {
+			found = true
+			if u.Bytes <= 0 {
+				t.Errorf("reported size %d for %s, want the real file size", u.Bytes, u.Path)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("repair snapshot %s absent from UntrackedSnapshots (%d entries) — "+
+			"an operator has no way to learn this disk is being used", repairPath, len(untracked))
+	}
+
+	// And it must be RECLAIMABLE.
+	if _, err := db.PruneMigrationSnapshots(); err != nil {
+		t.Fatalf("PruneMigrationSnapshots: %v", err)
+	}
+	if _, err := os.Stat(repairPath); !os.IsNotExist(err) {
+		t.Errorf("repair snapshot survived prune (stat err: %v) — this is how the "+
+			"copies accumulated one per migration, forever", err)
+	}
+}
+
+// TestSnapshot_FileMatchGrammar bounds what prune is allowed to delete.
+//
+// The untracked-file scan removes full database copies, so widening it to catch
+// repair snapshots must not also catch a file an operator put here themselves.
+// Matching the whole emitted grammar — including the trailing timestamp — is
+// what keeps "remove snapshots" from meaning "remove anything named like one".
+func TestSnapshot_FileMatchGrammar(t *testing.T) {
+	ours := []string{
+		"continuity-pre-v9-2026-06-20T20-00-06Z.db",             // migration snapshot
+		"continuity-pre-repair-vectors-2026-07-17T21-27-19Z.db", // embedder use / doctor repair
+		"continuity-pre-gc-compost-2026-01-02T03-04-05Z.db",     // compost reclaim
+		"continuity-snapshot-2026-01-02T03-04-05Z.db",           // empty-label fallback
+	}
+	for _, name := range ours {
+		if !isSnapshotFile(name) {
+			t.Errorf("isSnapshotFile(%q) = false, want true — we wrote this file and must reclaim it", name)
+		}
+	}
+
+	notOurs := []string{
+		"continuity-backup.db",                         // an operator's own copy — deleting this is data loss
+		"continuity.db",                                // the database itself, copied here
+		"continuity-pre-v9.db",                         // snapshot-shaped but no timestamp
+		"operator-notes.txt",                           // not a database at all
+		"continuity-2026-06-20.db",                     // date, but not the full timestamp grammar
+		"my-continuity-pre-v9-2026-06-20T20-00-06Z.db", // right suffix, wrong owner
+	}
+	for _, name := range notOurs {
+		if isSnapshotFile(name) {
+			t.Errorf("isSnapshotFile(%q) = true, want false — prune would delete a file we did not write", name)
+		}
+	}
+
+	// The writer and the matcher must agree, for every label in the codebase.
+	for _, label := range []string{"pre-v6", "pre-v16", "pre-repair-vectors", "pre-gc-compost", ""} {
+		if got := snapshotFileName(label); !isSnapshotFile(got) {
+			t.Errorf("snapshotFileName(%q) = %q, which isSnapshotFile rejects — "+
+				"the writer and the reclaimer have drifted apart again", label, got)
+		}
+	}
+}
+
 func TestSnapshot_PruneReclaimsUntrackedFiles(t *testing.T) {
 	t.Setenv(EnvNoMigrationSnapshot, "")
 

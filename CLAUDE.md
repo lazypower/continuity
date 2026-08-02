@@ -36,7 +36,8 @@ continuity hook <evt>  → Claude Code hook handler (reads stdin JSON, writes st
 continuity search      → CLI memory search
 continuity profile     → Show relational profile
 continuity tree        → Browse memory tree
-continuity import      → Migrate from claude-mem JS database
+continuity doctor      → Diagnose embedder/vector coherence
+continuity prune       → Reclaim spent observations + compact the database
 ```
 
 Single binary. SQLite via `modernc.org/sqlite` (pure Go, no CGO). Embedded vector search. `go:embed` for viewer UI.
@@ -121,7 +122,7 @@ See `RFC.md` §16 for full breakdown. Summary:
 
 ## Legacy Migration
 
-The old claude-mem JS database lives at `~/.claude-mem/claude-mem.db`. Run `continuity import --from=claude-mem` to migrate sessions, observations, and the relational profile into the new memory tree. Non-destructive — old DB is preserved.
+**Not implemented.** The old claude-mem JS database lives at `~/.claude-mem/claude-mem.db`, and RFC.md §12 still describes the intended `continuity import --from=claude-mem` migration — sessions, observations, and the relational profile into the new memory tree, non-destructively. No such command ships today. It was registered as a stub that printed "not yet implemented" until it was removed for being a verb in `--help` that answered nothing. Build it before documenting it.
 
 ## Development Notes
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -33,6 +34,134 @@ type MigrationSnapshot struct {
 	TargetVersion int
 	CreatedAt     time.Time
 	BootsSince    int
+}
+
+// Snapshot filenames are a CONTRACT between the code that writes them and the
+// code that reclaims them, so both sides go through the helpers below rather
+// than building or matching the string inline.
+//
+// They did not always. snapshotBeforeRiskyMigration wrote "continuity-pre-v<N>-"
+// while SnapshotNow wrote "continuity-<label>-", and PruneMigrationSnapshots'
+// untracked-file scan hardcoded the former. Every repair and compost snapshot —
+// a FULL database copy each — therefore sat outside both the tracking table and
+// the scan: invisible to `snapshot list`, untouched by `snapshot prune`, and
+// retained forever. One real install carried a 322 MB orphan next to a 22 MB
+// database. Deriving the match from the same prefix used to write closes that
+// class of bug rather than the one instance of it.
+const (
+	snapshotFilePrefix = "continuity-"
+	snapshotFileSuffix = ".db"
+)
+
+// snapshotFileName builds a snapshot filename from a label. The timestamp uses
+// RFC3339 with dashes instead of colons so the name is safe on every
+// filesystem (Windows in particular rejects colons).
+func snapshotFileName(label string) string {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
+			return r
+		default:
+			return '-'
+		}
+	}, label)
+	if safe == "" {
+		safe = "snapshot"
+	}
+	timestamp := time.Now().UTC().Format("2006-01-02T15-04-05Z")
+	return snapshotFilePrefix + safe + "-" + timestamp + snapshotFileSuffix
+}
+
+// snapshotNamePattern matches the full grammar snapshotFileName emits —
+// prefix, label, and the trailing UTC timestamp — built from the same constants
+// the writer uses so the two cannot drift apart again.
+//
+// Matching the whole grammar rather than the prefix alone is deliberate. These
+// entries are deleted by `snapshot prune`, and a bare "continuity-*.db" test
+// would also claim a file an operator put here themselves — a hand-made
+// continuity-backup.db would be silently destroyed by a command that promises
+// only to remove snapshots. Requiring the timestamp means we delete exactly what
+// we wrote and nothing that merely resembles it.
+var snapshotNamePattern = regexp.MustCompile(
+	`^` + regexp.QuoteMeta(snapshotFilePrefix) +
+		`.+-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z` +
+		regexp.QuoteMeta(snapshotFileSuffix) + `$`)
+
+// isSnapshotFile reports whether a directory entry inside a snapshot directory
+// is one this code wrote. Scoped by the caller to snapshotDirForDB, which is
+// namespaced per database, so it can never reach another database's rollback
+// point.
+func isSnapshotFile(name string) bool {
+	return snapshotNamePattern.MatchString(name)
+}
+
+// UntrackedSnapshot is a snapshot file on disk that no tracking row accounts
+// for — a repair or compost copy (SnapshotNow records no row by design), or a
+// migration copy stranded when recording failed after its migration committed.
+type UntrackedSnapshot struct {
+	Path  string
+	Bytes int64
+}
+
+// UntrackedSnapshots reports full-database copies sitting in this DB's snapshot
+// directory with no tracking row behind them.
+//
+// These are reclaimable by `snapshot prune`, but until now nothing SURFACED
+// them: `snapshot list` reads the tracking table, so it answered "no migration
+// safety snapshots retained" while a full database copy sat in the directory it
+// had just read. An operator had no way to learn the space existed. Silent
+// growth that only becomes visible as a symptom elsewhere is the failure this
+// release exists to fix, so the same reasoning applies here.
+func (db *DB) UntrackedSnapshots() ([]UntrackedSnapshot, error) {
+	if db.Path == "" || db.Path == ":memory:" {
+		return []UntrackedSnapshot{}, nil
+	}
+	tracked, err := db.ListMigrationSnapshots()
+	if err != nil {
+		return nil, err
+	}
+	// Compare canonicalized paths. Tracking rows store whatever path the DB was
+	// opened with, so a row written under a relative CONTINUITY_DB and read back
+	// under an absolute one would not match lexically — and the same physical
+	// file would then be reported as both tracked AND untracked in one listing.
+	isTracked := make(map[string]bool, len(tracked)*2)
+	for _, s := range tracked {
+		isTracked[s.Path] = true
+		if abs, err := filepath.Abs(s.Path); err == nil {
+			isTracked[abs] = true
+		}
+	}
+
+	snapDir := snapshotDirForDB(db.Path)
+	entries, err := os.ReadDir(snapDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []UntrackedSnapshot{}, nil
+		}
+		return nil, fmt.Errorf("scan snapshot dir %s: %w", snapDir, err)
+	}
+
+	out := []UntrackedSnapshot{}
+	for _, e := range entries {
+		if e.IsDir() || !isSnapshotFile(e.Name()) {
+			continue
+		}
+		p := filepath.Join(snapDir, e.Name())
+		if isTracked[p] {
+			continue
+		}
+		if abs, err := filepath.Abs(p); err == nil && isTracked[abs] {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			// A file that vanished mid-scan is not an error worth failing the
+			// whole report over — it is one fewer thing to reclaim.
+			continue
+		}
+		out = append(out, UntrackedSnapshot{Path: p, Bytes: info.Size()})
+	}
+	return out, nil
 }
 
 // snapshotDirForDB returns the per-database directory that holds this DB's
@@ -110,11 +239,7 @@ func (db *DB) snapshotBeforeRiskyMigration(m migration) (string, error) {
 		return "", fmt.Errorf("create snapshot dir %s: %w", snapDir, err)
 	}
 
-	// Timestamp uses RFC3339 with dashes instead of colons so the filename
-	// is safe on every filesystem (Windows in particular rejects colons).
-	timestamp := time.Now().UTC().Format("2006-01-02T15-04-05Z")
-	snapName := fmt.Sprintf("continuity-pre-v%d-%s.db", m.Version, timestamp)
-	snapPath := filepath.Join(snapDir, snapName)
+	snapPath := filepath.Join(snapDir, snapshotFileName(fmt.Sprintf("pre-v%d", m.Version)))
 
 	// VACUUM INTO is the SQLite-blessed atomic copy. DO NOT replace this with
 	// a file-level copy (os.Rename / io.Copy / `cp` / `tar` / etc.). Reasons:
@@ -175,20 +300,7 @@ func (db *DB) SnapshotNow(label string) (string, error) {
 		return "", fmt.Errorf("create snapshot dir %s: %w", snapDir, err)
 	}
 
-	safe := strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
-			return r
-		default:
-			return '-'
-		}
-	}, label)
-	if safe == "" {
-		safe = "snapshot"
-	}
-
-	timestamp := time.Now().UTC().Format("2006-01-02T15-04-05Z")
-	snapPath := filepath.Join(snapDir, fmt.Sprintf("continuity-%s-%s.db", safe, timestamp))
+	snapPath := filepath.Join(snapDir, snapshotFileName(label))
 
 	if _, err := db.Exec("VACUUM INTO ?", snapPath); err != nil {
 		return "", fmt.Errorf("vacuum into %s: %w", snapPath, err)
@@ -406,7 +518,7 @@ func (db *DB) PruneMigrationSnapshots() (int, error) {
 			// Only touch our own snapshot files; never anything else that
 			// happens to share the directory.
 			name := e.Name()
-			if e.IsDir() || !strings.HasPrefix(name, "continuity-pre-v") || !strings.HasSuffix(name, ".db") {
+			if e.IsDir() || !isSnapshotFile(name) {
 				continue
 			}
 			p := filepath.Join(snapDir, name)

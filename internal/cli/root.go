@@ -21,7 +21,6 @@ func init() {
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(profileCmd)
 	rootCmd.AddCommand(treeCmd)
-	rootCmd.AddCommand(importCmd)
 	rootCmd.AddCommand(dedupCmd)
 	rootCmd.AddCommand(rememberCmd)
 	rootCmd.AddCommand(retractCmd)
