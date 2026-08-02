@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -401,5 +402,74 @@ func TestForeignKeysEnabled(t *testing.T) {
 	}
 	if fk != 1 {
 		t.Errorf("foreign_keys = %d, want 1", fk)
+	}
+}
+
+// TestPragmasApplyToEveryPooledConnection pins the DSN contract.
+//
+// These pragmas were previously issued as db.Exec("PRAGMA ...") after opening.
+// database/sql runs that on whichever pooled connection serves the call, so
+// every connection opened later reverted to SQLite's defaults — busy_timeout 0
+// (return SQLITE_BUSY instantly instead of waiting) and foreign_keys OFF. The
+// symptom was boot-time writers losing to the background vector backfill and
+// giving up: retention, the snapshot tick, and the metrics rollup could each
+// fail on a healthy database.
+//
+// Checking one connection cannot catch that regression, so this holds several
+// open at once and checks each.
+func TestPragmasApplyToEveryPooledConnection(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	const n = 4
+	conns := make([]*sql.Conn, 0, n)
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+
+	// Hold them simultaneously — released connections would be reused and a
+	// single correctly-configured one could satisfy every check.
+	for i := 0; i < n; i++ {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("conn %d: %v", i, err)
+		}
+		conns = append(conns, c)
+	}
+
+	for i, c := range conns {
+		var busy int
+		if err := c.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busy); err != nil {
+			t.Fatalf("conn %d busy_timeout: %v", i, err)
+		}
+		if busy != 5000 {
+			t.Errorf("conn %d: busy_timeout = %d, want 5000 — this connection would "+
+				"return SQLITE_BUSY instantly instead of waiting for the write lock", i, busy)
+		}
+
+		var fk int
+		if err := c.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk); err != nil {
+			t.Fatalf("conn %d foreign_keys: %v", i, err)
+		}
+		if fk != 1 {
+			t.Errorf("conn %d: foreign_keys = %d, want 1 — this connection would not "+
+				"enforce referential integrity", i, fk)
+		}
+	}
+
+	// WAL is persisted in the database header, so it must hold everywhere too.
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("journal_mode: %v", err)
+	}
+	if mode != "wal" {
+		t.Errorf("journal_mode = %q, want wal", mode)
 	}
 }
