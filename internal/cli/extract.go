@@ -109,6 +109,11 @@ func runExtract(cmd *cobra.Command, args []string) error {
 		if resp.Relational == "extracting" {
 			fmt.Println("relational profiling queued — the profile still updates from this session")
 		}
+		// The server failed to queue the relational job — say so instead of
+		// letting the silent-skip message imply the profile update happened.
+		if resp.Relational == "error" {
+			fmt.Fprintf(os.Stderr, "relational profiling could NOT be queued for %s — the profile may miss this session; check serve.log\n", sessionID)
+		}
 		return nil
 	}
 

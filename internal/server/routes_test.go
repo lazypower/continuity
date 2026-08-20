@@ -763,6 +763,35 @@ func TestExtractSessionRouteRelationalKillSwitch(t *testing.T) {
 	}
 }
 
+// TestExtractSessionRouteRelationalEnqueueErrorSurfaced: when the relational
+// job cannot be queued, the response must carry "relational":"error" so the
+// CLI can tell the user the profile misses this session — not the plain
+// disabled status as if nothing was expected to happen.
+func TestExtractSessionRouteRelationalEnqueueErrorSurfaced(t *testing.T) {
+	srv := testServerWithEngine(t)
+	srv.db.InitSession("extract-eqerr", "proj")
+
+	// Force EnqueueExtraction to fail: drop the queue table out from under it.
+	if _, err := srv.db.Exec("DROP TABLE extraction_queue"); err != nil {
+		t.Fatalf("drop extraction_queue: %v", err)
+	}
+
+	body := `{"transcript_path":"/nonexistent/transcript.jsonl"}`
+	req := newTestRequest("POST", "/api/sessions/extract-eqerr/extract", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); !strings.Contains(got, StatusExtractionDisabled) {
+		t.Fatalf("body = %q, want %s", got, StatusExtractionDisabled)
+	}
+	if got := w.Body.String(); !strings.Contains(got, `"relational":"error"`) {
+		t.Fatalf("body = %q, want relational error marker", got)
+	}
+}
+
 // TestExtractSessionRouteAutoOffNoTranscriptSkipsRelational: without a
 // transcript path there is nothing for the relational profiler to analyze, so
 // the disabled branch enqueues nothing rather than a job doomed to fail.

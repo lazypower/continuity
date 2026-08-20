@@ -128,6 +128,15 @@ func (s *Server) runExtractionJob(job *store.ExtractionJob) error {
 		// Relational-only job (#78): enqueued by handleExtractSession while
 		// autoExtract is off, so the profile keeps learning without the memory
 		// pipeline. Runs no memory extraction and never marks the session extracted.
+		//
+		// Honor the kill switch at execution time too, not just at enqueue: a job
+		// queued before CONTINUITY_RELATIONAL_AUTO=false took effect must not
+		// replay after a restart and write to a profile the operator froze.
+		// Dropping (nil ⇒ deleted) is the freeze doing its job, not data loss.
+		if !s.relationalAuto {
+			log.Printf("extraction worker: dropping queued relational job for %s — relational auto is disabled", job.SessionID)
+			return nil
+		}
 		return s.engine.ExtractRelational(job.SessionID, job.Payload)
 	default:
 		// Unknown kind: drop it (nil error ⇒ deleted) rather than retry forever.

@@ -211,6 +211,43 @@ func TestRelationalOnlyPipelineWithDefaultConfig(t *testing.T) {
 	}
 }
 
+// TestExtractionWorkerDropsRelationalWhenKillSwitchOff (#78): the kill switch
+// is honored at execution time, not only at enqueue — a relational job queued
+// before CONTINUITY_RELATIONAL_AUTO=false took effect (e.g. across a restart)
+// is dropped on replay and never writes to the frozen profile.
+func TestExtractionWorkerDropsRelationalWhenKillSwitchOff(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	mock := &llm.MockClient{Response: &llm.Response{
+		Content: "## 1. FEEDBACK CALIBRATION\nMust never be written — the switch is off.", Provider: "mock"}}
+	eng := engine.New(db, mock)
+	s := New(db, eng, "test")
+	s.SetRelationalAuto(false)
+
+	db.InitSession("rel-frozen", "proj")
+	if err := db.EnqueueExtraction("rel-frozen", "relational", writeWorkerTranscript(t), false); err != nil {
+		t.Fatalf("EnqueueExtraction: %v", err)
+	}
+
+	s.StartExtractionWorker()
+	t.Cleanup(func() { s.StopExtractionWorker(2 * time.Second) })
+
+	// Dropped means deleted (queue drains), not parked with bumped attempts.
+	waitForPending(t, db, 0, 3*time.Second)
+
+	node, err := db.GetNodeByURI("mem://user/profile/communication")
+	if err != nil {
+		t.Fatalf("GetNodeByURI: %v", err)
+	}
+	if node != nil {
+		t.Fatal("queued relational job wrote to the frozen profile — kill switch not honored on replay")
+	}
+}
+
 // TestExtractionWorkerReplaysExistingQueue: jobs already in the queue when the
 // worker starts (i.e. left by a prior crash) drain on start with no enqueue-wake
 // — the crash-recovery guarantee.

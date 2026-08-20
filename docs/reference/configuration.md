@@ -90,7 +90,9 @@ loosely — `true`, `1`, and `yes` all mean on; anything else means off.
 creates arbitrary memories — it only merges into the system-owned
 `mem://user/profile/communication` node, and its provenance is unambiguous
 (analysis of the session, not facts transiting it). Turning it off freezes the
-relational profile; `serve` prints a warning at startup saying so.
+relational profile — including relational jobs already sitting in the durable
+queue, which are dropped rather than replayed — and `serve` prints a warning at
+startup saying so.
 
 ### `[embedder]`
 

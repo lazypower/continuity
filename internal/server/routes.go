@@ -170,8 +170,12 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 		if s.relationalAuto && req.TranscriptPath != "" {
 			if err := s.db.EnqueueExtraction(sessionID, "relational", req.TranscriptPath, false); err != nil {
 				// Non-fatal: memory extraction was skipped either way; the profile
-				// update is lost for this session only, and loudly.
+				// update is lost for this session only, and loudly — both in the
+				// server log AND in the response, so the CLI can tell the user
+				// instead of reporting the plain disabled status as if nothing
+				// was expected to happen.
 				log.Printf("enqueue relational extraction for %s: %v", sessionID, err)
+				resp["relational"] = "error"
 			} else {
 				s.wakeExtractionWorker()
 				resp["relational"] = "extracting"
