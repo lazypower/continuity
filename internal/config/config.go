@@ -14,6 +14,7 @@ type Config struct {
 	LLM        LLMConfig        `toml:"llm"`
 	Extraction ExtractionConfig `toml:"extraction"`
 	Embedder   EmbedderConfig   `toml:"embedder"`
+	Gate       GateConfig       `toml:"gate"`
 }
 
 type ServerConfig struct {
@@ -67,6 +68,46 @@ type EmbedderConfig struct {
 	Backend string `toml:"backend"`
 }
 
+// Gate mode values. The zero/empty value and every unrecognized value resolve
+// to shadow — injection requires the literal "on" and nothing else, so no
+// config state (typo, stray key, partial file) can silently enable it (#80).
+const (
+	GateOff    = "off"    // gate fully off: no search, no calibration events
+	GateShadow = "shadow" // default: log calibration events, inject nothing
+	GateOn     = "on"     // inject hits at or above tau (explicit opt-in only)
+)
+
+// GateConfig governs the ADR-001 §4 prompt gate (#80): a per-prompt,
+// project-scoped, pure-vector recall check at UserPromptSubmit.
+type GateConfig struct {
+	// Mode is "off", "shadow" (default), or "on". Shadow logs one calibration
+	// event per prompt and never injects; that is this release's deliverable —
+	// "on" exists for tests and for the post-calibration flip.
+	Mode string `toml:"mode"`
+	// Tau is the hard similarity threshold for injection when Mode is "on".
+	// Default 0.50 from the issue #80 backtest (1,401 prompts: median
+	// max-sim 0.31, fire rate 5.5% at 0.50, precision flat above the knee).
+	// Tau is per-embedder; recalibrate on embedder change (ADR-001 ⚑).
+	Tau float64 `toml:"tau"`
+}
+
+// NormalizedGateMode collapses a configured mode string to one of the three
+// canonical values. Anything that is not exactly "off" or "on" is shadow:
+// fail-safe resolution, never fail-open into injection.
+func NormalizedGateMode(mode string) string {
+	switch mode {
+	case GateOff:
+		return GateOff
+	case GateOn:
+		return GateOn
+	default:
+		return GateShadow
+	}
+}
+
+// DefaultGateTau is the provisional per-embedder injection threshold (#80).
+const DefaultGateTau = 0.50
+
 // Default returns a Config with sensible defaults.
 func Default() Config {
 	return Config{
@@ -87,6 +128,10 @@ func Default() Config {
 		},
 		Embedder: EmbedderConfig{
 			Backend: "auto",
+		},
+		Gate: GateConfig{
+			Mode: GateShadow,
+			Tau:  DefaultGateTau,
 		},
 	}
 }

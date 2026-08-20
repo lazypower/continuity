@@ -23,6 +23,11 @@ type SearchResult struct {
 type SearchOpts struct {
 	Limit    int    // max results (default 10)
 	Category string // filter by category (empty = all)
+	// Scope, when non-nil, restricts the match space to nodes it accepts.
+	// The prompt gate passes a project-affinity predicate here (#80) so Find
+	// stays the one vector-search authority instead of the gate growing a
+	// parallel scan. Scope is a pure filter: it must not mutate the node.
+	Scope func(store.MemNode) bool
 }
 
 func (o SearchOpts) limit() int {
@@ -130,6 +135,10 @@ func Find(ctx context.Context, db *store.DB, embedder Embedder, query string, op
 		// Dedup-against-retracted runs on a separate path that intentionally
 		// keeps retracted nodes in the match space.
 		if node.IsRetracted() {
+			continue
+		}
+		// Caller-supplied scope (the gate's project-affinity filter, #80).
+		if opts.Scope != nil && !opts.Scope(node) {
 			continue
 		}
 

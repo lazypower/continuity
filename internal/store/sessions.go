@@ -200,6 +200,34 @@ func (db *DB) GetRecentProjectSessions(project string, limit int) ([]Session, er
 	return sessions, rows.Err()
 }
 
+// SessionIDsForProject returns the set of session ids whose project matches
+// the given normalized project identity (projectMatch semantics, #79). The
+// prompt gate uses it to scope find-mode to project-affine nodes (#80): a
+// node is affine when its source_session is in this set — the same join the
+// tray's corpus index walks, evaluated as a set so the gate can filter inside
+// the in-memory vector scan.
+func (db *DB) SessionIDsForProject(project string) (map[string]bool, error) {
+	if project == "" {
+		return map[string]bool{}, nil
+	}
+	rows, err := db.Query(`
+		SELECT session_id FROM sessions WHERE `+projectMatch("project"), project, project, project)
+	if err != nil {
+		return nil, fmt.Errorf("session ids for project: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan session id: %w", err)
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
+}
+
 // GetSessionsSince returns all sessions started after the given timestamp, ordered by started_at ASC.
 func (db *DB) GetSessionsSince(sinceMs int64) ([]Session, error) {
 	rows, err := db.Query(`

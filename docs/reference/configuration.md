@@ -103,6 +103,25 @@ next `serve` selects; your stored vectors stay in the old space, and search fail
 closed on the mismatch until you repair it. `continuity embedder use <backend>`
 is the command that changes the key *and* re-embeds.
 
+### `[gate]`
+
+The prompt gate (ADR-001 §4): on every user prompt, the submit hook asks the
+server whether memory holds something similar enough to surface. In `shadow`
+mode (the default) it only *logs* a calibration event per prompt — nothing is
+ever injected. `on` injects hits at or above `tau` as one-line pointers
+(L0 + `mem://` URI), deduped against what the session has already seen.
+`continuity doctor` renders the collected calibration distribution.
+
+| Key | Type | Default | Accepted values |
+|---|---|---|---|
+| `mode` | string | `shadow` | `off`, `shadow`, `on`. Anything else is read as `shadow` — a typo can disable injection, never enable it. |
+| `tau` | number | `0.50` | A number in (0, 1]. Out-of-range or unparsable values keep the default. |
+
+The gate call fails closed by contract: if the server is stopped, slow, locked,
+or answers garbage, the hook stays silent and the prompt passes through
+unmodified. Turning `mode` to `on` prints a startup notice, like
+`[extraction].auto` does.
+
 ---
 
 ## Environment variables
@@ -118,6 +137,8 @@ is the command that changes the key *and* re-embeds.
 | `CONTINUITY_OBSERVATION_RETENTION_DAYS` | — | `14` days | A positive integer number of days, or `off` / `false` to disable pruning. See [below](#observation-retention). |
 | `ANTHROPIC_API_KEY` | `[llm].provider` **and** `[llm].anthropic_key` | *(unset)* | An API key. Setting it forces `provider = "anthropic"`, overriding whatever `config.toml` says. |
 | `CONTINUITY_GC` | — | `off` | `off`, `shadow`, `on`. Memory garbage collection. Anything unrecognized is treated as `off`. **Advanced.** |
+| `CONTINUITY_GATE` | `[gate].mode` | `shadow` | `off`, `shadow`, `on`. `serve` **refuses to start** on anything else — an explicit knob with a typo must surface, not silently pick a mode. |
+| `CONTINUITY_GATE_TAU` | `[gate].tau` | `0.50` | A number in (0, 1]. `serve` **refuses to start** on anything else. |
 | `CONTINUITY_NO_MIGRATION_SNAPSHOT` | — | *(unset)* | Any non-empty value skips the safety snapshot before a risky schema migration. **Advanced — this removes your rollback point.** |
 
 `PATH` and `HOME` are read by `continuity install-service` to build the service

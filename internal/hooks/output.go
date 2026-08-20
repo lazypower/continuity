@@ -23,6 +23,25 @@ func WriteSessionStartOutput(context string) error {
 	return json.NewEncoder(os.Stdout).Encode(out)
 }
 
+// UserPromptSubmitOutput is the JSON structure Claude Code expects on stdout
+// from the UserPromptSubmit hook when it injects additional context (#80).
+type UserPromptSubmitOutput struct {
+	HookSpecificOutput struct {
+		HookEventName     string `json:"hookEventName"`
+		AdditionalContext string `json:"additionalContext"`
+	} `json:"hookSpecificOutput"`
+}
+
+// WriteUserPromptSubmitOutput writes a UserPromptSubmit response to stdout.
+// Only the gate's injection path calls this; every other submit outcome —
+// including every gate failure — writes nothing (silence is the default).
+func WriteUserPromptSubmitOutput(context string) error {
+	out := UserPromptSubmitOutput{}
+	out.HookSpecificOutput.HookEventName = "UserPromptSubmit"
+	out.HookSpecificOutput.AdditionalContext = context
+	return json.NewEncoder(os.Stdout).Encode(out)
+}
+
 // ExitSilent exits with code 0, no stdout. Used by all hooks except SessionStart.
 func ExitSilent() {
 	os.Exit(0)

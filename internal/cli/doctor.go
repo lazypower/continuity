@@ -35,7 +35,9 @@ Checks:
   - missing vectors (leaves with no embedding)
   - mixed-dimension vectors
   - stale vectors from an older embedder
-  - a read-only retrieval smoke test (do nodes retrieve themselves?)`,
+  - a read-only retrieval smoke test (do nodes retrieve themselves?)
+  - the prompt gate's shadow calibration distribution (#80): prompt count,
+    max-similarity percentiles, fire rates at candidate thresholds`,
 	RunE: runDoctor,
 }
 
@@ -83,8 +85,71 @@ type doctorReport struct {
 	StaleVectors   int           `json:"stale_vectors"`
 	DimMismatch    int           `json:"dim_mismatch_vectors"`
 	Smoke          smokeResult   `json:"retrieval_smoke_test"`
+	Gate           gateCalReport `json:"gate_calibration"`
 	Findings       []string      `json:"findings"`
 	Healthy        bool          `json:"healthy"`
+}
+
+// gateFireRate is the share of logged prompts whose max-similarity clears one
+// candidate τ — the number the ADR-001 §4 flip decision reads.
+type gateFireRate struct {
+	Tau  float64 `json:"tau"`
+	Rate float64 `json:"rate"` // fraction of prompts, 0..1
+}
+
+// gateCalReport renders the shadow-mode τ calibration distribution (#80):
+// prompt count, median and upper percentiles of per-prompt max-similarity,
+// and fire rates at candidate thresholds. Percentiles are nearest-rank over
+// the retained window (bounded at write time, store/gate.go). This is a
+// read-only view — doctor never writes calibration rows.
+type gateCalReport struct {
+	Prompts   int            `json:"prompts"`
+	Median    float64        `json:"median_max_sim"`
+	P90       float64        `json:"p90_max_sim"`
+	P95       float64        `json:"p95_max_sim"`
+	P99       float64        `json:"p99_max_sim"`
+	FireRates []gateFireRate `json:"fire_rates,omitempty"`
+	Note      string         `json:"note,omitempty"`
+}
+
+// gateCandidateTaus are the thresholds the calibration report evaluates —
+// the band the issue #80 backtest bracketed around the τ=0.50 knee.
+var gateCandidateTaus = []float64{0.40, 0.45, 0.50, 0.55, 0.60}
+
+// buildGateCalReport derives the calibration report from the logged
+// max-similarities (ascending, as GateCalibrationMaxSims returns them).
+func buildGateCalReport(sims []float64) gateCalReport {
+	n := len(sims)
+	if n == 0 {
+		return gateCalReport{Note: "no calibration events yet — the gate logs one per prompt in shadow mode"}
+	}
+	// Nearest-rank percentile over ascending sims.
+	pct := func(q float64) float64 {
+		idx := int(q*float64(n)+0.5) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= n {
+			idx = n - 1
+		}
+		return sims[idx]
+	}
+	rep := gateCalReport{
+		Prompts: n,
+		Median:  pct(0.50),
+		P90:     pct(0.90),
+		P95:     pct(0.95),
+		P99:     pct(0.99),
+	}
+	for _, tau := range gateCandidateTaus {
+		// sims is ascending: the first index at or above tau gives the count above.
+		lo := sort.SearchFloat64s(sims, tau)
+		rep.FireRates = append(rep.FireRates, gateFireRate{
+			Tau:  tau,
+			Rate: float64(n-lo) / float64(n),
+		})
+	}
+	return rep
 }
 
 // serverIdentity is what the running server reports about its live embedder.
@@ -143,6 +208,15 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	declared, _, _ := db.VectorIdentity()
 
 	rep := buildDoctorReport(emb, leaves, vectors, declared, fetchServerIdentity())
+
+	// Gate calibration (#80): read-only view over the bounded shadow log.
+	// A read failure is a note, not a doctor failure — the vector-coherence
+	// diagnosis must not be blocked by a telemetry table.
+	if sims, simErr := db.GateCalibrationMaxSims(); simErr != nil {
+		rep.Gate = gateCalReport{Note: "gate calibration unreadable: " + simErr.Error()}
+	} else {
+		rep.Gate = buildGateCalReport(sims)
+	}
 
 	if doctorJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -541,6 +615,21 @@ func printDoctorReport(rep doctorReport) {
 			fmt.Printf(", median rank %d", s.MedianRank)
 		}
 		fmt.Println(")")
+	}
+	fmt.Println()
+
+	g := rep.Gate
+	fmt.Println("  gate calibration (ADR-001 §4 shadow log):")
+	if g.Note != "" {
+		fmt.Printf("    %s\n", g.Note)
+	} else {
+		fmt.Printf("    prompts:  %d\n", g.Prompts)
+		fmt.Printf("    max-sim:  median %.3f · p90 %.3f · p95 %.3f · p99 %.3f\n", g.Median, g.P90, g.P95, g.P99)
+		fmt.Printf("    fire rate:")
+		for _, fr := range g.FireRates {
+			fmt.Printf("  τ=%.2f → %.1f%%", fr.Tau, fr.Rate*100)
+		}
+		fmt.Println()
 	}
 	fmt.Println()
 
