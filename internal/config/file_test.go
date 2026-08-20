@@ -50,6 +50,30 @@ func TestLoadFile_DefaultBackendIsAuto(t *testing.T) {
 	}
 }
 
+// TestLoadFile_RelationalAuto (#78): relational profiling defaults on and is
+// disableable via [extraction] relational_auto = false.
+func TestLoadFile_RelationalAuto(t *testing.T) {
+	if !Default().Extraction.RelationalAuto {
+		t.Fatal("Default().Extraction.RelationalAuto = false, want true")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := "[extraction]\nrelational_auto = false\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if cfg.Extraction.RelationalAuto {
+		t.Error("Extraction.RelationalAuto = true, want false from config file")
+	}
+	if cfg.Extraction.Auto {
+		t.Error("Extraction.Auto must stay off by default")
+	}
+}
+
 func TestLoadFile_OtherFieldsRoundtrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	content := `[server]

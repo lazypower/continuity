@@ -694,12 +694,13 @@ func TestExtractSessionRouteAcceptsForce(t *testing.T) {
 	}
 }
 
-// TestExtractSessionRouteSkipsWhenAutoOff pins the default behavior: with auto
-// session extraction off (the default), a non-force request — the Stop/End hook
-// path — is accepted but skipped, enqueuing nothing. This is what silences the
-// high-noise transcript-guessing path.
-func TestExtractSessionRouteSkipsWhenAutoOff(t *testing.T) {
-	srv := testServerWithEngine(t) // autoExtract defaults to false
+// TestExtractSessionRouteAutoOffEnqueuesRelationalOnly pins the default
+// behavior (#78): with auto session extraction off (the default), a non-force
+// request — the Stop/End hook path — still skips memory extraction (the stable
+// extraction_disabled contract), but enqueues a relational-only job so the
+// relational profile keeps learning.
+func TestExtractSessionRouteAutoOffEnqueuesRelationalOnly(t *testing.T) {
+	srv := testServerWithEngine(t) // autoExtract defaults to false, relationalAuto to true
 	srv.db.InitSession("extract-off", "proj")
 
 	body := `{"transcript_path":"/nonexistent/transcript.jsonl"}`
@@ -713,10 +714,102 @@ func TestExtractSessionRouteSkipsWhenAutoOff(t *testing.T) {
 	if got := w.Body.String(); !strings.Contains(got, StatusExtractionDisabled) {
 		t.Fatalf("body = %q, want %s", got, StatusExtractionDisabled)
 	}
+	if got := w.Body.String(); !strings.Contains(got, `"relational":"extracting"`) {
+		t.Fatalf("body = %q, want relational extracting marker", got)
+	}
+
+	// Exactly one job, and it is relational-only — memory extraction stays off.
+	if n, _ := srv.db.PendingExtractions(); n != 1 {
+		t.Fatalf("pending = %d, want 1", n)
+	}
+	job, err := srv.db.NextExtraction(maxExtractionAttempts)
+	if err != nil {
+		t.Fatalf("NextExtraction: %v", err)
+	}
+	if job == nil || job.Kind != "relational" {
+		t.Fatalf("job = %+v, want kind=relational", job)
+	}
+	if job.Force {
+		t.Error("relational-only job must not carry force")
+	}
+	if job.Payload != "/nonexistent/transcript.jsonl" {
+		t.Errorf("payload = %q, want the transcript path", job.Payload)
+	}
+}
+
+// TestExtractSessionRouteRelationalKillSwitch: CONTINUITY_RELATIONAL_AUTO=false
+// (SetRelationalAuto(false)) restores the pre-#78 behavior — a non-force
+// request with autoExtract off enqueues nothing at all.
+func TestExtractSessionRouteRelationalKillSwitch(t *testing.T) {
+	srv := testServerWithEngine(t)
+	srv.SetRelationalAuto(false)
+	srv.db.InitSession("extract-kill", "proj")
+
+	body := `{"transcript_path":"/nonexistent/transcript.jsonl"}`
+	req := newTestRequest("POST", "/api/sessions/extract-kill/extract", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); !strings.Contains(got, StatusExtractionDisabled) {
+		t.Fatalf("body = %q, want %s", got, StatusExtractionDisabled)
+	}
 	if job, err := srv.db.NextExtraction(maxExtractionAttempts); err != nil {
 		t.Fatalf("NextExtraction: %v", err)
 	} else if job != nil {
 		t.Fatalf("expected empty queue, got job kind=%q session=%q", job.Kind, job.SessionID)
+	}
+}
+
+// TestExtractSessionRouteRelationalEnqueueErrorSurfaced: when the relational
+// job cannot be queued, the response must carry "relational":"error" so the
+// CLI can tell the user the profile misses this session — not the plain
+// disabled status as if nothing was expected to happen.
+func TestExtractSessionRouteRelationalEnqueueErrorSurfaced(t *testing.T) {
+	srv := testServerWithEngine(t)
+	srv.db.InitSession("extract-eqerr", "proj")
+
+	// Force EnqueueExtraction to fail: drop the queue table out from under it.
+	if _, err := srv.db.Exec("DROP TABLE extraction_queue"); err != nil {
+		t.Fatalf("drop extraction_queue: %v", err)
+	}
+
+	body := `{"transcript_path":"/nonexistent/transcript.jsonl"}`
+	req := newTestRequest("POST", "/api/sessions/extract-eqerr/extract", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if got := w.Body.String(); !strings.Contains(got, StatusExtractionDisabled) {
+		t.Fatalf("body = %q, want %s", got, StatusExtractionDisabled)
+	}
+	if got := w.Body.String(); !strings.Contains(got, `"relational":"error"`) {
+		t.Fatalf("body = %q, want relational error marker", got)
+	}
+}
+
+// TestExtractSessionRouteAutoOffNoTranscriptSkipsRelational: without a
+// transcript path there is nothing for the relational profiler to analyze, so
+// the disabled branch enqueues nothing rather than a job doomed to fail.
+func TestExtractSessionRouteAutoOffNoTranscriptSkipsRelational(t *testing.T) {
+	srv := testServerWithEngine(t)
+	srv.db.InitSession("extract-nopath", "proj")
+
+	req := newTestRequest("POST", "/api/sessions/extract-nopath/extract", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if job, err := srv.db.NextExtraction(maxExtractionAttempts); err != nil {
+		t.Fatalf("NextExtraction: %v", err)
+	} else if job != nil {
+		t.Fatalf("expected empty queue, got job kind=%q", job.Kind)
 	}
 }
 
