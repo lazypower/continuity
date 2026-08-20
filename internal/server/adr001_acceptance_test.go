@@ -160,7 +160,7 @@ func TestAcceptance_InjectionWritesShownPreviewWritesNothing(t *testing.T) {
 		"how the user works, synthesized", "the synthesized relational profile body")
 
 	// Preview: zero events.
-	_ = srv.renderContext("", true)
+	_ = srv.renderContext("", "", true)
 	srv.events.Close()
 	if n, _ := srv.db.CountEvents(""); n != 0 {
 		t.Fatalf("preview wrote %d events — preview must be side-effect free", n)

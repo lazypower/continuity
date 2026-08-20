@@ -177,6 +177,105 @@ func TestHookStart_SubprocessE2E_ServerDownDegradesGracefully(t *testing.T) {
 	}
 }
 
+// TestHookStart_SubprocessE2E_WorktreeRendersProjectIndex pins the #79
+// acceptance chain end to end: SessionStart fired from a linked worktree
+// normalizes cwd to the primary checkout, forwards it as the project, and the
+// injected context carries the corpus index with that repository's affine L0
+// pointers plus project-scoped Recent Sessions.
+func TestHookStart_SubprocessE2E_WorktreeRendersProjectIndex(t *testing.T) {
+	h := setupHookE2E(t)
+
+	// Primary checkout + linked worktree on disk. The seeded session must
+	// carry the same canonical (symlink-resolved) spelling the hook asserts —
+	// t.TempDir sits under a symlink on macOS.
+	repo := filepath.Join(h.workDir, "repo")
+	gitRepo(t, repo)
+	repo = mustEvalSymlinks(t, repo)
+	wt := filepath.Join(repo, ".claude", "worktrees", "agent-e2e")
+	linkedWorktree(t, repo, wt, "agent-e2e")
+
+	// A prior session on the repo (normalized identity) with an affine node.
+	if _, err := h.db.InitSession("e2e-prior", repo); err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
+	if err := h.db.CreateNode(&store.MemNode{
+		URI: "mem://agent/cases/e2e-scar", NodeType: "leaf", Category: "cases",
+		L0Abstract: "the e2e migration scar", L1Overview: "L1 payload must not ride the tray index",
+		SourceSession: "e2e-prior",
+	}); err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+
+	res := h.runHook(t, "start", HookInput{
+		SessionID:     "e2e-wt-session",
+		HookEventName: "SessionStart",
+		CWD:           wt,
+	})
+	res.ExpectExit(t, 0)
+
+	var out SessionStartOutput
+	if err := json.Unmarshal([]byte(res.Stdout), &out); err != nil {
+		t.Fatalf("SessionStart JSON: %v\n%s", err, res.Stdout)
+	}
+	ctx := out.HookSpecificOutput.AdditionalContext
+	if !strings.Contains(ctx, "### Memory Index") {
+		t.Fatalf("context missing the corpus index:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "cases 1") {
+		t.Errorf("index missing shape counts:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "the e2e migration scar") ||
+		!strings.Contains(ctx, "mem://agent/cases/e2e-scar") {
+		t.Errorf("worktree session did not render its primary repo's affine pointer:\n%s", ctx)
+	}
+	if strings.Contains(ctx, "L1 payload must not ride the tray index") {
+		t.Errorf("index leaked an L1 payload:\n%s", ctx)
+	}
+	if !strings.Contains(ctx, "### Recent Sessions") || !strings.Contains(ctx, "repo:") {
+		t.Errorf("Recent Sessions missing the repo's prior session:\n%s", ctx)
+	}
+}
+
+// TestHookStart_SubprocessE2E_UnknownProjectShapeOnly pins the #79 degrade
+// path at the hook surface: a cwd with no memories behind it gets shape-only
+// counts — no pointers, never guessed content.
+func TestHookStart_SubprocessE2E_UnknownProjectShapeOnly(t *testing.T) {
+	h := setupHookE2E(t)
+
+	if _, err := h.db.InitSession("e2e-other", filepath.Join(h.workDir, "other-repo")); err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
+	if err := h.db.CreateNode(&store.MemNode{
+		URI: "mem://agent/cases/other-scar", NodeType: "leaf", Category: "cases",
+		L0Abstract: "someone else's scar", SourceSession: "e2e-other",
+	}); err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+
+	fresh := filepath.Join(h.workDir, "fresh-project")
+	if err := os.MkdirAll(fresh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res := h.runHook(t, "start", HookInput{
+		SessionID:     "e2e-fresh-session",
+		HookEventName: "SessionStart",
+		CWD:           fresh,
+	})
+	res.ExpectExit(t, 0)
+
+	var out SessionStartOutput
+	if err := json.Unmarshal([]byte(res.Stdout), &out); err != nil {
+		t.Fatalf("SessionStart JSON: %v\n%s", err, res.Stdout)
+	}
+	ctx := out.HookSpecificOutput.AdditionalContext
+	if !strings.Contains(ctx, "### Memory Index") || !strings.Contains(ctx, "cases 1") {
+		t.Fatalf("shape counts missing for unknown project:\n%s", ctx)
+	}
+	if strings.Contains(ctx, "This project:") || strings.Contains(ctx, "someone else's scar") {
+		t.Errorf("unknown project rendered pointers:\n%s", ctx)
+	}
+}
+
 // =========================================================================
 // UserPromptSubmit contract
 // =========================================================================
@@ -205,6 +304,37 @@ func TestHookSubmit_SubprocessE2E_CreatesSession(t *testing.T) {
 			sess, _ := h.db.GetSession(sessionID)
 			return sess != nil
 		})
+}
+
+// TestHookSubmit_SubprocessE2E_NormalizesWorktreeProject pins #79's write-time
+// normalization: a submit fired from a linked worktree must store the primary
+// checkout path as sessions.project, not the worktree cwd — otherwise every
+// worktree fragments the affinity join.
+func TestHookSubmit_SubprocessE2E_NormalizesWorktreeProject(t *testing.T) {
+	h := setupHookE2E(t)
+
+	repo := filepath.Join(h.workDir, "norm-repo")
+	gitRepo(t, repo)
+	repo = mustEvalSymlinks(t, repo) // canonical spelling, as the hook stores
+	wt := filepath.Join(repo, ".claude", "worktrees", "agent-norm")
+	linkedWorktree(t, repo, wt, "agent-norm")
+
+	sessionID := "test-submit-norm-" + time.Now().Format("150405.000000")
+	h.runHook(t, "submit", HookInput{
+		SessionID: sessionID,
+		CWD:       wt,
+		Prompt:    "ordinary user message",
+	}).ExpectExit(t, 0)
+
+	testharness.WaitForCondition(t, 2*time.Second, "session created",
+		func() bool { s, _ := h.db.GetSession(sessionID); return s != nil })
+	sess, err := h.db.GetSession(sessionID)
+	if err != nil || sess == nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.Project != repo {
+		t.Errorf("sessions.project = %q, want normalized primary checkout %q", sess.Project, repo)
+	}
 }
 
 // TestHookSubmit_SubprocessE2E_InternalSentinelSkipsInit pins the

@@ -326,6 +326,65 @@ func (db *DB) FindByCategory(category string) ([]MemNode, error) {
 	return scanNodes(rows)
 }
 
+// CountLeavesByCategory returns live-leaf counts per category — the corpus
+// shape for the tray index (#79, ADR-001 §3). Retracted nodes are excluded;
+// sessionless writes (empty source_session) are included, since shape is a
+// property of the corpus, not of any project's affinity.
+func (db *DB) CountLeavesByCategory() (map[string]int, error) {
+	rows, err := db.Query(`
+		SELECT category, COUNT(*) FROM mem_nodes
+		WHERE node_type = 'leaf' AND tombstoned_at IS NULL
+		GROUP BY category
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("count leaves by category: %w", err)
+	}
+	defer rows.Close()
+
+	counts := make(map[string]int)
+	for rows.Next() {
+		var category string
+		var n int
+		if err := rows.Scan(&category, &n); err != nil {
+			return nil, fmt.Errorf("scan category count: %w", err)
+		}
+		counts[category] = n
+	}
+	return counts, rows.Err()
+}
+
+// FindProjectAffine returns live leaf nodes affine to the given normalized
+// project identity via the join mem_nodes.source_session →
+// sessions.session_id → sessions.project (#79, ADR-001 §3). Ordered by
+// updated_at DESC — updated_at moves on write/merge, never on exposure or
+// fetch, so the ordering carries no touch mechanics. Moments are excluded
+// (they have their own diversity-sampled tray channel), as are nodes with no
+// L0 (nothing to render — an empty row must not occupy a result slot);
+// sessionless writes have no source_session and drop out of the join by
+// construction (accepted limit, #79); merged nodes carry last-writer affinity
+// (accepted limit, #79).
+func (db *DB) FindProjectAffine(project string, limit int) ([]MemNode, error) {
+	rows, err := db.Query(`
+		SELECT n.id, n.uri, n.parent_uri, n.node_type, n.category, n.l0_abstract, n.l1_overview, n.l2_content,
+			n.mergeable, n.merged_from, n.relevance, n.last_access, n.access_count, n.source_session, n.created_at, n.updated_at,
+			n.tombstoned_at, n.tombstone_reason, n.superseded_by, n.pinned_at
+		FROM mem_nodes n
+		JOIN sessions s ON n.source_session = s.session_id
+		WHERE n.node_type = 'leaf' AND n.tombstoned_at IS NULL
+			AND n.category != 'moments'
+			AND n.l0_abstract != ''
+			AND `+projectMatch("s.project")+`
+		ORDER BY n.updated_at DESC
+		LIMIT ?
+	`, project, project, project, limit)
+	if err != nil {
+		return nil, fmt.Errorf("find project affine: %w", err)
+	}
+	defer rows.Close()
+
+	return scanNodes(rows)
+}
+
 // ListLeaves returns live leaf nodes ordered by relevance DESC.
 // Retracted nodes are excluded — use ListLeavesIncludingRetracted for inspection.
 func (db *DB) ListLeaves() ([]MemNode, error) {

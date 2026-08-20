@@ -144,6 +144,62 @@ func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 	return sessions, rows.Err()
 }
 
+// projectMatch returns a SQL clause matching the given project column against
+// a normalized project identity; bind three copies of the identity (#79).
+// Rows written since #79 store the normalized primary-checkout path, so they
+// match exactly. Rows written before it keep their raw cwd — for in-repo
+// Claude worktrees (<root>/.claude/worktrees/<x>, the fragmentation case #79
+// names) that raw path sits under the normalized root at a path only linked
+// worktrees of this repository occupy, so the prefix compare picks them up
+// cheaply.
+//
+// The prefix is deliberately NOT a bare "<root>/": a path under the root can
+// be its own repository (a nested checkout stores its own normalized identity
+// at init), and a bare-subtree prefix would leak that project's sessions and
+// memories into this one's index forever. Affinity never guesses: raw rows
+// outside the worktree prefix — repo subdirectories, worktrees outside the
+// root — stay unmatched, an accepted limit alongside the ones #79 names.
+// Normalization is applied at write time going forward, never as a
+// retroactive defrag.
+//
+// Comparison uses '/' — the separator every supported platform's hook writes
+// today. A legacy Windows-style row would simply stay unmatched (shape-only:
+// less content, never wrong content).
+//
+// Named residual: an INDEPENDENT repository physically cloned into
+// <root>/.claude/worktrees/ would still prefix-match. That directory is
+// tool-managed — only linked worktrees are created there — so constructing
+// the collision requires the operator to plant a foreign checkout inside it;
+// accepted as out-of-model alongside the data-dir owner. Dropping the prefix
+// branch entirely (exact-only matching) would close even that at the cost of
+// all legacy worktree affinity — a product call, not a correctness patch.
+func projectMatch(column string) string {
+	return fmt.Sprintf("(%[1]s = ? OR substr(%[1]s, 1, length(?) + 19) = ? || '/.claude/worktrees/')", column)
+}
+
+// GetRecentProjectSessions returns the most recent sessions whose project
+// matches the given normalized project identity, ordered by started_at DESC.
+func (db *DB) GetRecentProjectSessions(project string, limit int) ([]Session, error) {
+	rows, err := db.Query(`
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone, last_active_at
+		FROM sessions WHERE `+projectMatch("project")+` ORDER BY started_at DESC LIMIT ?
+	`, project, project, project, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get recent project sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var s Session
+		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone, &s.LastActiveAt); err != nil {
+			return nil, fmt.Errorf("scan session: %w", err)
+		}
+		sessions = append(sessions, s)
+	}
+	return sessions, rows.Err()
+}
+
 // GetSessionsSince returns all sessions started after the given timestamp, ordered by started_at ASC.
 func (db *DB) GetSessionsSince(sinceMs int64) ([]Session, error) {
 	rows, err := db.Query(`

@@ -20,7 +20,10 @@ func (s *Server) handleGetContext(w http.ResponseWriter, r *http.Request) {
 	// so moment rotation advances. A preview that consumed rotation would change
 	// the very thing it claims to show — the panel is an honesty instrument.
 	preview := r.URL.Query().Get("preview") == "true"
-	ctx := s.renderContext(r.URL.Query().Get("session_id"), preview)
+	// project is the normalized repository identity forwarded by the start
+	// hook (#79) — it scopes the corpus index and Recent Sessions at t=0,
+	// before the sessions row exists.
+	ctx := s.renderContext(r.URL.Query().Get("session_id"), r.URL.Query().Get("project"), preview)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -40,31 +43,60 @@ const (
 	// store.MaxPins, which is enforced at pin *write* time — so this cap is
 	// defense-in-depth that never actually fires (listed pins == injected pins).
 	maxPinnedItems = store.MaxPins
+	// maxIndexContext caps the ### Memory Index section (#79, ADR-001 §3):
+	// shape line plus project-affine L0 pointers — a fraction of what the
+	// retired Recent Memories window spent.
+	maxIndexContext = 600
+	// maxIndexAffineNodes caps how many affine pointers may render; the char
+	// budget above usually cuts in first. The query overfetches by the pin
+	// cap so nodes already surfaced on the tray (pins, the relational
+	// profile) can't occupy every result slot and starve the index into a
+	// false shape-only render.
+	maxIndexAffineNodes = 8
+	// maxRecentProjectSessions caps Recent Sessions for a known project.
+	// Project unknown → one line, the most recent session overall.
+	maxRecentProjectSessions = 3
 )
 
 // buildContext creates the context markdown for a real session injection.
 // Side effects — moment rotation bookkeeping (AdvanceRotation) and `shown`
 // telemetry — fire on this path only; this is the SessionStart path. For a
-// side-effect-free render (the Cold Boot preview), use renderContext(sessionID, true).
+// side-effect-free render (the Cold Boot preview), use renderContext(sessionID, project, true).
 func (s *Server) buildContext(currentSessionID string) string {
-	return s.renderContext(currentSessionID, false)
+	return s.renderContext(currentSessionID, "", false)
 }
 
-// renderContext builds the context markdown. When preview is true, it makes no
+// renderContext builds the context markdown. project is the normalized
+// repository identity (empty = unknown); it scopes the corpus index and
+// Recent Sessions. When preview is true, it makes no
 // writes — moment rotation is NOT advanced — so callers can show exactly what a
 // cold SessionStart would inject without consuming the rotation that injection
 // would. Enforces a hard character budget to prevent context bloat.
-func (s *Server) renderContext(currentSessionID string, preview bool) string {
+func (s *Server) renderContext(currentSessionID, project string, preview bool) string {
 	var b strings.Builder
 	budget := maxContextTotal
+
+	// A resumed session whose start hook predates #79's project forwarding
+	// still has a sessions row that knows the project.
+	if project == "" && currentSessionID != "" {
+		if sess, err := s.db.GetSession(currentSessionID); err == nil && sess != nil {
+			project = sess.Project
+		}
+	}
 
 	now := time.Now()
 	header := fmt.Sprintf("<context>\n## Continuity — Session Memory\nCurrent: %s\n", now.Format("2006-01-02 15:04 (Mon)"))
 	b.WriteString(header)
 	budget -= len(header)
 
-	// Gap signal: if last session on this project was >7 days ago, flag it
-	if lastSessions, err := s.db.GetRecentSessions(1); err == nil && len(lastSessions) > 0 {
+	// Gap signal: if last session on this project was >7 days ago, flag it.
+	// Project-scoped when identity is known (#79) — a gap on someone else's
+	// project says nothing about this one.
+	lastSessions, lastErr := s.db.GetRecentSessions(1)
+	if project != "" {
+		lastSessions, lastErr = s.db.GetRecentProjectSessions(project, 1)
+	}
+	if lastErr == nil && len(lastSessions) > 0 {
 		last := lastSessions[0]
 		if last.SessionID != currentSessionID {
 			gap := now.Sub(time.UnixMilli(last.StartedAt))
@@ -77,6 +109,11 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 			}
 		}
 	}
+
+	// surfacedURIs records every node already rendered on the tray so later
+	// sections (pins dedupe, moments, the corpus index) don't render the same
+	// node twice.
+	surfacedURIs := make(map[string]bool)
 
 	// Relational profile (Working With You) — capped portion of budget.
 	// A retracted profile must not be injected: silently injecting retracted
@@ -95,6 +132,7 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 		section += content + "\n"
 		b.WriteString(section)
 		budget -= len(section)
+		surfacedURIs[relProfile.URI] = true
 		if !preview {
 			s.events.record("shown", "tray", relProfile.URI, currentSessionID)
 		}
@@ -105,9 +143,7 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 	// pinned to the tray; they ride every cold boot regardless of recency or
 	// relevance. ListPinned excludes retracted nodes at the store layer, so a
 	// pinned-then-retracted memory goes silent here without any check in this
-	// function — the single retraction chokepoint. pinnedURIs records what was
-	// shown so the ranked sections below don't render the same node twice.
-	pinnedURIs := make(map[string]bool)
+	// function — the single retraction chokepoint.
 	if pinned, err := s.db.ListPinned(); err == nil && len(pinned) > 0 {
 		const pinnedHeader = "\n### Pinned\n"
 		section := pinnedHeader
@@ -120,7 +156,7 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 			// The relational profile has its own "Working With You" section above;
 			// mark it shown but don't render it twice if the operator pinned it.
 			if p.URI == "mem://user/profile/communication" {
-				pinnedURIs[p.URI] = true
+				surfacedURIs[p.URI] = true
 				continue
 			}
 			if p.L0Abstract == "" {
@@ -136,7 +172,7 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 				break
 			}
 			section += line
-			pinnedURIs[p.URI] = true
+			surfacedURIs[p.URI] = true
 			used++
 			if !preview {
 				s.events.record("shown", "tray", p.URI, currentSessionID)
@@ -153,10 +189,10 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 	moments, err := s.db.FindByCategory("moments")
 	if err == nil && len(moments) > 0 {
 		// Drop any moment already shown as a pin so it isn't rendered twice.
-		if len(pinnedURIs) > 0 {
+		if len(surfacedURIs) > 0 {
 			live := moments[:0]
 			for _, m := range moments {
-				if !pinnedURIs[m.URI] {
+				if !surfacedURIs[m.URI] {
 					live = append(live, m)
 				}
 			}
@@ -196,26 +232,103 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 	// adjustment; see the memory-injection north star ("make categorization
 	// irrelevant, not better").
 
-	// Recent sessions
-	sessions, err := s.db.GetRecentSessions(5)
-	if err == nil && len(sessions) > 0 {
-		b.WriteString("\n### Recent Sessions\n")
+	// Corpus index (#79, ADR-001 §3): the tray carries the corpus's shape —
+	// per-category counts — plus L0 pointers for nodes affine to the current
+	// project. Push the pointers, pull the payloads: the agent cannot search
+	// for what it does not know exists. Project unknown, or zero affine nodes
+	// → shape-only; less content, never guessed content. Rendering mutates no
+	// node state (shown is not use, ADR-001 §2) — the only write is `shown`
+	// telemetry on the real injection path, recorded after the section commits
+	// so a budget-dropped section can't inflate the exposure denominator.
+	if counts, err := s.db.CountLeavesByCategory(); err == nil && len(counts) > 0 {
+		section := "\n### Memory Index\n" + indexShapeLine(counts)
+		var indexShown []string
+		if project != "" {
+			// Overfetch by the pin cap + 1 (relational profile): every
+			// surfaced node skipped below still leaves a candidate behind it.
+			if affine, err := s.db.FindProjectAffine(project, maxIndexAffineNodes+maxPinnedItems+1); err == nil {
+				const affineHeader = "This project:\n"
+				lines := ""
+				for _, n := range affine {
+					if len(indexShown) >= maxIndexAffineNodes {
+						break
+					}
+					if surfacedURIs[n.URI] || n.L0Abstract == "" {
+						continue
+					}
+					l0 := n.L0Abstract
+					if len(l0) > maxItemContext {
+						l0 = truncateAtSentence(l0, maxItemContext)
+					}
+					line := fmt.Sprintf("- %s (%s)\n", l0, n.URI)
+					// Skip, don't stop: one oversized line (a long URI) must
+					// not starve every shorter pointer behind it.
+					if len(section)+len(affineHeader)+len(lines)+len(line) > maxIndexContext {
+						continue
+					}
+					lines += line
+					indexShown = append(indexShown, n.URI)
+				}
+				if lines != "" {
+					section += affineHeader + lines
+				}
+			}
+		}
+		if budget-len(section) >= 0 {
+			b.WriteString(section)
+			budget -= len(section)
+			if !preview {
+				for _, uri := range indexShown {
+					s.events.record("shown", "index", uri, currentSessionID)
+				}
+			}
+		} else {
+			log.Printf("context: budget exhausted before memory index (%d chars left)", budget)
+		}
+	}
+
+	// Recent Sessions — project-scoped (#79, ADR-001 §3): booting into a
+	// project, the likeliest continuation is that project's last session, so
+	// resumption is tray-worthy before knowing the operation. Cross-project
+	// history lives behind the index as counts. Project unknown → one line,
+	// the most recent session overall. Fixed recency, no ranking, no touch
+	// mechanics.
+	maxRecent := maxRecentProjectSessions
+	var sessions []store.Session
+	var sessErr error
+	if project != "" {
+		sessions, sessErr = s.db.GetRecentProjectSessions(project, maxRecent+1)
+	} else {
+		maxRecent = 1
+		sessions, sessErr = s.db.GetRecentSessions(maxRecent + 1)
+	}
+	if sessErr == nil && len(sessions) > 0 {
+		var lines strings.Builder
+		rendered := 0
 		for _, sess := range sessions {
 			if sess.SessionID == currentSessionID {
 				continue
 			}
+			if rendered >= maxRecent {
+				break
+			}
 			ts := time.UnixMilli(sess.StartedAt).Format("2006-01-02 15:04")
-			project := sess.Project
-			if project == "" {
-				project = "unknown"
+			name := sess.Project
+			if name == "" {
+				name = "unknown"
 			} else {
-				project = filepath.Base(project)
+				name = filepath.Base(name)
 			}
 			toneSuffix := ""
 			if sess.Tone != nil && *sess.Tone != "" {
 				toneSuffix = fmt.Sprintf(" — %s", *sess.Tone)
 			}
-			b.WriteString(fmt.Sprintf("- [%s] %s: %s (%d tools used)%s\n", ts, project, sess.Status, sess.ToolCount, toneSuffix))
+			lines.WriteString(fmt.Sprintf("- [%s] %s: %s (%d tools used)%s\n", ts, name, sess.Status, sess.ToolCount, toneSuffix))
+			rendered++
+		}
+		if lines.Len() > 0 {
+			b.WriteString("\n### Recent Sessions\n")
+			b.WriteString(lines.String())
 		}
 	}
 
@@ -229,6 +342,40 @@ func (s *Server) renderContext(currentSessionID string, preview bool) string {
 
 	b.WriteString("</context>")
 	return b.String()
+}
+
+// indexCategoryOrder fixes the shape line's rendering order: contract
+// categories first, then the episodic corpus, then moments. Purely
+// presentational — the counts carry no ranking.
+var indexCategoryOrder = []string{"profile", "preferences", "feedback", "entities", "events", "patterns", "cases", "reference", "moments"}
+
+// indexShapeLine renders the corpus shape — total plus per-category live-leaf
+// counts (#79). Categories outside the fixed order (schema drift) still
+// render, sorted, so the shape never silently under-reports the corpus.
+func indexShapeLine(counts map[string]int) string {
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	parts := make([]string, 0, len(counts))
+	seen := make(map[string]bool, len(counts))
+	for _, c := range indexCategoryOrder {
+		if counts[c] > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", c, counts[c]))
+		}
+		seen[c] = true
+	}
+	var extras []string
+	for c := range counts {
+		if !seen[c] {
+			extras = append(extras, c)
+		}
+	}
+	sort.Strings(extras)
+	for _, c := range extras {
+		parts = append(parts, fmt.Sprintf("%s %d", c, counts[c]))
+	}
+	return fmt.Sprintf("%d memories: %s\n", total, strings.Join(parts, ", "))
 }
 
 // truncateAtSentence truncates to maxLen, preferring sentence boundaries.

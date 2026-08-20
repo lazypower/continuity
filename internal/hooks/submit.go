@@ -89,10 +89,12 @@ func handleSubmit(client *Client, input *HookInput) {
 		return
 	}
 
-	// Initialize/resume session on first user prompt
+	// Initialize/resume session on first user prompt. Project is the
+	// normalized repository identity, not the raw cwd (#79) — see
+	// projectIdentity for why normalization is hook-side.
 	body, err := json.Marshal(map[string]string{
 		"session_id": input.SessionID,
-		"project":    input.CWD,
+		"project":    projectIdentity(input.CWD),
 	})
 	if err != nil {
 		ExitError(err)
