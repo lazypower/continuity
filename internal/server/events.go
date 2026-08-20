@@ -21,9 +21,13 @@ import (
 // may race Close() (a late request during shutdown), and a send on a closed
 // channel panics. With the stop pattern the late event is simply dropped —
 // which is the telemetry contract anyway.
+// The channel carries both journal rows (store.MemEvent) and gate calibration
+// rows (store.GateCalibration, #80) — two tables, one write contract: buffered,
+// fire-and-forget, droppable. Giving calibration its own goroutine would
+// duplicate the shutdown/drop machinery without changing any guarantee.
 type eventRecorder struct {
 	db       *store.DB
-	ch       chan store.MemEvent
+	ch       chan any
 	stop     chan struct{}
 	done     chan struct{}
 	stopOnce sync.Once
@@ -35,7 +39,7 @@ const eventBuffer = 256
 func newEventRecorder(db *store.DB) *eventRecorder {
 	r := &eventRecorder{
 		db:   db,
-		ch:   make(chan store.MemEvent, eventBuffer),
+		ch:   make(chan any, eventBuffer),
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
@@ -63,36 +67,58 @@ func (r *eventRecorder) drain() {
 	}
 }
 
-func (r *eventRecorder) insert(e store.MemEvent) {
-	if err := r.db.InsertEvent(e); err != nil {
-		// Best-effort by contract: log and move on. A persistent failure
-		// here (e.g. schema drift) surfaces in doctor, not in surfacing.
-		log.Printf("events: write failed for %s/%s %s: %v", e.Event, e.Surface, e.NodeURI, err)
+func (r *eventRecorder) insert(item any) {
+	switch e := item.(type) {
+	case store.MemEvent:
+		if err := r.db.InsertEvent(e); err != nil {
+			// Best-effort by contract: log and move on. A persistent failure
+			// here (e.g. schema drift) surfaces in doctor, not in surfacing.
+			log.Printf("events: write failed for %s/%s %s: %v", e.Event, e.Surface, e.NodeURI, err)
+		}
+	case store.GateCalibration:
+		// InsertGateCalibration enforces the #72 retention bound in the same
+		// call, so every drained write leaves the table bounded.
+		if err := r.db.InsertGateCalibration(e); err != nil {
+			log.Printf("events: gate calibration write failed: %v", err)
+		}
 	}
 }
 
-// record enqueues one event without blocking. Full buffer or shutdown = drop.
-func (r *eventRecorder) record(event, surface, uri, sessionID string) {
+// enqueue pushes one telemetry item without blocking. Full buffer or shutdown = drop.
+func (r *eventRecorder) enqueue(item any) {
 	select {
 	case <-r.stop:
 		return // shutting down; a late telemetry event is droppable by contract
 	default:
 	}
-	e := store.MemEvent{
-		NodeURI:   uri,
-		Event:     event,
-		Surface:   surface,
-		SessionID: sessionID,
-		CreatedAt: time.Now().UnixMilli(),
-	}
 	select {
-	case r.ch <- e:
+	case r.ch <- item:
 	default:
 		n := r.dropped.Add(1)
 		if n == 1 || n%100 == 0 {
 			log.Printf("events: buffer full — %d telemetry event(s) dropped so far (by contract, not by accident)", n)
 		}
 	}
+}
+
+// record enqueues one journal event without blocking.
+func (r *eventRecorder) record(event, surface, uri, sessionID string) {
+	r.enqueue(store.MemEvent{
+		NodeURI:   uri,
+		Event:     event,
+		Surface:   surface,
+		SessionID: sessionID,
+		CreatedAt: time.Now().UnixMilli(),
+	})
+}
+
+// recordCalibration enqueues one gate calibration row (#80). Same droppable
+// contract as record: the prompt never waits for its own telemetry.
+func (r *eventRecorder) recordCalibration(e store.GateCalibration) {
+	if e.CreatedAt == 0 {
+		e.CreatedAt = time.Now().UnixMilli()
+	}
+	r.enqueue(e)
 }
 
 // Close stops accepting events and flushes what's buffered, bounded by a

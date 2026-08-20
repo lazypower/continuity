@@ -106,6 +106,13 @@ func handleSubmit(client *Client, input *HookInput) {
 		return
 	}
 
+	// Prompt gate (ADR-001 §4, #80): a separate request on its own client with
+	// its own sub-second budget — it never inherits this function's init error
+	// path (a failed init already returned above, and the gate stayed silent).
+	// Terse prompts self-handle by clearing no threshold; internal-sentinel
+	// prompts already bailed at the top of this function.
+	promptGate(NewGateClient(), input)
+
 	// Check for signal keywords — fire and forget
 	if input.Prompt != "" {
 		if hasSignal(input.Prompt) {

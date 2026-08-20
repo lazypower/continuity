@@ -38,6 +38,13 @@ const (
 	// dialProbeTimeout bounds the "is anything listening?" TCP probe used to
 	// tell a slow server from an absent one.
 	dialProbeTimeout = 2 * time.Second
+
+	// gateTimeout bounds the prompt-gate round-trip (ADR-001 §4, #80). The
+	// gate runs synchronously ahead of the user's prompt, so its budget must
+	// sit well under the general hook budget (httpTimeout, 5s): a memory
+	// lookup is never allowed to delay the prompt beyond this. On expiry —
+	// or ANY other failure — the gate resolves to silence with exit 0.
+	gateTimeout = 1 * time.Second
 )
 
 // Client talks to the continuity server.
@@ -75,6 +82,16 @@ func ResolveServerURL() string {
 func NewClient() *Client {
 	return &Client{
 		http:      &http.Client{Timeout: httpTimeout},
+		serverURL: ResolveServerURL(),
+	}
+}
+
+// NewGateClient creates the prompt gate's own client (#80). The gate call is
+// its own request with its own short budget — it never rides the session-init
+// client, so it can never inherit that call's error path or its 5s patience.
+func NewGateClient() *Client {
+	return &Client{
+		http:      &http.Client{Timeout: gateTimeout},
 		serverURL: ResolveServerURL(),
 	}
 }
