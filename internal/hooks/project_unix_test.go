@@ -26,10 +26,31 @@ func projectIdentityWithin(t *testing.T, cwd string, deadline time.Duration) str
 	}
 }
 
+// One repository, one identity spelling: entering the primary checkout
+// through a symlinked path (macOS /tmp → /private/tmp) must yield the same
+// identity as entering it directly, or the affinity join key fragments.
+func TestProjectIdentity_SymlinkedEntryCanonicalizes(t *testing.T) {
+	tmp := canonicalTempDir(t)
+	main := mkdirAll(t, filepath.Join(tmp, "repo"))
+	gitRepo(t, main)
+
+	alias := filepath.Join(tmp, "alias")
+	if err := os.Symlink(main, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	if got := projectIdentity(alias); got != main {
+		t.Errorf("projectIdentity(%q) = %q, want canonical %q", alias, got, main)
+	}
+	if direct := projectIdentity(main); direct != projectIdentity(alias) {
+		t.Errorf("identity fragments on spelling: %q vs %q", direct, projectIdentity(alias))
+	}
+}
+
 // A FIFO named .git must not be opened: a blocking read with no writer would
 // hang the hook forever. The walk falls back to the raw cwd.
 func TestProjectIdentity_FifoGitFileDoesNotHang(t *testing.T) {
-	tmp := t.TempDir()
+	tmp := canonicalTempDir(t)
 	dir := filepath.Join(tmp, "fifo-git")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -46,7 +67,7 @@ func TestProjectIdentity_FifoGitFileDoesNotHang(t *testing.T) {
 // A FIFO commondir inside an otherwise valid worktree layout must likewise be
 // refused; resolution fails and the raw cwd is kept.
 func TestProjectIdentity_FifoCommondirDoesNotHang(t *testing.T) {
-	tmp := t.TempDir()
+	tmp := canonicalTempDir(t)
 	main := filepath.Join(tmp, "repo")
 	gitRepo(t, main)
 

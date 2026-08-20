@@ -261,8 +261,10 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 						l0 = truncateAtSentence(l0, maxItemContext)
 					}
 					line := fmt.Sprintf("- %s (%s)\n", l0, n.URI)
+					// Skip, don't stop: one oversized line (a long URI) must
+					// not starve every shorter pointer behind it.
 					if len(section)+len(affineHeader)+len(lines)+len(line) > maxIndexContext {
-						break
+						continue
 					}
 					lines += line
 					indexShown = append(indexShown, n.URI)

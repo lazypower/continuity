@@ -185,9 +185,12 @@ func TestHookStart_SubprocessE2E_ServerDownDegradesGracefully(t *testing.T) {
 func TestHookStart_SubprocessE2E_WorktreeRendersProjectIndex(t *testing.T) {
 	h := setupHookE2E(t)
 
-	// Primary checkout + linked worktree on disk.
+	// Primary checkout + linked worktree on disk. The seeded session must
+	// carry the same canonical (symlink-resolved) spelling the hook asserts —
+	// t.TempDir sits under a symlink on macOS.
 	repo := filepath.Join(h.workDir, "repo")
 	gitRepo(t, repo)
+	repo = mustEvalSymlinks(t, repo)
 	wt := filepath.Join(repo, ".claude", "worktrees", "agent-e2e")
 	linkedWorktree(t, repo, wt, "agent-e2e")
 
@@ -312,6 +315,7 @@ func TestHookSubmit_SubprocessE2E_NormalizesWorktreeProject(t *testing.T) {
 
 	repo := filepath.Join(h.workDir, "norm-repo")
 	gitRepo(t, repo)
+	repo = mustEvalSymlinks(t, repo) // canonical spelling, as the hook stores
 	wt := filepath.Join(repo, ".claude", "worktrees", "agent-norm")
 	linkedWorktree(t, repo, wt, "agent-norm")
 

@@ -165,6 +165,14 @@ func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 // Comparison uses '/' — the separator every supported platform's hook writes
 // today. A legacy Windows-style row would simply stay unmatched (shape-only:
 // less content, never wrong content).
+//
+// Named residual: an INDEPENDENT repository physically cloned into
+// <root>/.claude/worktrees/ would still prefix-match. That directory is
+// tool-managed — only linked worktrees are created there — so constructing
+// the collision requires the operator to plant a foreign checkout inside it;
+// accepted as out-of-model alongside the data-dir owner. Dropping the prefix
+// branch entirely (exact-only matching) would close even that at the cost of
+// all legacy worktree affinity — a product call, not a correctness patch.
 func projectMatch(column string) string {
 	return fmt.Sprintf("(%[1]s = ? OR substr(%[1]s, 1, length(?) + 19) = ? || '/.claude/worktrees/')", column)
 }

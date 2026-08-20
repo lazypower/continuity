@@ -38,7 +38,7 @@ func projectIdentity(cwd string) string {
 		gitPath := filepath.Join(dir, ".git")
 		if fi, err := os.Stat(gitPath); err == nil {
 			if fi.IsDir() {
-				return dir
+				return canonicalIdentity(dir)
 			}
 			// Only a regular file can be a worktree pointer. Anything else
 			// (FIFO, device, socket) must not be opened — a blocking read
@@ -46,7 +46,7 @@ func projectIdentity(cwd string) string {
 			// back to the raw cwd, never hang (#79).
 			if fi.Mode().IsRegular() {
 				if root := primaryCheckoutFromGitFile(dir, gitPath); root != "" {
-					return root
+					return canonicalIdentity(root)
 				}
 			}
 			return cwd
@@ -77,7 +77,10 @@ func projectIdentity(cwd string) string {
 const maxGitMetadataBytes = 1 << 20
 
 // readGitMetadata reads a git metadata file, refusing non-regular files (a
-// FIFO would block the hook forever) and oversized ones.
+// FIFO would block the hook forever) and oversized ones. The check-then-read
+// is not atomic; an actor racing file swaps in the cwd mid-hook is the local
+// FS owner and out of the threat model — the guard exists for static hostile
+// layouts (an extracted tarball, a crafted checkout).
 func readGitMetadata(path string) ([]byte, bool) {
 	fi, err := os.Stat(path)
 	if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxGitMetadataBytes {
@@ -88,6 +91,20 @@ func readGitMetadata(path string) ([]byte, bool) {
 		return nil, false
 	}
 	return data, true
+}
+
+// canonicalIdentity resolves symlinked path components so one repository
+// yields ONE identity spelling however the session entered it (macOS /tmp vs
+// /private/tmp; a symlinked ~/Code): sessions at the primary checkout carry
+// the cwd's spelling while worktree resolution carries git metadata's, and
+// the affinity join key must not fragment on the difference. Applied only to
+// a RESOLVED identity — a raw-cwd fallback stays exactly what the hook
+// received. Lexical path on resolution failure.
+func canonicalIdentity(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
 }
 
 // samePath reports whether two cleaned paths name the same file, tolerating
@@ -157,6 +174,16 @@ func primaryCheckoutFromGitFile(worktreeRoot, gitFile string) string {
 		if c != "" {
 			if !filepath.IsAbs(c) {
 				c = filepath.Join(gitdir, c)
+			}
+			c = filepath.Clean(c)
+			// A linked worktree's gitdir lives at <common>/worktrees/<name>
+			// — that geometry is what makes commondir trustworthy. A
+			// commondir naming anything else is crafted metadata trying to
+			// select a foreign repository's identity (the gitdir back-pointer
+			// alone can't prevent this: a cwd-controlled fake gitdir can
+			// point back at its own .git while commondir names a victim).
+			if !samePath(filepath.Dir(filepath.Dir(gitdir)), c) {
+				return ""
 			}
 			common = c
 		}

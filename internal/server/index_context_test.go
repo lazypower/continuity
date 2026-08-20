@@ -276,6 +276,41 @@ func TestMemoryIndex_PinnedNodesDoNotStarvePointers(t *testing.T) {
 	}
 }
 
+// One oversized line (a pathologically long URI) must not starve the shorter
+// pointers behind it — the loop skips what doesn't fit and keeps going.
+func TestMemoryIndex_OversizedLineDoesNotStarveRest(t *testing.T) {
+	srv := testServer(t)
+	if _, err := srv.db.InitSession("s-alpha", "/repo/alpha"); err != nil {
+		t.Fatal(err)
+	}
+	hugeURI := "mem://agent/cases/" + strings.Repeat("very-long-slug-", 40) // ~620 chars
+	if err := srv.db.CreateNode(&store.MemNode{
+		URI: hugeURI, NodeType: "leaf", Category: "cases",
+		L0Abstract: "oversized node", SourceSession: "s-alpha",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.db.CreateNode(&store.MemNode{
+		URI: "mem://agent/cases/short", NodeType: "leaf", Category: "cases",
+		L0Abstract: "short survivor", SourceSession: "s-alpha",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Make the oversized node the newest so it is considered first.
+	if _, err := srv.db.Exec(`UPDATE mem_nodes SET updated_at = 9999999999999 WHERE uri = ?`, hugeURI); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := srv.renderContext("cur", "/repo/alpha", false)
+	section := indexSection(t, ctx)
+	if !strings.Contains(section, "mem://agent/cases/short") {
+		t.Errorf("oversized line starved the pointers behind it:\n%s", section)
+	}
+	if len(section) > maxIndexContext {
+		t.Errorf("index section %d chars, budget %d", len(section), maxIndexContext)
+	}
+}
+
 // Acceptance (#79): Recent Sessions lists only the current project's sessions
 // (last 1-3); project unknown → one line, the most recent session overall.
 func TestRecentSessions_ProjectScoped(t *testing.T) {

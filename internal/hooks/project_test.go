@@ -6,6 +6,28 @@ import (
 	"testing"
 )
 
+// canonicalTempDir returns a symlink-resolved t.TempDir(): projectIdentity
+// canonicalizes resolved identities (macOS /var → /private/var), so tests
+// build layouts on physical paths to compare spellings directly.
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	p, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(TempDir): %v", err)
+	}
+	return p
+}
+
+// mustEvalSymlinks resolves a path's symlinked components, fatally on error.
+func mustEvalSymlinks(t *testing.T, p string) string {
+	t.Helper()
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%s): %v", p, err)
+	}
+	return r
+}
+
 // mkdirAll is a fatal-on-error helper for building git layouts in tests.
 func mkdirAll(t *testing.T, path string) string {
 	t.Helper()
@@ -42,7 +64,7 @@ func linkedWorktree(t *testing.T, main, wt, name string) {
 }
 
 func TestProjectIdentity(t *testing.T) {
-	tmp := t.TempDir()
+	tmp := canonicalTempDir(t)
 
 	main := mkdirAll(t, filepath.Join(tmp, "repo"))
 	gitRepo(t, main)
@@ -90,7 +112,7 @@ func TestProjectIdentity(t *testing.T) {
 // gitdir pointer — legal per git-worktree(1) even if `git worktree add`
 // writes absolute paths.
 func TestProjectIdentity_RelativeGitdir(t *testing.T) {
-	tmp := t.TempDir()
+	tmp := canonicalTempDir(t)
 	main := mkdirAll(t, filepath.Join(tmp, "repo"))
 	gitRepo(t, main)
 
@@ -113,7 +135,7 @@ func TestProjectIdentity_RelativeGitdir(t *testing.T) {
 // carries a back-pointer to the worktree's .git file — and resolution requires
 // it; a pointer without the back-link falls back to the raw cwd.
 func TestProjectIdentity_ForeignGitdirRejected(t *testing.T) {
-	tmp := t.TempDir()
+	tmp := canonicalTempDir(t)
 	victim := mkdirAll(t, filepath.Join(tmp, "victim"))
 	gitRepo(t, victim)
 
@@ -128,7 +150,7 @@ func TestProjectIdentity_ForeignGitdirRejected(t *testing.T) {
 // TestProjectIdentity_MismatchedBackPointerRejected: a gitdir whose
 // back-pointer names some OTHER worktree is not this worktree's gitdir.
 func TestProjectIdentity_MismatchedBackPointerRejected(t *testing.T) {
-	tmp := t.TempDir()
+	tmp := canonicalTempDir(t)
 	main := mkdirAll(t, filepath.Join(tmp, "repo"))
 	gitRepo(t, main)
 
@@ -146,12 +168,33 @@ func TestProjectIdentity_MismatchedBackPointerRejected(t *testing.T) {
 	}
 }
 
+// TestProjectIdentity_ForgedCommondirRejected: a cwd-controlled fake gitdir
+// can satisfy the back-pointer check (it points back at its own .git) while
+// its commondir names a victim repository's .git. The commondir is only
+// trustworthy inside real worktree geometry — gitdir at <common>/worktrees/<n>
+// — so the forgery must fall back to the raw cwd, not the victim's identity.
+func TestProjectIdentity_ForgedCommondirRejected(t *testing.T) {
+	tmp := canonicalTempDir(t)
+	victim := mkdirAll(t, filepath.Join(tmp, "victim"))
+	gitRepo(t, victim)
+
+	attacker := mkdirAll(t, filepath.Join(tmp, "attacker"))
+	fakeGitdir := mkdirAll(t, filepath.Join(attacker, "fakegit"))
+	writeFile(t, filepath.Join(attacker, ".git"), "gitdir: "+fakeGitdir+"\n")
+	writeFile(t, filepath.Join(fakeGitdir, "gitdir"), filepath.Join(attacker, ".git")+"\n")
+	writeFile(t, filepath.Join(fakeGitdir, "commondir"), filepath.Join(victim, ".git")+"\n")
+
+	if got := projectIdentity(attacker); got != attacker {
+		t.Errorf("projectIdentity(%q) = %q — forged commondir claimed %q; want raw cwd", attacker, got, victim)
+	}
+}
+
 // TestProjectIdentity_BrokenGitSymlinkFailsBack: an entry named .git that
 // exists but cannot be classified (broken symlink) must fail back to the raw
 // cwd — ascending past it would resolve to an enclosing repository the
 // directory does not belong to.
 func TestProjectIdentity_BrokenGitSymlinkFailsBack(t *testing.T) {
-	tmp := t.TempDir()
+	tmp := canonicalTempDir(t)
 	parent := mkdirAll(t, filepath.Join(tmp, "parent"))
 	gitRepo(t, parent)
 
@@ -169,7 +212,7 @@ func TestProjectIdentity_BrokenGitSymlinkFailsBack(t *testing.T) {
 // primary checkout (bare repo), there is no primary path to resolve to — the
 // raw cwd is kept rather than a guess.
 func TestProjectIdentity_BareCommonDir(t *testing.T) {
-	tmp := t.TempDir()
+	tmp := canonicalTempDir(t)
 	bare := mkdirAll(t, filepath.Join(tmp, "repo.git"))
 
 	wt := filepath.Join(tmp, "bare-wt")
