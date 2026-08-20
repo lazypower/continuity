@@ -41,7 +41,7 @@ func TestRenderContext_PreviewDoesNotTouchMoments(t *testing.T) {
 	}
 
 	// Preview: zero rotation writes.
-	_ = srv.renderContext("", true)
+	_ = srv.renderContext("", "", true)
 	for i := 0; i < 4; i++ {
 		n, _ := srv.db.GetNodeByURI(fmt.Sprintf("mem://agent/moments/m-%d", i))
 		if n == nil {

@@ -237,6 +237,49 @@ func TestSessionToneInRecentSessions(t *testing.T) {
 	}
 }
 
+// TestGetRecentProjectSessions pins projectMatch semantics (#79): exact match
+// on the normalized identity, prefix match for pre-normalization raw paths
+// under the root, and no match for lookalike siblings.
+func TestGetRecentProjectSessions(t *testing.T) {
+	db, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	defer db.Close()
+
+	for _, spec := range []struct{ id, project string }{
+		{"s-exact", "/repo/alpha"},
+		{"s-raw-worktree", "/repo/alpha/.claude/worktrees/agent-x"},
+		{"s-raw-subdir", "/repo/alpha/internal/store"},
+		{"s-lookalike", "/repo/alphabet"},
+		{"s-other", "/repo/beta"},
+	} {
+		if _, err := db.InitSession(spec.id, spec.project); err != nil {
+			t.Fatalf("InitSession %s: %v", spec.id, err)
+		}
+	}
+
+	sessions, err := db.GetRecentProjectSessions("/repo/alpha", 10)
+	if err != nil {
+		t.Fatalf("GetRecentProjectSessions: %v", err)
+	}
+
+	got := make(map[string]bool, len(sessions))
+	for _, s := range sessions {
+		got[s.SessionID] = true
+	}
+	for _, want := range []string{"s-exact", "s-raw-worktree", "s-raw-subdir"} {
+		if !got[want] {
+			t.Errorf("expected %s to match /repo/alpha; got %v", want, got)
+		}
+	}
+	for _, banned := range []string{"s-lookalike", "s-other"} {
+		if got[banned] {
+			t.Errorf("%s must not match /repo/alpha (lookalike/cross-project)", banned)
+		}
+	}
+}
+
 func TestUnmarkExtracted(t *testing.T) {
 	db, err := OpenMemory()
 	if err != nil {

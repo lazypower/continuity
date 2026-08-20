@@ -144,6 +144,41 @@ func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 	return sessions, rows.Err()
 }
 
+// projectMatch returns a SQL clause matching the given project column against
+// a normalized project identity; bind three copies of the identity (#79).
+// Rows written since #79 store the normalized primary-checkout path, so they
+// match exactly. Rows written before it keep their raw cwd — for repo
+// subdirectories and in-repo worktrees that raw path sits UNDER the normalized
+// root, so the prefix compare picks them up cheaply. A pre-#79 worktree
+// outside the repository root stays unmatched: normalization is applied at
+// write time going forward, never as a retroactive defrag.
+func projectMatch(column string) string {
+	return fmt.Sprintf("(%[1]s = ? OR substr(%[1]s, 1, length(?) + 1) = ? || '/')", column)
+}
+
+// GetRecentProjectSessions returns the most recent sessions whose project
+// matches the given normalized project identity, ordered by started_at DESC.
+func (db *DB) GetRecentProjectSessions(project string, limit int) ([]Session, error) {
+	rows, err := db.Query(`
+		SELECT id, session_id, project, started_at, ended_at, status, summary_node, message_count, tool_count, extracted_at, tone, last_active_at
+		FROM sessions WHERE `+projectMatch("project")+` ORDER BY started_at DESC LIMIT ?
+	`, project, project, project, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get recent project sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []Session
+	for rows.Next() {
+		var s Session
+		if err := rows.Scan(&s.ID, &s.SessionID, &s.Project, &s.StartedAt, &s.EndedAt, &s.Status, &s.SummaryNode, &s.MessageCount, &s.ToolCount, &s.ExtractedAt, &s.Tone, &s.LastActiveAt); err != nil {
+			return nil, fmt.Errorf("scan session: %w", err)
+		}
+		sessions = append(sessions, s)
+	}
+	return sessions, rows.Err()
+}
+
 // GetSessionsSince returns all sessions started after the given timestamp, ordered by started_at ASC.
 func (db *DB) GetSessionsSince(sinceMs int64) ([]Session, error) {
 	rows, err := db.Query(`
