@@ -36,26 +36,25 @@ func projectIdentity(cwd string) string {
 	dir := filepath.Clean(cwd)
 	for {
 		gitPath := filepath.Join(dir, ".git")
-		if fi, err := os.Stat(gitPath); err == nil {
+		// Lstat, not Stat: git only ever writes .git as a real directory or a
+		// real regular file. A .git that is a SYMLINK is not a git-authored
+		// entry — following it (os.Stat does) would let a cwd-local symlink
+		// point at a foreign linked worktree's real .git and inherit that
+		// repository's identity. Any non-plain entry (symlink, FIFO, device)
+		// fails back to the raw cwd: never guessed, never hung (#79).
+		if fi, err := os.Lstat(gitPath); err == nil {
 			if fi.IsDir() {
 				return canonicalIdentity(dir)
 			}
-			// Only a regular file can be a worktree pointer. Anything else
-			// (FIFO, device, socket) must not be opened — a blocking read
-			// here would hang the SessionStart hook, and a hook must fail
-			// back to the raw cwd, never hang (#79).
 			if fi.Mode().IsRegular() {
 				if root := primaryCheckoutFromGitFile(dir, gitPath); root != "" {
 					return canonicalIdentity(root)
 				}
 			}
-			return cwd
-		} else if _, lerr := os.Lstat(gitPath); lerr == nil {
-			// The entry exists but cannot be classified (broken symlink,
-			// symlink cycle, permission failure). Ascending past it could
-			// resolve to an ENCLOSING repository this directory does not
-			// belong to — an unresolvable layout fails back to the raw cwd,
-			// never to a guess.
+			// The entry exists but is not a plain dir/file (symlink, cycle,
+			// FIFO) or did not resolve. Ascending past it could bind to an
+			// ENCLOSING repository this directory does not belong to, so it
+			// fails back to the raw cwd rather than to a guess.
 			return cwd
 		}
 		parent := filepath.Dir(dir)
@@ -71,6 +70,13 @@ func projectIdentity(cwd string) string {
 // directory, and returns the primary checkout path (the shared .git's parent).
 // Returns "" when the layout doesn't resolve — the caller falls back to the
 // raw cwd rather than guessing.
+//
+// This resolves LINKED WORKTREES only — the #79 fragmentation case. Other
+// gitfile layouts (submodules, `--separate-git-dir`) have no worktree
+// back-pointer / no commondir, so they return "" and the session keeps its
+// raw cwd: shape-only, never a wrong identity. Normalizing those is outside
+// #79's scope, and their raw-cwd affinity is an accepted limit, not a
+// regression — the same layouts fell back before this hardening.
 // maxGitMetadataBytes bounds reads of git metadata files (.git pointer,
 // commondir). Real ones are a single short line; anything larger is not git
 // metadata and must not be slurped into hook memory.

@@ -189,6 +189,34 @@ func TestProjectIdentity_ForgedCommondirRejected(t *testing.T) {
 	}
 }
 
+// TestProjectIdentity_SymlinkedGitToForeignWorktreeRejected: a cwd-local .git
+// SYMLINK pointing at a legitimate foreign worktree's real .git file would,
+// if followed, satisfy the back-pointer and commondir checks (they describe
+// the real worktree) and inherit that repository's identity. git never writes
+// .git as a symlink, so an Lstat that sees a symlink fails back to the raw
+// cwd. Constructed with only a symlink inside the attacker's own cwd.
+func TestProjectIdentity_SymlinkedGitToForeignWorktreeRejected(t *testing.T) {
+	tmp := canonicalTempDir(t)
+	victim := mkdirAll(t, filepath.Join(tmp, "victim"))
+	gitRepo(t, victim)
+	victimWT := filepath.Join(tmp, "victim-wt")
+	linkedWorktree(t, victim, victimWT, "vwt")
+
+	// Sanity: the victim worktree really does resolve to the victim primary.
+	if got := projectIdentity(victimWT); got != victim {
+		t.Fatalf("precondition: victim worktree resolves to %q, want %q", got, victim)
+	}
+
+	attacker := mkdirAll(t, filepath.Join(tmp, "attacker"))
+	if err := os.Symlink(filepath.Join(victimWT, ".git"), filepath.Join(attacker, ".git")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	if got := projectIdentity(attacker); got != attacker {
+		t.Errorf("projectIdentity(%q) = %q — symlinked .git claimed foreign identity %q; want raw cwd", attacker, got, victim)
+	}
+}
+
 // TestProjectIdentity_BrokenGitSymlinkFailsBack: an entry named .git that
 // exists but cannot be classified (broken symlink) must fail back to the raw
 // cwd — ascending past it would resolve to an enclosing repository the
