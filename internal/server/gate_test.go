@@ -233,6 +233,37 @@ func TestGate_DedupesAgainstOtherSurfaces(t *testing.T) {
 	}
 }
 
+// A tray render seeds the gate's SYNCHRONOUS ledger, so the gate cannot
+// re-inject a just-surfaced URI even while the tray's `shown` journal rows
+// are still buffered (Codex round 2).
+func TestGate_TrayRenderSeedsLedgerSynchronously(t *testing.T) {
+	srv := acceptanceServer(t)
+	srv.SetGate(config.GateOn, 0.5)
+	seedProjectLeaf(t, srv, "mem://agent/cases/scar", "cases",
+		"migration snapshots caused cross-db data loss", "/repo/alpha", "sess-src")
+
+	// Real (non-preview) SessionStart render for this session + project — the
+	// affine node lands in the Memory Index section.
+	code, body := get(t, srv, "/api/context?session_id=sess-1&project=%2Frepo%2Falpha")
+	if code != 200 || !strings.Contains(body, "mem://agent/cases/scar") {
+		t.Fatalf("context render did not surface the node: %d %s", code, body)
+	}
+
+	// The claim must be visible immediately, without any recorder drain.
+	srv.gateSessions.mu.Lock()
+	claimed := srv.gateSessions.sessions["sess-1"]["mem://agent/cases/scar"]
+	srv.gateSessions.mu.Unlock()
+	if !claimed {
+		t.Fatal("tray render did not claim the surfaced URI into the gate ledger")
+	}
+
+	// And the gate honors it: no injection for the just-surfaced URI.
+	_, gateBody := postGate(t, srv, "sess-1", "/repo/alpha", "migration snapshots caused cross-db data loss")
+	if r := decodeGate(t, gateBody); len(r.Inject) != 0 {
+		t.Errorf("gate re-injected a tray-surfaced URI: %s", gateBody)
+	}
+}
+
 // Episodic hits are project-scoped: a node from another project's session
 // does not surface, while contract categories match globally.
 func TestGate_ProjectScopeAndGlobalContract(t *testing.T) {

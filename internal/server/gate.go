@@ -281,6 +281,14 @@ func (s *Server) handleGate(w http.ResponseWriter, r *http.Request) {
 		log.Printf("gate: response write failed, %d hit(s) not journaled as shown: %v", len(inject), err)
 		return
 	}
+	// Push the payload to the socket before the journal writes below: without
+	// the flush, net/http would hold the buffered response until this handler
+	// returns, coupling the client's receipt to a possibly lock-contended
+	// SQLite insert (Codex round 2). Encode-then-flush is the same
+	// best-effort delivered-proxy the search path uses.
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 	for _, h := range inject {
 		if err := s.db.InsertEvent(store.MemEvent{
 			NodeURI: h.URI, Event: "shown", Surface: "gate", SessionID: req.SessionID,
