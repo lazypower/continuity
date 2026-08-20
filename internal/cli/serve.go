@@ -35,6 +35,12 @@ const (
 	// envServeExtractionAuto re-enables the deprecated automatic session-end
 	// extraction (default off). Accepts any strconv.ParseBool value.
 	envServeExtractionAuto = "CONTINUITY_EXTRACTION_AUTO"
+
+	// envServeRelationalAuto is the kill switch for automatic relational
+	// profiling at session end (default on; #78). Accepts any strconv.ParseBool
+	// value. Setting it false restores the pre-#78 behavior: non-force /extract
+	// requests are skipped entirely while autoExtract is off.
+	envServeRelationalAuto = "CONTINUITY_RELATIONAL_AUTO"
 )
 
 // tfidfLexicalNotice is surfaced once at startup whenever the hashed lexical
@@ -165,6 +171,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	srv := server.New(db, eng, VersionString())
 	srv.SetAutoExtraction(cfg.Extraction.Auto)
+	srv.SetRelationalAuto(cfg.Extraction.RelationalAuto)
+	if !cfg.Extraction.RelationalAuto {
+		fmt.Fprintf(os.Stderr,
+			"  ! extraction.relational_auto DISABLED — the relational profile will not "+
+				"update from session ends. Unset %s to return to the default.\n",
+			envServeRelationalAuto)
+	}
 	if cfg.Extraction.Auto {
 		fmt.Fprintf(os.Stderr,
 			"  ! extraction.auto ENABLED — automatic session extraction is on; it is off by "+
@@ -303,6 +316,13 @@ func applyServeEnvOverrides(cfg *config.Config) error {
 			return fmt.Errorf("%s=%q: must be a boolean (true/false/1/0)", envServeExtractionAuto, v)
 		}
 		cfg.Extraction.Auto = enabled
+	}
+	if v := strings.TrimSpace(os.Getenv(envServeRelationalAuto)); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("%s=%q: must be a boolean (true/false/1/0)", envServeRelationalAuto, v)
+		}
+		cfg.Extraction.RelationalAuto = enabled
 	}
 	return nil
 }

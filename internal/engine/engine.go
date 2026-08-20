@@ -710,6 +710,21 @@ func (e *Engine) ExtractSessionForce(sessionID, transcriptPath string) error {
 	return e.extractSession(sessionID, transcriptPath, true)
 }
 
+// ExtractRelational runs only the relational profiling pipeline (#78) — the
+// "relational" queue jobs enqueued while autoExtract is off. It writes zero
+// memory nodes and does NOT mark the session extracted, so a later
+// `continuity extract --force` still runs the full pipeline; extractRelational's
+// source-session guard then prevents double-applying the same profile update.
+// The vector-identity lock is irrelevant here by construction: relational only
+// merges into the fixed system-owned URI and never passes the resurrection gate
+// (see the comment above extractRelational's UpsertNode call).
+func (e *Engine) ExtractRelational(sessionID, transcriptPath string) error {
+	if transcriptPath == "" {
+		return fmt.Errorf("no transcript path provided")
+	}
+	return extractRelational(e.DB, e.LLM, sessionID, transcriptPath)
+}
+
 func (e *Engine) extractSession(sessionID, transcriptPath string, force bool) error {
 	if transcriptPath == "" {
 		return fmt.Errorf("no transcript path provided")

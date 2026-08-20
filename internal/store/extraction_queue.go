@@ -10,15 +10,16 @@ import (
 type ExtractionJob struct {
 	ID        int64
 	SessionID string
-	Kind      string // "session" | "signal"
-	Payload   string // transcript path (session) or prompt (signal)
+	Kind      string // "session" | "signal" | "relational"
+	Payload   string // transcript path (session, relational) or prompt (signal)
 	Force     bool
 	Attempts  int
 }
 
 // EnqueueExtraction records a pending extraction so the work survives a crash or
 // restart: the row is deleted only after the extraction succeeds (H1). kind is
-// "session" (payload = transcript path) or "signal" (payload = prompt).
+// "session" or "relational" (payload = transcript path) or "signal"
+// (payload = prompt).
 func (db *DB) EnqueueExtraction(sessionID, kind, payload string, force bool) error {
 	f := 0
 	if force {

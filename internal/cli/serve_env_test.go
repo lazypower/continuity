@@ -9,7 +9,7 @@ import (
 
 func clearServeEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{envServeDB, envServePort, envServeBind, envServeEmbedder} {
+	for _, k := range []string{envServeDB, envServePort, envServeBind, envServeEmbedder, envServeExtractionAuto, envServeRelationalAuto} {
 		t.Setenv(k, "")
 	}
 }
@@ -86,6 +86,29 @@ func TestApplyServeEnvOverrides_WhitespaceIgnored(t *testing.T) {
 	}
 }
 
+// TestApplyServeEnvOverrides_RelationalAuto (#78): the kill switch flips the
+// on-by-default relational profiling off; an invalid value fails fast.
+func TestApplyServeEnvOverrides_RelationalAuto(t *testing.T) {
+	clearServeEnv(t)
+	cfg := config.Default()
+	if !cfg.Extraction.RelationalAuto {
+		t.Fatal("relational auto must default ON")
+	}
+
+	t.Setenv(envServeRelationalAuto, "false")
+	if err := applyServeEnvOverrides(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Extraction.RelationalAuto {
+		t.Error("CONTINUITY_RELATIONAL_AUTO=false must disable relational auto")
+	}
+
+	t.Setenv(envServeRelationalAuto, "not-a-bool")
+	if err := applyServeEnvOverrides(&cfg); err == nil {
+		t.Error("expected error for non-boolean CONTINUITY_RELATIONAL_AUTO")
+	}
+}
+
 func TestNormalizeBackend(t *testing.T) {
 	cases := []struct {
 		in, want string
@@ -116,10 +139,12 @@ func TestNormalizeBackend_UnknownPassesThrough(t *testing.T) {
 // The env constants form a contract used by external automation; pin them.
 func TestServeEnvConstants(t *testing.T) {
 	cases := map[string]string{
-		"CONTINUITY_DB":       envServeDB,
-		"CONTINUITY_PORT":     envServePort,
-		"CONTINUITY_BIND":     envServeBind,
-		"CONTINUITY_EMBEDDER": envServeEmbedder,
+		"CONTINUITY_DB":              envServeDB,
+		"CONTINUITY_PORT":            envServePort,
+		"CONTINUITY_BIND":            envServeBind,
+		"CONTINUITY_EMBEDDER":        envServeEmbedder,
+		"CONTINUITY_EXTRACTION_AUTO": envServeExtractionAuto,
+		"CONTINUITY_RELATIONAL_AUTO": envServeRelationalAuto,
 	}
 	for want, got := range cases {
 		if got != want {

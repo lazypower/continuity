@@ -42,6 +42,15 @@ type Server struct {
 	// `continuity extract --force` (force=true) and the signal path are unaffected.
 	// Set via SetAutoExtraction from config.Extraction.Auto.
 	autoExtract bool
+
+	// relationalAuto gates automatic relational profiling at session end.
+	// Default true, decoupled from autoExtract (#78): relational merges into a
+	// single system-owned node with unambiguous provenance and never creates
+	// arbitrary memories, so gating it behind autoExtract froze the profile.
+	// When autoExtract is off and this is on, handleExtractSession enqueues a
+	// relational-only job instead of skipping entirely. Set via
+	// SetRelationalAuto from config.Extraction.RelationalAuto.
+	relationalAuto bool
 }
 
 // New creates a new Server with the given database, engine, and version string.
@@ -57,6 +66,10 @@ func New(db *store.DB, eng *engine.Engine, version string) *Server {
 		extractWake: make(chan struct{}, 1),
 		extractStop: make(chan struct{}),
 		extractDone: make(chan struct{}),
+
+		// Relational profiling defaults ON (#78) — the zero value would silently
+		// freeze the profile for any caller that never calls SetRelationalAuto.
+		relationalAuto: true,
 	}
 	if eng != nil {
 		s.runJob = s.runExtractionJob
@@ -71,6 +84,11 @@ func New(db *store.DB, eng *engine.Engine, version string) *Server {
 // while `continuity extract --force` and the signal path remain available.
 // See config.ExtractionConfig for the deprecation rationale.
 func (s *Server) SetAutoExtraction(enabled bool) { s.autoExtract = enabled }
+
+// SetRelationalAuto toggles automatic relational profiling at session end
+// (default on; #78). When false, non-force /extract requests with autoExtract
+// off are skipped entirely — the pre-#78 behavior.
+func (s *Server) SetRelationalAuto(enabled bool) { s.relationalAuto = enabled }
 
 // Close releases the server's background resources (the telemetry recorder).
 // Safe to call once; telemetry flush is bounded, never blocking shutdown.

@@ -124,6 +124,11 @@ func (s *Server) runExtractionJob(job *store.ExtractionJob) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		return s.engine.ExtractSignal(ctx, job.SessionID, job.Payload)
+	case "relational":
+		// Relational-only job (#78): enqueued by handleExtractSession while
+		// autoExtract is off, so the profile keeps learning without the memory
+		// pipeline. Runs no memory extraction and never marks the session extracted.
+		return s.engine.ExtractRelational(job.SessionID, job.Payload)
 	default:
 		// Unknown kind: drop it (nil error ⇒ deleted) rather than retry forever.
 		log.Printf("extraction worker: unknown job kind %q (job %d) — dropping", job.Kind, job.ID)

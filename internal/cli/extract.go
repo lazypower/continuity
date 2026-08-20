@@ -99,10 +99,16 @@ func runExtract(cmd *cobra.Command, args []string) error {
 	// than falsely reporting the job as queued. The status string is the server's
 	// stable extraction_disabled contract (server.StatusExtractionDisabled).
 	var resp struct {
-		Status string `json:"status"`
+		Status     string `json:"status"`
+		Relational string `json:"relational"`
 	}
 	if jsonErr := json.Unmarshal(data, &resp); jsonErr == nil && resp.Status == "extraction_disabled" {
 		fmt.Printf("automatic session extraction is off for %s — re-run with --force to extract it anyway\n", sessionID)
+		// Relational profiling is decoupled from that gate (#78); report it when
+		// the server queued a relational-only job for this request.
+		if resp.Relational == "extracting" {
+			fmt.Println("relational profiling queued — the profile still updates from this session")
+		}
 		return nil
 	}
 
