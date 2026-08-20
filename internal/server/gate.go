@@ -57,11 +57,12 @@ var gateGlobalCategories = map[string]bool{
 const maxLedgerSessions = 64
 
 // gateLedger is the synchronous half of the per-session dedupe ledger (#80).
-// The durable half is the mem_events `shown` journal — but journal writes are
-// buffered and fire-and-forget, so two prompts in quick succession could both
-// clear the journal check before the first one's `shown` row lands. This map
-// closes that window: injection decisions are recorded here synchronously,
-// under the lock, before the response is written.
+// The durable half is the mem_events `shown` journal — but tray/index/moments
+// rows arrive through the buffered recorder, and even the gate's own journal
+// write lands after the response, so two prompts in quick succession could
+// both clear the journal check before either row exists. This map closes that
+// window: injection decisions are recorded here synchronously, under the
+// lock, before the response is written.
 type gateLedger struct {
 	mu       sync.Mutex
 	sessions map[string]map[string]bool
@@ -269,11 +270,22 @@ func (s *Server) handleGate(w http.ResponseWriter, r *http.Request) {
 	// write succeeds (ADR-001 §5: a canceled client must not inflate the
 	// used-given-shown denominator). Shadow mode reaches here with an empty
 	// inject list and journals nothing — shadow hits were shown to nobody.
+	//
+	// Written SYNCHRONOUSLY, not through the buffered recorder: these rows are
+	// the durable half of the dedupe ledger, and a dropped row plus a ledger
+	// eviction or restart would re-inject the same URI (Codex round 1). The
+	// client already has its response, so only this handler goroutine waits —
+	// the prompt-latency contract is untouched, and a failed insert costs one
+	// possible duplicate line, logged.
 	if err != nil {
 		log.Printf("gate: response write failed, %d hit(s) not journaled as shown: %v", len(inject), err)
 		return
 	}
 	for _, h := range inject {
-		s.events.record("shown", "gate", h.URI, req.SessionID)
+		if err := s.db.InsertEvent(store.MemEvent{
+			NodeURI: h.URI, Event: "shown", Surface: "gate", SessionID: req.SessionID,
+		}); err != nil {
+			log.Printf("gate: shown journal write failed for %s: %v (dedupe falls back to the in-memory ledger)", h.URI, err)
+		}
 	}
 }

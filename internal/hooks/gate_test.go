@@ -32,7 +32,7 @@ func TestPromptGate_ServerDownIsSilent(t *testing.T) {
 	ts.Close()
 
 	out := captureStdout(t, func() {
-		promptGate(gateClientFor(url), gateInput("migration snapshots"))
+		promptGate(gateClientFor(url), gateInput("migration snapshots"), "")
 	})
 	if out != "" {
 		t.Errorf("server-down gate wrote stdout: %q", out)
@@ -50,7 +50,7 @@ func TestPromptGate_SlowServerIsSilentWithinBudget(t *testing.T) {
 
 	start := time.Now()
 	out := captureStdout(t, func() {
-		promptGate(gateClientFor(ts.URL), gateInput("migration snapshots"))
+		promptGate(gateClientFor(ts.URL), gateInput("migration snapshots"), "")
 	})
 	elapsed := time.Since(start)
 
@@ -83,7 +83,7 @@ func TestPromptGate_BadResponsesAreSilent(t *testing.T) {
 			ts := httptest.NewServer(handler)
 			defer ts.Close()
 			out := captureStdout(t, func() {
-				promptGate(gateClientFor(ts.URL), gateInput("migration snapshots"))
+				promptGate(gateClientFor(ts.URL), gateInput("migration snapshots"), "")
 			})
 			if out != "" {
 				t.Errorf("%s: gate wrote stdout: %q", name, out)
@@ -108,13 +108,34 @@ func TestPromptGate_EmptyInjectIsSilent(t *testing.T) {
 	defer ts.Close()
 
 	out := captureStdout(t, func() {
-		promptGate(gateClientFor(ts.URL), gateInput("a scarred topic"))
+		promptGate(gateClientFor(ts.URL), gateInput("a scarred topic"), "")
 	})
 	if out != "" {
 		t.Errorf("shadow gate wrote stdout: %q", out)
 	}
 	if gotBody["prompt"] != "a scarred topic" || gotBody["session_id"] != "sess-1" {
 		t.Errorf("gate request body = %v", gotBody)
+	}
+}
+
+// "Shadow never injects" is enforced hook-side too: a buggy or skewed server
+// that returns inject items WITHOUT mode "on" is refused (Codex round 1).
+func TestPromptGate_ShadowWithInjectItemsIsSilent(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"mode": "shadow", "max_similarity": 0.9, "tau": 0.5,
+			"inject": []map[string]any{
+				{"uri": "mem://agent/cases/scar", "l0_abstract": "should never render", "similarity": 0.9},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	out := captureStdout(t, func() {
+		promptGate(gateClientFor(ts.URL), gateInput("migration snapshots"), "")
+	})
+	if out != "" {
+		t.Errorf("shadow response with inject items produced output: %q", out)
 	}
 }
 
@@ -132,7 +153,7 @@ func TestPromptGate_InjectsL0AndURI(t *testing.T) {
 	defer ts.Close()
 
 	out := captureStdout(t, func() {
-		promptGate(gateClientFor(ts.URL), gateInput("migration snapshots"))
+		promptGate(gateClientFor(ts.URL), gateInput("migration snapshots"), "")
 	})
 	var parsed UserPromptSubmitOutput
 	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
@@ -159,7 +180,7 @@ func TestPromptGate_EmptyPromptSkips(t *testing.T) {
 	}))
 	defer ts.Close()
 	out := captureStdout(t, func() {
-		promptGate(gateClientFor(ts.URL), gateInput(""))
+		promptGate(gateClientFor(ts.URL), gateInput(""), "")
 	})
 	if called || out != "" {
 		t.Errorf("empty prompt reached the gate (called=%v, out=%q)", called, out)

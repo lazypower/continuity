@@ -91,10 +91,12 @@ func handleSubmit(client *Client, input *HookInput) {
 
 	// Initialize/resume session on first user prompt. Project is the
 	// normalized repository identity, not the raw cwd (#79) — see
-	// projectIdentity for why normalization is hook-side.
+	// projectIdentity for why normalization is hook-side. Resolved once here
+	// and shared with the gate call below.
+	project := projectIdentity(input.CWD)
 	body, err := json.Marshal(map[string]string{
 		"session_id": input.SessionID,
-		"project":    projectIdentity(input.CWD),
+		"project":    project,
 	})
 	if err != nil {
 		ExitError(err)
@@ -111,7 +113,7 @@ func handleSubmit(client *Client, input *HookInput) {
 	// path (a failed init already returned above, and the gate stayed silent).
 	// Terse prompts self-handle by clearing no threshold; internal-sentinel
 	// prompts already bailed at the top of this function.
-	promptGate(NewGateClient(), input)
+	promptGate(NewGateClient(), input, project)
 
 	// Check for signal keywords — fire and forget
 	if input.Prompt != "" {

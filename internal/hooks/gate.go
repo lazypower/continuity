@@ -14,14 +14,14 @@ import (
 // passes through unmodified and the hook exits 0 exactly as if the gate did
 // not exist. It runs only after session init succeeded; a failed init keeps
 // its own non-blocking error path and the gate simply never fires.
-func promptGate(client *Client, input *HookInput) {
+func promptGate(client *Client, input *HookInput, project string) {
 	if input.Prompt == "" {
 		return
 	}
 
 	body, err := json.Marshal(map[string]string{
 		"session_id": input.SessionID,
-		"project":    projectIdentity(input.CWD),
+		"project":    project,
 		"prompt":     input.Prompt,
 	})
 	if err != nil {
@@ -34,6 +34,7 @@ func promptGate(client *Client, input *HookInput) {
 	}
 
 	var resp struct {
+		Mode   string `json:"mode"`
 		Inject []struct {
 			URI        string `json:"uri"`
 			L0Abstract string `json:"l0_abstract"`
@@ -43,9 +44,17 @@ func promptGate(client *Client, input *HookInput) {
 		return // malformed body → silence
 	}
 
-	// Shadow mode (the default) always returns an empty inject list; so does
-	// every prompt under τ. Median prompt injects zero — silence is the
-	// default, and no output at all is how UserPromptSubmit says "unchanged".
+	// "Shadow never injects" is enforced on BOTH sides of the wire: the server
+	// returns an empty inject list in shadow mode, and the hook independently
+	// refuses inject items unless the response says mode "on" — so a buggy or
+	// version-skewed server cannot turn shadow into injection (Codex round 1).
+	if resp.Mode != "on" {
+		return
+	}
+
+	// Every prompt under τ returns an empty inject list. Median prompt injects
+	// zero — silence is the default, and no output at all is how
+	// UserPromptSubmit says "unchanged".
 	if len(resp.Inject) == 0 {
 		return
 	}
