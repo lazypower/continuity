@@ -238,8 +238,10 @@ func TestSessionToneInRecentSessions(t *testing.T) {
 }
 
 // TestGetRecentProjectSessions pins projectMatch semantics (#79): exact match
-// on the normalized identity, prefix match for pre-normalization raw paths
-// under the root, and no match for lookalike siblings.
+// on the normalized identity, prefix match ONLY for raw in-repo Claude
+// worktree paths, and no match for lookalike siblings, plain subdirectories,
+// or nested repositories (a path under the root can be its own project —
+// affinity never guesses).
 func TestGetRecentProjectSessions(t *testing.T) {
 	db, err := OpenMemory()
 	if err != nil {
@@ -251,6 +253,7 @@ func TestGetRecentProjectSessions(t *testing.T) {
 		{"s-exact", "/repo/alpha"},
 		{"s-raw-worktree", "/repo/alpha/.claude/worktrees/agent-x"},
 		{"s-raw-subdir", "/repo/alpha/internal/store"},
+		{"s-nested-repo", "/repo/alpha/vendor/libfoo"},
 		{"s-lookalike", "/repo/alphabet"},
 		{"s-other", "/repo/beta"},
 	} {
@@ -268,14 +271,20 @@ func TestGetRecentProjectSessions(t *testing.T) {
 	for _, s := range sessions {
 		got[s.SessionID] = true
 	}
-	for _, want := range []string{"s-exact", "s-raw-worktree", "s-raw-subdir"} {
+	for _, want := range []string{"s-exact", "s-raw-worktree"} {
 		if !got[want] {
 			t.Errorf("expected %s to match /repo/alpha; got %v", want, got)
 		}
 	}
-	for _, banned := range []string{"s-lookalike", "s-other"} {
+	// s-raw-subdir is a deliberate non-match: a bare-subtree prefix cannot
+	// tell a subdirectory from a nested repository (s-nested-repo could be
+	// its own checkout, storing exactly that path as its identity), so the
+	// prefix compare accepts only the .claude/worktrees layout. Legacy
+	// subdir rows degrade to counts-only rather than risk cross-project
+	// leakage.
+	for _, banned := range []string{"s-raw-subdir", "s-nested-repo", "s-lookalike", "s-other"} {
 		if got[banned] {
-			t.Errorf("%s must not match /repo/alpha (lookalike/cross-project)", banned)
+			t.Errorf("%s must not match /repo/alpha (subtree/nested-repo/lookalike leak)", banned)
 		}
 	}
 }

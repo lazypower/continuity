@@ -350,9 +350,11 @@ func (db *DB) CountLeavesByCategory() (map[string]int, error) {
 // sessions.session_id → sessions.project (#79, ADR-001 §3). Ordered by
 // updated_at DESC — updated_at moves on write/merge, never on exposure or
 // fetch, so the ordering carries no touch mechanics. Moments are excluded
-// (they have their own diversity-sampled tray channel); sessionless writes
-// have no source_session and drop out of the join by construction (accepted
-// limit, #79); merged nodes carry last-writer affinity (accepted limit, #79).
+// (they have their own diversity-sampled tray channel), as are nodes with no
+// L0 (nothing to render — an empty row must not occupy a result slot);
+// sessionless writes have no source_session and drop out of the join by
+// construction (accepted limit, #79); merged nodes carry last-writer affinity
+// (accepted limit, #79).
 func (db *DB) FindProjectAffine(project string, limit int) ([]MemNode, error) {
 	rows, err := db.Query(`
 		SELECT n.id, n.uri, n.parent_uri, n.node_type, n.category, n.l0_abstract, n.l1_overview, n.l2_content,
@@ -362,6 +364,7 @@ func (db *DB) FindProjectAffine(project string, limit int) ([]MemNode, error) {
 		JOIN sessions s ON n.source_session = s.session_id
 		WHERE n.node_type = 'leaf' AND n.tombstoned_at IS NULL
 			AND n.category != 'moments'
+			AND n.l0_abstract != ''
 			AND `+projectMatch("s.project")+`
 		ORDER BY n.updated_at DESC
 		LIMIT ?

@@ -227,6 +227,55 @@ func TestMemoryIndex_BudgetEnforced(t *testing.T) {
 	}
 }
 
+// Pinned affine nodes must not starve the index: pins render in ### Pinned
+// and are skipped here, but each skip must leave a candidate behind it — a
+// project whose most recent nodes are all pinned still gets pointers for the
+// rest, never a false shape-only render.
+func TestMemoryIndex_PinnedNodesDoNotStarvePointers(t *testing.T) {
+	srv := testServer(t)
+	if _, err := srv.db.InitSession("s-alpha", "/repo/alpha"); err != nil {
+		t.Fatal(err)
+	}
+	// maxIndexAffineNodes newest nodes all pinned...
+	for i := 0; i < maxIndexAffineNodes; i++ {
+		uri := fmt.Sprintf("mem://agent/cases/pinned-%d", i)
+		if err := srv.db.CreateNode(&store.MemNode{
+			URI: uri, NodeType: "leaf", Category: "cases",
+			L0Abstract: fmt.Sprintf("pinned scar %d", i), SourceSession: "s-alpha",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if i < store.MaxPins {
+			if _, err := srv.db.PinNode(uri); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// ...plus one older unpinned node that must still surface.
+	if err := srv.db.CreateNode(&store.MemNode{
+		URI: "mem://agent/cases/unpinned-survivor", NodeType: "leaf", Category: "cases",
+		L0Abstract: "the unpinned survivor", SourceSession: "s-alpha",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.db.Exec(
+		`UPDATE mem_nodes SET updated_at = 1 WHERE uri = 'mem://agent/cases/unpinned-survivor'`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := srv.renderContext("cur", "/repo/alpha", false)
+	section := indexSection(t, ctx)
+	if !strings.Contains(section, "mem://agent/cases/unpinned-survivor") {
+		t.Errorf("pinned nodes starved the index into shape-only:\n%s", section)
+	}
+	for i := 0; i < store.MaxPins; i++ {
+		if strings.Contains(section, fmt.Sprintf("mem://agent/cases/pinned-%d (", i)) &&
+			strings.Contains(section, fmt.Sprintf("- pinned scar %d (mem://agent/cases/pinned-%d)", i, i)) {
+			t.Errorf("pinned node %d rendered twice (tray + index):\n%s", i, section)
+		}
+	}
+}
+
 // Acceptance (#79): Recent Sessions lists only the current project's sessions
 // (last 1-3); project unknown → one line, the most recent session overall.
 func TestRecentSessions_ProjectScoped(t *testing.T) {

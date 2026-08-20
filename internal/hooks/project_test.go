@@ -29,12 +29,14 @@ func gitRepo(t *testing.T, root string) {
 }
 
 // linkedWorktree builds the on-disk layout `git worktree add` produces:
-// <main>/.git/worktrees/<name>/commondir → "../.." and <wt>/.git →
+// <main>/.git/worktrees/<name>/commondir → "../..", the `gitdir` back-pointer
+// naming the worktree's .git file, and <wt>/.git →
 // "gitdir: <main>/.git/worktrees/<name>".
 func linkedWorktree(t *testing.T, main, wt, name string) {
 	t.Helper()
 	gitdir := mkdirAll(t, filepath.Join(main, ".git", "worktrees", name))
 	writeFile(t, filepath.Join(gitdir, "commondir"), "../..\n")
+	writeFile(t, filepath.Join(gitdir, "gitdir"), filepath.Join(wt, ".git")+"\n")
 	mkdirAll(t, wt)
 	writeFile(t, filepath.Join(wt, ".git"), "gitdir: "+gitdir+"\n")
 }
@@ -95,11 +97,71 @@ func TestProjectIdentity_RelativeGitdir(t *testing.T) {
 	wt := filepath.Join(tmp, "rel-wt")
 	gitdir := mkdirAll(t, filepath.Join(main, ".git", "worktrees", "rel"))
 	writeFile(t, filepath.Join(gitdir, "commondir"), "../..\n")
+	// Relative back-pointer — legal alongside a relative gitdir.
+	writeFile(t, filepath.Join(gitdir, "gitdir"), "../../../../rel-wt/.git\n")
 	mkdirAll(t, wt)
 	writeFile(t, filepath.Join(wt, ".git"), "gitdir: ../repo/.git/worktrees/rel\n")
 
 	if got := projectIdentity(wt); got != main {
 		t.Errorf("projectIdentity(%q) = %q, want %q", wt, got, main)
+	}
+}
+
+// TestProjectIdentity_ForeignGitdirRejected: a crafted .git file naming an
+// arbitrary directory that happens to end in .git must NOT claim that
+// repository's identity. Git's worktree linkage is bidirectional — the gitdir
+// carries a back-pointer to the worktree's .git file — and resolution requires
+// it; a pointer without the back-link falls back to the raw cwd.
+func TestProjectIdentity_ForeignGitdirRejected(t *testing.T) {
+	tmp := t.TempDir()
+	victim := mkdirAll(t, filepath.Join(tmp, "victim"))
+	gitRepo(t, victim)
+
+	attacker := mkdirAll(t, filepath.Join(tmp, "attacker"))
+	writeFile(t, filepath.Join(attacker, ".git"), "gitdir: "+filepath.Join(victim, ".git")+"\n")
+
+	if got := projectIdentity(attacker); got != attacker {
+		t.Errorf("projectIdentity(%q) = %q — crafted gitdir claimed %q; want raw cwd", attacker, got, victim)
+	}
+}
+
+// TestProjectIdentity_MismatchedBackPointerRejected: a gitdir whose
+// back-pointer names some OTHER worktree is not this worktree's gitdir.
+func TestProjectIdentity_MismatchedBackPointerRejected(t *testing.T) {
+	tmp := t.TempDir()
+	main := mkdirAll(t, filepath.Join(tmp, "repo"))
+	gitRepo(t, main)
+
+	real := filepath.Join(tmp, "real-wt")
+	linkedWorktree(t, main, real, "real")
+
+	// Imposter points at the real worktree's gitdir; its back-pointer names
+	// real-wt/.git, not imposter/.git.
+	imposter := mkdirAll(t, filepath.Join(tmp, "imposter"))
+	writeFile(t, filepath.Join(imposter, ".git"),
+		"gitdir: "+filepath.Join(main, ".git", "worktrees", "real")+"\n")
+
+	if got := projectIdentity(imposter); got != imposter {
+		t.Errorf("projectIdentity(%q) = %q, want raw cwd", imposter, got)
+	}
+}
+
+// TestProjectIdentity_BrokenGitSymlinkFailsBack: an entry named .git that
+// exists but cannot be classified (broken symlink) must fail back to the raw
+// cwd — ascending past it would resolve to an enclosing repository the
+// directory does not belong to.
+func TestProjectIdentity_BrokenGitSymlinkFailsBack(t *testing.T) {
+	tmp := t.TempDir()
+	parent := mkdirAll(t, filepath.Join(tmp, "parent"))
+	gitRepo(t, parent)
+
+	child := mkdirAll(t, filepath.Join(parent, "child"))
+	if err := os.Symlink(filepath.Join(tmp, "does-not-exist"), filepath.Join(child, ".git")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	if got := projectIdentity(child); got != child {
+		t.Errorf("projectIdentity(%q) = %q — broken .git symlink ascended to %q; want raw cwd", child, got, parent)
 	}
 }
 
@@ -113,6 +175,7 @@ func TestProjectIdentity_BareCommonDir(t *testing.T) {
 	wt := filepath.Join(tmp, "bare-wt")
 	gitdir := mkdirAll(t, filepath.Join(bare, "worktrees", "w"))
 	writeFile(t, filepath.Join(gitdir, "commondir"), "../..\n")
+	writeFile(t, filepath.Join(gitdir, "gitdir"), filepath.Join(wt, ".git")+"\n")
 	mkdirAll(t, wt)
 	writeFile(t, filepath.Join(wt, ".git"), "gitdir: "+gitdir+"\n")
 

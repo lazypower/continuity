@@ -47,8 +47,11 @@ const (
 	// shape line plus project-affine L0 pointers — a fraction of what the
 	// retired Recent Memories window spent.
 	maxIndexContext = 600
-	// maxIndexAffineNodes bounds the affinity query; the char budget above is
-	// what actually decides how many pointers render.
+	// maxIndexAffineNodes caps how many affine pointers may render; the char
+	// budget above usually cuts in first. The query overfetches by the pin
+	// cap so nodes already surfaced on the tray (pins, the relational
+	// profile) can't occupy every result slot and starve the index into a
+	// false shape-only render.
 	maxIndexAffineNodes = 8
 	// maxRecentProjectSessions caps Recent Sessions for a known project.
 	// Project unknown → one line, the most recent session overall.
@@ -241,10 +244,15 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 		section := "\n### Memory Index\n" + indexShapeLine(counts)
 		var indexShown []string
 		if project != "" {
-			if affine, err := s.db.FindProjectAffine(project, maxIndexAffineNodes); err == nil {
+			// Overfetch by the pin cap + 1 (relational profile): every
+			// surfaced node skipped below still leaves a candidate behind it.
+			if affine, err := s.db.FindProjectAffine(project, maxIndexAffineNodes+maxPinnedItems+1); err == nil {
 				const affineHeader = "This project:\n"
 				lines := ""
 				for _, n := range affine {
+					if len(indexShown) >= maxIndexAffineNodes {
+						break
+					}
 					if surfacedURIs[n.URI] || n.L0Abstract == "" {
 						continue
 					}

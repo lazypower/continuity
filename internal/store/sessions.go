@@ -147,13 +147,26 @@ func (db *DB) GetRecentSessions(limit int) ([]Session, error) {
 // projectMatch returns a SQL clause matching the given project column against
 // a normalized project identity; bind three copies of the identity (#79).
 // Rows written since #79 store the normalized primary-checkout path, so they
-// match exactly. Rows written before it keep their raw cwd — for repo
-// subdirectories and in-repo worktrees that raw path sits UNDER the normalized
-// root, so the prefix compare picks them up cheaply. A pre-#79 worktree
-// outside the repository root stays unmatched: normalization is applied at
-// write time going forward, never as a retroactive defrag.
+// match exactly. Rows written before it keep their raw cwd — for in-repo
+// Claude worktrees (<root>/.claude/worktrees/<x>, the fragmentation case #79
+// names) that raw path sits under the normalized root at a path only linked
+// worktrees of this repository occupy, so the prefix compare picks them up
+// cheaply.
+//
+// The prefix is deliberately NOT a bare "<root>/": a path under the root can
+// be its own repository (a nested checkout stores its own normalized identity
+// at init), and a bare-subtree prefix would leak that project's sessions and
+// memories into this one's index forever. Affinity never guesses: raw rows
+// outside the worktree prefix — repo subdirectories, worktrees outside the
+// root — stay unmatched, an accepted limit alongside the ones #79 names.
+// Normalization is applied at write time going forward, never as a
+// retroactive defrag.
+//
+// Comparison uses '/' — the separator every supported platform's hook writes
+// today. A legacy Windows-style row would simply stay unmatched (shape-only:
+// less content, never wrong content).
 func projectMatch(column string) string {
-	return fmt.Sprintf("(%[1]s = ? OR substr(%[1]s, 1, length(?) + 1) = ? || '/')", column)
+	return fmt.Sprintf("(%[1]s = ? OR substr(%[1]s, 1, length(?) + 19) = ? || '/.claude/worktrees/')", column)
 }
 
 // GetRecentProjectSessions returns the most recent sessions whose project
