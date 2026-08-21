@@ -115,6 +115,14 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 	// node twice.
 	surfacedURIs := make(map[string]bool)
 
+	// ledgerURIs mirrors the `shown` events recorded on this (real) injection
+	// path. The journal rows ride the buffered recorder and may still be
+	// pending when the first prompt hits the gate, so they are also claimed
+	// into the gate's synchronous in-memory ledger at the end of this render —
+	// otherwise the gate could re-inject a URI the tray just surfaced
+	// (#80, Codex round 2).
+	var ledgerURIs []string
+
 	// Relational profile (Working With You) — capped portion of budget.
 	// A retracted profile must not be injected: silently injecting retracted
 	// content into every future session would defeat the retraction. No
@@ -135,6 +143,7 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 		surfacedURIs[relProfile.URI] = true
 		if !preview {
 			s.events.record("shown", "tray", relProfile.URI, currentSessionID)
+			ledgerURIs = append(ledgerURIs, relProfile.URI)
 		}
 	}
 
@@ -176,6 +185,7 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 			used++
 			if !preview {
 				s.events.record("shown", "tray", p.URI, currentSessionID)
+				ledgerURIs = append(ledgerURIs, p.URI)
 			}
 		}
 		if section != pinnedHeader {
@@ -214,6 +224,7 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 				if !preview {
 					s.db.AdvanceRotation(m.URI)
 					s.events.record("shown", "moments", m.URI, currentSessionID)
+					ledgerURIs = append(ledgerURIs, m.URI)
 				}
 			}
 			b.WriteString(section)
@@ -281,6 +292,7 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 				for _, uri := range indexShown {
 					s.events.record("shown", "index", uri, currentSessionID)
 				}
+				ledgerURIs = append(ledgerURIs, indexShown...)
 			}
 		} else {
 			log.Printf("context: budget exhausted before memory index (%d chars left)", budget)
@@ -338,6 +350,13 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 		if err == nil && count > 0 {
 			b.WriteString(fmt.Sprintf("\n### Current Session\n%d tool uses recorded this session\n", count))
 		}
+	}
+
+	// Seed the gate's synchronous ledger with everything this render surfaced,
+	// so the async journal write can never race the session's first prompt
+	// into a double-injection (see ledgerURIs above).
+	if !preview && currentSessionID != "" && len(ledgerURIs) > 0 {
+		s.gateSessions.claim(currentSessionID, ledgerURIs)
 	}
 
 	b.WriteString("</context>")

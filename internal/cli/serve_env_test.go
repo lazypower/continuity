@@ -9,7 +9,7 @@ import (
 
 func clearServeEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{envServeDB, envServePort, envServeBind, envServeEmbedder, envServeExtractionAuto, envServeRelationalAuto} {
+	for _, k := range []string{envServeDB, envServePort, envServeBind, envServeEmbedder, envServeGate, envServeGateTau, envServeExtractionAuto, envServeRelationalAuto} {
 		t.Setenv(k, "")
 	}
 }
@@ -133,6 +133,52 @@ func TestNormalizeBackend_UnknownPassesThrough(t *testing.T) {
 	// warn on them rather than silently mis-selecting a known backend.
 	if got := normalizeBackend("openai"); got != "openai" {
 		t.Errorf("normalizeBackend(openai) = %q, want passthrough %q", got, "openai")
+	}
+}
+
+// The gate env override must fail fast on garbage and NEVER normalize an
+// unrecognized value into a mode — least of all "on" (#80).
+func TestApplyServeEnvOverrides_GateMode(t *testing.T) {
+	for _, in := range []string{"off", "shadow", "on", "ON", " Shadow "} {
+		clearServeEnv(t)
+		t.Setenv(envServeGate, in)
+		cfg := config.Default()
+		if err := applyServeEnvOverrides(&cfg); err != nil {
+			t.Errorf("%s=%q: unexpected error %v", envServeGate, in, err)
+			continue
+		}
+		want := strings.ToLower(strings.TrimSpace(in))
+		if cfg.Gate.Mode != want {
+			t.Errorf("%s=%q: Gate.Mode = %q, want %q", envServeGate, in, cfg.Gate.Mode, want)
+		}
+	}
+	for _, in := range []string{"yes", "true", "1", "inject", "onn"} {
+		clearServeEnv(t)
+		t.Setenv(envServeGate, in)
+		cfg := config.Default()
+		if err := applyServeEnvOverrides(&cfg); err == nil {
+			t.Errorf("%s=%q: expected refusal, got mode %q", envServeGate, in, cfg.Gate.Mode)
+		}
+	}
+}
+
+func TestApplyServeEnvOverrides_GateTau(t *testing.T) {
+	clearServeEnv(t)
+	t.Setenv(envServeGateTau, "0.55")
+	cfg := config.Default()
+	if err := applyServeEnvOverrides(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Gate.Tau != 0.55 {
+		t.Errorf("Gate.Tau = %v, want 0.55", cfg.Gate.Tau)
+	}
+	for _, in := range []string{"0", "-0.2", "1.5", "abc"} {
+		clearServeEnv(t)
+		t.Setenv(envServeGateTau, in)
+		cfg := config.Default()
+		if err := applyServeEnvOverrides(&cfg); err == nil {
+			t.Errorf("%s=%q: expected refusal, got tau %v", envServeGateTau, in, cfg.Gate.Tau)
+		}
 	}
 }
 

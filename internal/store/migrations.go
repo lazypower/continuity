@@ -370,6 +370,39 @@ UPDATE sessions SET last_active_at = COALESCE(
 CREATE INDEX idx_sessions_last_active ON sessions(status, last_active_at);
 `,
 	},
+	{
+		Version:     17,
+		Description: "gate_calibration: bounded per-prompt shadow log for the ADR-001 §4 prompt gate (#80)",
+		// Additive. One row per gated prompt: max cosine similarity, the top-k
+		// hits as JSON pointers (uri+sim only — never node payloads, never the
+		// prompt text), project and session attribution. This is calibration
+		// telemetry, not the §5 surfacing journal: shadow-mode hits are shown
+		// to nobody, so writing them as `shown` events would corrupt the
+		// used-given-shown denominator at birth.
+		//
+		// Retention rule (#72: telemetry must never outgrow the corpus it
+		// measures): the table is bounded AT WRITE TIME — every insert ages out
+		// rows older than gateCalibrationMaxAge and trims to the newest
+		// gateCalibrationMaxRows (store/gate.go). No background sweeper, no
+		// unbounded growth window between sweeps.
+		//
+		// idx_events_session serves the gate's dedupe ledger: "which URIs were
+		// already shown this session" was a full-table scan without it, on the
+		// synchronous prompt path.
+		SQL: `
+CREATE TABLE gate_calibration (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT    NOT NULL DEFAULT '',
+    project      TEXT    NOT NULL DEFAULT '',
+    prompt_chars INTEGER NOT NULL DEFAULT 0,
+    max_sim      REAL    NOT NULL DEFAULT 0,
+    top_hits     TEXT    NOT NULL DEFAULT '[]',
+    created_at   INTEGER NOT NULL
+);
+CREATE INDEX idx_gate_calibration_created ON gate_calibration(created_at);
+CREATE INDEX idx_events_session ON mem_events(session_id, event);
+`,
+	},
 }
 
 // headVersion is the highest schema version this binary knows how to apply.

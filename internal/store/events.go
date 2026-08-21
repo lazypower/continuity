@@ -63,6 +63,36 @@ func (db *DB) EventsByURI(uri string) ([]MemEvent, error) {
 	return events, rows.Err()
 }
 
+// ShownURIsForSession returns the set of node URIs already journaled as
+// `shown` to the given session, across every surface (tray, index, moments,
+// search, gate). This is the durable half of the prompt gate's dedupe ledger
+// (#80): a URI the session has already seen must not be injected again.
+// Served by idx_events_session — the gate reads this on the synchronous
+// prompt path, so it must not scan.
+func (db *DB) ShownURIsForSession(sessionID string) (map[string]bool, error) {
+	if sessionID == "" {
+		return map[string]bool{}, nil
+	}
+	rows, err := db.Query(`
+		SELECT DISTINCT node_uri FROM mem_events
+		WHERE session_id = ? AND event = 'shown'
+	`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("shown uris for session: %w", err)
+	}
+	defer rows.Close()
+
+	uris := make(map[string]bool)
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			return nil, fmt.Errorf("scan shown uri: %w", err)
+		}
+		uris[u] = true
+	}
+	return uris, rows.Err()
+}
+
 // CountEvents returns how many events match the given event name ("" = all).
 // Inspection/test helper.
 func (db *DB) CountEvents(event string) (int, error) {

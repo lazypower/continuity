@@ -36,6 +36,15 @@ const (
 	// extraction (default off). Accepts any strconv.ParseBool value.
 	envServeExtractionAuto = "CONTINUITY_EXTRACTION_AUTO"
 
+	// envServeGate overrides [gate].mode: "off" | "shadow" (default) | "on"
+	// (#80). Unlike CONTINUITY_GC's silent fallback, an unrecognized value
+	// refuses to start: the operator explicitly reached for the knob, and the
+	// difference between what they typed and what they got is whether memory
+	// text is injected into their prompts.
+	envServeGate = "CONTINUITY_GATE"
+	// envServeGateTau overrides [gate].tau: a float in (0, 1]. Anything else
+	// refuses to start, same posture as CONTINUITY_PORT.
+	envServeGateTau = "CONTINUITY_GATE_TAU"
 	// envServeRelationalAuto is the kill switch for automatic relational
 	// profiling at session end (default on; #78). Accepts any strconv.ParseBool
 	// value. Setting it false restores the pre-#78 behavior: non-force /extract
@@ -171,6 +180,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	srv := server.New(db, eng, VersionString())
 	srv.SetAutoExtraction(cfg.Extraction.Auto)
+	srv.SetGate(cfg.Gate.Mode, cfg.Gate.Tau)
+	switch config.NormalizedGateMode(cfg.Gate.Mode) {
+	case config.GateOn:
+		// Injection is an explicit opt-in that changes what rides the user's
+		// prompts — say so at startup, like extraction.auto does.
+		fmt.Fprintf(os.Stderr, "  ! gate mode ON — prompt-gate hits at or above τ=%.2f are injected; "+
+			"shadow (log-only) is the default\n", cfg.Gate.Tau)
+	case config.GateShadow:
+		fmt.Fprintln(os.Stderr, "  gate: shadow (calibration logging only, no injection)")
+	}
 	srv.SetRelationalAuto(cfg.Extraction.RelationalAuto)
 	if !cfg.Extraction.RelationalAuto {
 		fmt.Fprintf(os.Stderr,
@@ -316,6 +335,21 @@ func applyServeEnvOverrides(cfg *config.Config) error {
 			return fmt.Errorf("%s=%q: must be a boolean (true/false/1/0)", envServeExtractionAuto, v)
 		}
 		cfg.Extraction.Auto = enabled
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv(envServeGate))); v != "" {
+		// Fail fast on garbage rather than normalizing it: a typo here must
+		// surface, not silently pick a mode for the operator (#80).
+		if v != config.GateOff && v != config.GateShadow && v != config.GateOn {
+			return fmt.Errorf("%s=%q: must be one of off, shadow, on", envServeGate, v)
+		}
+		cfg.Gate.Mode = v
+	}
+	if v := strings.TrimSpace(os.Getenv(envServeGateTau)); v != "" {
+		tau, err := strconv.ParseFloat(v, 64)
+		if err != nil || tau <= 0 || tau > 1 {
+			return fmt.Errorf("%s=%q: must be a number in (0, 1]", envServeGateTau, v)
+		}
+		cfg.Gate.Tau = tau
 	}
 	if v := strings.TrimSpace(os.Getenv(envServeRelationalAuto)); v != "" {
 		enabled, err := strconv.ParseBool(v)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -27,8 +28,8 @@ func Path() (string, error) {
 // dependency in go.mod and this project's guardrails forbid adding one for a
 // single scalar field. LoadFile below reads exactly the subset of TOML this
 // project actually writes (a flat `[section]` header followed by `key =
-// "value"` or `key = bool` lines, one section deep, string/bool scalars
-// only) — sufficient for every field Config declares today. If config.toml
+// "value"` or `key = bool` lines, one section deep, string/bool/number
+// scalars only) — sufficient for every field Config declares today. If config.toml
 // ever needs richer TOML (arrays, nested tables, multi-line strings), that is
 // the trigger to reconsider a real TOML library rather than extending this
 // further.
@@ -134,6 +135,20 @@ func applyKV(cfg *Config, section, key, val string) {
 	case "embedder":
 		if key == "backend" {
 			cfg.Embedder.Backend = val
+		}
+	case "gate":
+		switch key {
+		case "mode":
+			// Only the three canonical values are accepted; anything else keeps
+			// the shadow default. Injection cannot be enabled by a typo (#80).
+			cfg.Gate.Mode = NormalizedGateMode(strings.ToLower(val))
+		case "tau":
+			// Out-of-range or unparsable tau keeps the calibrated default —
+			// same silent-ignore posture as [server].port, and a garbage
+			// threshold must never widen the gate (#80).
+			if f, err := strconv.ParseFloat(val, 64); err == nil && f > 0 && f <= 1 {
+				cfg.Gate.Tau = f
+			}
 		}
 	}
 }

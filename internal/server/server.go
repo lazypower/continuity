@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/lazypower/continuity/internal/buildinfo"
+	"github.com/lazypower/continuity/internal/config"
 	"github.com/lazypower/continuity/internal/engine"
 	"github.com/lazypower/continuity/internal/store"
 )
@@ -34,6 +35,16 @@ type Server struct {
 	// runJob executes one queued job. Defaults to runExtractionJob (needs a live
 	// engine); overridable in tests to drive the drain loop without an LLM.
 	runJob func(*store.ExtractionJob) error
+
+	// Prompt gate state (ADR-001 §4, #80). gateMode is one of the
+	// config.Gate* values; the zero value resolves to shadow via
+	// config.NormalizedGateMode, so a server constructed without SetGate can
+	// log calibration but can never inject. gateTau is the injection
+	// threshold for mode "on". gateSessions is the synchronous half of the
+	// per-session dedupe ledger — see gateLedger.
+	gateMode     string
+	gateTau      float64
+	gateSessions *gateLedger
 
 	// autoExtract gates automatic session-end extraction. Default false: the
 	// Stop/SessionEnd hooks POST /extract with force=false, and handleExtractSession
@@ -63,6 +74,10 @@ func New(db *store.DB, eng *engine.Engine, version string) *Server {
 		started: time.Now(),
 		events:  newEventRecorder(db),
 
+		gateMode:     config.GateShadow,
+		gateTau:      config.DefaultGateTau,
+		gateSessions: newGateLedger(),
+
 		extractWake: make(chan struct{}, 1),
 		extractStop: make(chan struct{}),
 		extractDone: make(chan struct{}),
@@ -84,6 +99,17 @@ func New(db *store.DB, eng *engine.Engine, version string) *Server {
 // while `continuity extract --force` and the signal path remain available.
 // See config.ExtractionConfig for the deprecation rationale.
 func (s *Server) SetAutoExtraction(enabled bool) { s.autoExtract = enabled }
+
+// SetGate configures the prompt gate (#80). mode is normalized: only the
+// literal "on" enables injection, only the literal "off" disables the gate,
+// and everything else — including garbage — is shadow. tau outside (0, 1]
+// keeps the calibrated default rather than widening or closing the gate.
+func (s *Server) SetGate(mode string, tau float64) {
+	s.gateMode = config.NormalizedGateMode(mode)
+	if tau > 0 && tau <= 1 {
+		s.gateTau = tau
+	}
+}
 
 // SetRelationalAuto toggles automatic relational profiling at session end
 // (default on; #78). When false, non-force /extract requests with autoExtract
@@ -129,6 +155,10 @@ func (s *Server) routes() {
 
 		// Phase 4: signal keywords
 		r.Post("/sessions/{sessionID}/signal", s.handleSignal)
+
+		// Prompt gate (ADR-001 §4, #80): shadow-mode calibration + flagged
+		// injection. Its own route so the hook can give it its own budget.
+		r.Post("/gate", s.handleGate)
 
 		// Phase 3: retrieval routes
 		r.Get("/search", s.handleSearch)

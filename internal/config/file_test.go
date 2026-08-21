@@ -50,6 +50,54 @@ func TestLoadFile_DefaultBackendIsAuto(t *testing.T) {
 	}
 }
 
+// [gate] parsing (#80): only the three canonical modes are accepted, a typo
+// resolves to the shadow default and can NEVER enable injection, and a
+// garbage tau keeps the calibrated default.
+func TestLoadFile_GateSection(t *testing.T) {
+	cases := []struct {
+		name, content, wantMode string
+		wantTau                 float64
+	}{
+		{"explicit on", "[gate]\nmode = \"on\"\ntau = 0.55\n", GateOn, 0.55},
+		{"explicit off", "[gate]\nmode = \"off\"\n", GateOff, DefaultGateTau},
+		{"typo mode falls back to shadow", "[gate]\nmode = \"onn\"\n", GateShadow, DefaultGateTau},
+		{"quoted tau parses", "[gate]\ntau = \"0.6\"\n", GateShadow, 0.6},
+		{"tau out of range keeps default", "[gate]\ntau = 1.5\n", GateShadow, DefaultGateTau},
+		{"tau garbage keeps default", "[gate]\ntau = \"lots\"\n", GateShadow, DefaultGateTau},
+		{"absent section keeps defaults", "[server]\nbind = \"0.0.0.0\"\n", GateShadow, DefaultGateTau},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadFile(path)
+			if err != nil {
+				t.Fatalf("LoadFile: %v", err)
+			}
+			if cfg.Gate.Mode != tc.wantMode {
+				t.Errorf("Gate.Mode = %q, want %q", cfg.Gate.Mode, tc.wantMode)
+			}
+			if cfg.Gate.Tau != tc.wantTau {
+				t.Errorf("Gate.Tau = %v, want %v", cfg.Gate.Tau, tc.wantTau)
+			}
+		})
+	}
+}
+
+func TestNormalizedGateMode(t *testing.T) {
+	cases := map[string]string{
+		"off": GateOff, "on": GateOn, "shadow": GateShadow,
+		"": GateShadow, "ON": GateShadow, "inject": GateShadow, "true": GateShadow,
+	}
+	for in, want := range cases {
+		if got := NormalizedGateMode(in); got != want {
+			t.Errorf("NormalizedGateMode(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestLoadFile_RelationalAuto (#78): relational profiling defaults on and is
 // disableable via [extraction] relational_auto = false.
 func TestLoadFile_RelationalAuto(t *testing.T) {
