@@ -242,11 +242,19 @@ func (db *DB) UpsertNode(node *MemNode) error {
 
 	if existing.Mergeable {
 		// Skip if new content is near-identical to existing (avoid churn).
-		// Log the skip: a mergeable update that re-states most of its content
-		// while adding one orthogonal observation is discarded here, and for the
-		// relational profile a silent refusal to learn is a real failure mode
-		// (H4 in the fresh-eyes audit). Visibility, not a behavior change.
-		if textNearIdentical(existing.L1Overview, node.L1Overview) &&
+		//
+		// System-owned URIs bypass the skip (#78, closing H4): the relational
+		// profile legitimately restates >95% of its prior content while adding one
+		// orthogonal observation, and refusing that write silently freezes
+		// learning. Its write path carries its own churn guards upstream
+		// (NO_UPDATE signal, meta-phrase rejection, per-session dedup in
+		// extractRelational), so the store-level skip is redundant there — and
+		// systemOwnedURIs is already the one authority for "continuity synthesizes
+		// and owns this node", which is exactly the set whose writers self-police.
+		// Arbitrary mergeable categories keep the skip; extraction re-emitting the
+		// same memory each session has no upstream dedup.
+		if !systemOwnedURIs[existing.URI] &&
+			textNearIdentical(existing.L1Overview, node.L1Overview) &&
 			textNearIdentical(existing.L0Abstract, node.L0Abstract) {
 			log.Printf("upsert: skipped near-identical merge for %s (L1 %d→%d chars, L0 %d→%d)",
 				existing.URI, len(existing.L1Overview), len(node.L1Overview),

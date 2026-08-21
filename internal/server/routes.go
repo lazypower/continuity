@@ -159,9 +159,30 @@ func (s *Server) handleExtractSession(w http.ResponseWriter, r *http.Request) {
 	// transcript-inference path stays off. An explicit `continuity extract --force`
 	// (force=true) is the manual override and still runs. The signal ("remember
 	// this") path is a separate endpoint and unaffected.
+	//
+	// Relational profiling is decoupled from that gate (#78): it merges into a
+	// single system-owned node, never creates arbitrary memories, and its
+	// provenance is unambiguous — so a relational-only job is enqueued here
+	// instead of freezing the profile with the rest of the pipeline.
+	// CONTINUITY_RELATIONAL_AUTO=false (SetRelationalAuto) restores the full skip.
 	if !s.autoExtract && !req.Force {
+		resp := map[string]string{"status": StatusExtractionDisabled}
+		if s.relationalAuto && req.TranscriptPath != "" {
+			if err := s.db.EnqueueExtraction(sessionID, "relational", req.TranscriptPath, false); err != nil {
+				// Non-fatal: memory extraction was skipped either way; the profile
+				// update is lost for this session only, and loudly — both in the
+				// server log AND in the response, so the CLI can tell the user
+				// instead of reporting the plain disabled status as if nothing
+				// was expected to happen.
+				log.Printf("enqueue relational extraction for %s: %v", sessionID, err)
+				resp["relational"] = "error"
+			} else {
+				s.wakeExtractionWorker()
+				resp["relational"] = "extracting"
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
-		encodeJSON(w, map[string]string{"status": StatusExtractionDisabled})
+		encodeJSON(w, resp)
 		return
 	}
 

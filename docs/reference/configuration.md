@@ -79,11 +79,20 @@ inherit your login `PATH`. Re-running `continuity install-service` bakes a usabl
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `auto` | boolean | `false` | Automatic session-end extraction: the Stop/SessionEnd hooks asking an LLM to infer memories from the whole transcript. |
+| `relational_auto` | boolean | `true` | Automatic relational profiling at session end: analyzing how you work and merging the result into the single profile node. Independent of `auto`. |
 
-Off by default on purpose. When you turn it on, `serve` prints a warning at
-startup saying so. Explicit `remember` calls, the signal-phrase path, and
-`continuity extract --force` are unaffected either way. Booleans are read
+`auto` is off by default on purpose. When you turn it on, `serve` prints a
+warning at startup saying so. Explicit `remember` calls, the signal-phrase path,
+and `continuity extract --force` are unaffected either way. Booleans are read
 loosely — `true`, `1`, and `yes` all mean on; anything else means off.
+
+`relational_auto` is on by default: unlike transcript extraction it never
+creates arbitrary memories — it only merges into the system-owned
+`mem://user/profile/communication` node, and its provenance is unambiguous
+(analysis of the session, not facts transiting it). Turning it off freezes the
+relational profile — including relational jobs already sitting in the durable
+queue, which are dropped rather than replayed — and `serve` prints a warning at
+startup saying so.
 
 ### `[embedder]`
 
@@ -134,6 +143,7 @@ unmodified. Turning `mode` to `on` prints a startup notice, like
 | `CONTINUITY_URL` | — | *(built from bind + port)* | Full base URL, e.g. `http://127.0.0.1:37777`. **Client-side only** — the CLI, hooks, and MCP server use it to find the server. It does not change what `serve` binds to. |
 | `CONTINUITY_EMBEDDER` | `[embedder].backend` | *(no override)* | `auto`, `model2vec`, `ollama`, `tfidf`, `hashtf`, `none`, or empty. Unrecognized values warn and fall back to `auto`. |
 | `CONTINUITY_EXTRACTION_AUTO` | `[extraction].auto` | `false` | Any Go boolean: `true`, `false`, `1`, `0`, `t`, `f`. `serve` **refuses to start** on anything else. |
+| `CONTINUITY_RELATIONAL_AUTO` | `[extraction].relational_auto` | `true` | Any Go boolean. `serve` **refuses to start** on anything else. `false` freezes the relational profile. |
 | `CONTINUITY_OBSERVATION_RETENTION_DAYS` | — | `14` days | A positive integer number of days, or `off` / `false` to disable pruning. See [below](#observation-retention). |
 | `ANTHROPIC_API_KEY` | `[llm].provider` **and** `[llm].anthropic_key` | *(unset)* | An API key. Setting it forces `provider = "anthropic"`, overriding whatever `config.toml` says. |
 | `CONTINUITY_GC` | — | `off` | `off`, `shadow`, `on`. Memory garbage collection. Anything unrecognized is treated as `off`. **Advanced.** |
@@ -287,6 +297,7 @@ anthropic_key = ""
 
 [extraction]
 auto = false
+relational_auto = true
 
 [embedder]
 backend = "auto"

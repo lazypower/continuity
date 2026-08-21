@@ -45,6 +45,11 @@ const (
 	// envServeGateTau overrides [gate].tau: a float in (0, 1]. Anything else
 	// refuses to start, same posture as CONTINUITY_PORT.
 	envServeGateTau = "CONTINUITY_GATE_TAU"
+	// envServeRelationalAuto is the kill switch for automatic relational
+	// profiling at session end (default on; #78). Accepts any strconv.ParseBool
+	// value. Setting it false restores the pre-#78 behavior: non-force /extract
+	// requests are skipped entirely while autoExtract is off.
+	envServeRelationalAuto = "CONTINUITY_RELATIONAL_AUTO"
 )
 
 // tfidfLexicalNotice is surfaced once at startup whenever the hashed lexical
@@ -184,6 +189,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 			"shadow (log-only) is the default\n", cfg.Gate.Tau)
 	case config.GateShadow:
 		fmt.Fprintln(os.Stderr, "  gate: shadow (calibration logging only, no injection)")
+	}
+	srv.SetRelationalAuto(cfg.Extraction.RelationalAuto)
+	if !cfg.Extraction.RelationalAuto {
+		fmt.Fprintf(os.Stderr,
+			"  ! extraction.relational_auto DISABLED — the relational profile will not "+
+				"update from session ends. Unset %s to return to the default.\n",
+			envServeRelationalAuto)
 	}
 	if cfg.Extraction.Auto {
 		fmt.Fprintf(os.Stderr,
@@ -338,6 +350,13 @@ func applyServeEnvOverrides(cfg *config.Config) error {
 			return fmt.Errorf("%s=%q: must be a number in (0, 1]", envServeGateTau, v)
 		}
 		cfg.Gate.Tau = tau
+	}
+	if v := strings.TrimSpace(os.Getenv(envServeRelationalAuto)); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("%s=%q: must be a boolean (true/false/1/0)", envServeRelationalAuto, v)
+		}
+		cfg.Extraction.RelationalAuto = enabled
 	}
 	return nil
 }

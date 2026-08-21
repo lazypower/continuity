@@ -90,6 +90,66 @@ func TestUpsertNode_SkipsNearIdentical(t *testing.T) {
 	}
 }
 
+// TestUpsertNode_SystemOwnedBypassesNearIdenticalSkip (#78, H4 residue): the
+// relational profile legitimately restates almost all of its prior content
+// while adding one orthogonal observation — >95% bigram-similar, so the churn
+// skip would silently discard the learning. System-owned URIs bypass the skip;
+// their writers carry their own churn guards (see extractRelational).
+func TestUpsertNode_SystemOwnedBypassesNearIdenticalSkip(t *testing.T) {
+	db := testDB(t)
+
+	base := "## 1. FEEDBACK CALIBRATION\n" +
+		"User gives direct, specific feedback and expects the agent to act on it immediately.\n\n" +
+		"## 2. WORKING DYNAMIC\n" +
+		"Prefers high-level direction with autonomous execution; reviews results rather than steps.\n\n" +
+		"## 3. CORRECTIONS RECEIVED\n" +
+		"- Always use WAL mode for SQLite\n" +
+		"- Prefer the standard library where possible\n"
+
+	original := &MemNode{
+		URI:           "mem://user/profile/communication",
+		NodeType:      "leaf",
+		Category:      "profile",
+		L0Abstract:    "Relational profile: communication style, feedback patterns, working dynamic",
+		L1Overview:    base,
+		L2Content:     base,
+		SourceSession: "sess-001",
+	}
+	if err := db.CreateNode(original); err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+
+	// Restated profile plus one new observation: identical L0 (it is a constant
+	// on this node) and >95%-similar L1.
+	restated := base + "- Fence identifiers in backticks\n"
+	if !textNearIdentical(base, restated) {
+		t.Fatal("test precondition: restated profile must be near-identical to the base")
+	}
+	update := &MemNode{
+		URI:           "mem://user/profile/communication",
+		NodeType:      "leaf",
+		Category:      "profile",
+		L0Abstract:    original.L0Abstract,
+		L1Overview:    restated,
+		L2Content:     restated,
+		SourceSession: "sess-002",
+	}
+	if err := db.UpsertNode(update); err != nil {
+		t.Fatalf("UpsertNode: %v", err)
+	}
+
+	node, err := db.GetNodeByURI("mem://user/profile/communication")
+	if err != nil {
+		t.Fatalf("GetNodeByURI: %v", err)
+	}
+	if node.L1Overview != restated {
+		t.Error("system-owned near-identical update must persist, not be skipped")
+	}
+	if node.SourceSession != "sess-002" {
+		t.Errorf("source_session = %q, want sess-002", node.SourceSession)
+	}
+}
+
 func TestUpsertNode_AllowsMeaningfulUpdate(t *testing.T) {
 	db := testDB(t)
 

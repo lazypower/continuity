@@ -180,6 +180,61 @@ User trusts agent with code generation and architectural decisions.`
 	}
 }
 
+// TestExtractRelationalOnlyThenForceDoesNotDoubleApply (#78): a relational-only
+// job followed by `extract --force` on the same session must not re-apply the
+// profile update — extractRelational's source-session guard holds inside the
+// forced full pipeline too.
+func TestExtractRelationalOnlyThenForceDoesNotDoubleApply(t *testing.T) {
+	db := testDB(t)
+	transcriptPath := makeTranscript(t)
+	if _, err := db.InitSession("rel-idem", "proj"); err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
+
+	relationalResp := `## 1. FEEDBACK CALIBRATION
+Direct feedback style, specific and immediate.
+
+## 2. WORKING DYNAMIC
+Autonomous execution preferred, reviews results.`
+	relMock := &llm.MockClient{Response: &llm.Response{Content: relationalResp, Provider: "mock"}}
+	relEng := New(db, relMock)
+
+	// Relational-only job: profile written, session NOT marked extracted.
+	if err := relEng.ExtractRelational("rel-idem", transcriptPath); err != nil {
+		t.Fatalf("ExtractRelational: %v", err)
+	}
+	first, err := db.GetNodeByURI(relationalURI)
+	if err != nil || first == nil {
+		t.Fatalf("expected profile node, err=%v", err)
+	}
+	if sess, _ := db.GetSession("rel-idem"); sess.ExtractedAt != nil {
+		t.Fatal("relational-only run must not mark the session extracted")
+	}
+
+	// Forced full extraction on the same session: memory extraction runs, but the
+	// relational leg skips before its LLM call (source-session dedup).
+	// Three responses so callIdx distinguishes 2 calls from 3: a relational leg
+	// that failed to dedup would consume the third slot.
+	multiMock := &multiResponseMock{responses: []*llm.Response{
+		{Content: `[{"category":"preferences","uri_hint":"go-style","l0":"Uses Go with minimal deps","l1":"Prefers Go with minimal dependencies and clean architecture","l2":"Full"}]`, Provider: "mock"},
+		{Content: "concise, collaborative", Provider: "mock"}, // tone
+		{Content: "unreached", Provider: "mock"},
+	}}
+	forceEng := New(db, multiMock)
+	if err := forceEng.ExtractSessionForce("rel-idem", transcriptPath); err != nil {
+		t.Fatalf("ExtractSessionForce: %v", err)
+	}
+
+	// Two LLM calls only: memory extraction + tone. Zero for relational.
+	if multiMock.callIdx != 2 {
+		t.Errorf("LLM calls = %d, want 2 (relational must dedup)", multiMock.callIdx)
+	}
+	second, _ := db.GetNodeByURI(relationalURI)
+	if second.L1Overview != first.L1Overview || second.SourceSession != first.SourceSession {
+		t.Error("profile changed on forced re-extraction of the same session")
+	}
+}
+
 func TestExtractRelationalDedup(t *testing.T) {
 	db := testDB(t)
 

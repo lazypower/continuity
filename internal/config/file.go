@@ -126,8 +126,11 @@ func applyKV(cfg *Config, section, key, val string) {
 			cfg.LLM.AnthropicKey = val
 		}
 	case "extraction":
-		if key == "auto" {
+		switch key {
+		case "auto":
 			cfg.Extraction.Auto = parseBoolLoose(val)
+		case "relational_auto":
+			cfg.Extraction.RelationalAuto = parseBoolLoose(val)
 		}
 	case "embedder":
 		if key == "backend" {

@@ -46,6 +46,14 @@ type ExtractionConfig struct {
 	// way. Explicit `continuity remember`, the signal ("remember this") path, and
 	// `continuity extract --force` (the manual override) are all unaffected.
 	Auto bool `toml:"auto"`
+
+	// RelationalAuto enables automatic relational profiling at session end. It
+	// defaults to ON, deliberately decoupled from Auto (#78): unlike transcript
+	// memory extraction, relational profiling merges into a single system-owned
+	// node (mem://user/profile/communication), never creates arbitrary memories,
+	// and its provenance is unambiguous — analysis of the session, not facts
+	// transiting it. CONTINUITY_RELATIONAL_AUTO=false is the kill switch.
+	RelationalAuto bool `toml:"relational_auto"`
 }
 
 // EmbedderConfig governs which embedding backend `serve` constructs.
@@ -125,6 +133,8 @@ func Default() Config {
 		Extraction: ExtractionConfig{
 			// Auto session extraction is off by default (deprecated, high-noise).
 			Auto: false,
+			// Relational profiling stays on by default (#78).
+			RelationalAuto: true,
 		},
 		Embedder: EmbedderConfig{
 			Backend: "auto",
