@@ -18,6 +18,10 @@ import (
 // is abandoned, and loudly. Losing a memory is worse than a lingering queue row.
 const maxExtractionAttempts = 20
 
+// vectorFreeJobKinds are the job kinds that never read or write vectors, so they
+// may run while the corpus vector identity is locked.
+var vectorFreeJobKinds = []string{"relational"}
+
 // extractionRetryInterval is the safety-net cadence. It replays jobs a crash
 // left behind and retries transient failures even when no new enqueue arrives to
 // wake the worker.
@@ -55,15 +59,19 @@ func (s *Server) extractionLoop() {
 // attempts and ends the pass so the ticker retries later (no tight spin), and a
 // job that exhausts maxExtractionAttempts is dropped with a loud log.
 func (s *Server) drainExtractionQueue() {
-	// If the corpus vector identity is locked, extraction is DEFERRED, not failed:
-	// the engine returns nil in that state (see ExtractSignal / extractSession),
-	// which we must not treat as "done" — deleting the row would lose the capture.
-	// Skip the whole pass; the operator repairs and the ticker retries. Guarded on
-	// a live engine (tests inject runJob with a nil engine).
+	// If the corpus vector identity is locked, session and signal extraction are
+	// DEFERRED, not failed: the engine returns nil in that state (see ExtractSignal
+	// / extractSession), which we must not treat as "done" — deleting the row
+	// would lose the capture. Those kinds wait for the operator's repair.
+	// Relational jobs never touch vectors (an LLM merge into the fixed profile
+	// node), so they keep draining, and the relational kill switch keeps
+	// applying to them. Guarded on a live engine (tests inject runJob with a nil
+	// engine).
+	var kinds []string
 	if s.engine != nil {
 		if locked, _ := s.engine.VectorIdentityLocked(); locked {
-			log.Printf("extraction worker: vector identity locked — deferring drain (run `continuity doctor --repair-vectors`)")
-			return
+			log.Printf("extraction worker: vector identity locked — deferring session and signal jobs (run `continuity doctor --repair-vectors`)")
+			kinds = vectorFreeJobKinds
 		}
 	}
 
@@ -74,7 +82,7 @@ func (s *Server) drainExtractionQueue() {
 		default:
 		}
 
-		job, err := s.db.NextExtraction(maxExtractionAttempts)
+		job, err := s.db.NextExtraction(maxExtractionAttempts, kinds...)
 		if err != nil {
 			log.Printf("extraction worker: read queue: %v", err)
 			return

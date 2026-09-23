@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -42,15 +43,24 @@ func (db *DB) EnqueueExtraction(sessionID, kind, payload string, force bool) err
 // inspection/replay instead of silently losing the capture. Ordering prefers
 // fewer-failed then older jobs so a repeatedly-failing job cannot head-of-line-
 // block fresh work.
-func (db *DB) NextExtraction(maxAttempts int) (*ExtractionJob, error) {
+//
+// kinds, when given, restricts selection to those job kinds; the worker uses it
+// to keep draining work that is safe while other kinds are deferred.
+func (db *DB) NextExtraction(maxAttempts int, kinds ...string) (*ExtractionJob, error) {
+	query := `SELECT id, session_id, kind, payload, force, attempts
+		 FROM extraction_queue WHERE attempts < ?`
+	args := []any{maxAttempts}
+	if len(kinds) > 0 {
+		query += ` AND kind IN (?` + strings.Repeat(`, ?`, len(kinds)-1) + `)`
+		for _, k := range kinds {
+			args = append(args, k)
+		}
+	}
+	query += ` ORDER BY attempts ASC, id ASC LIMIT 1`
+
 	var j ExtractionJob
 	var force int
-	err := db.QueryRow(
-		`SELECT id, session_id, kind, payload, force, attempts
-		 FROM extraction_queue WHERE attempts < ?
-		 ORDER BY attempts ASC, id ASC LIMIT 1`,
-		maxAttempts,
-	).Scan(&j.ID, &j.SessionID, &j.Kind, &j.Payload, &force, &j.Attempts)
+	err := db.QueryRow(query, args...).Scan(&j.ID, &j.SessionID, &j.Kind, &j.Payload, &force, &j.Attempts)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

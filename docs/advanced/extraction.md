@@ -108,13 +108,17 @@ be on a volume that comes back.
 ### The locked-identity deferral
 
 Before draining anything, the worker checks whether the corpus vector identity
-is locked. If it is, the **entire pass is skipped**.
+is locked. If it is, **`session` and `signal` jobs are skipped** for the pass.
 
 This is subtler than it looks. While locked, `ExtractSignal` and
 `extractSession` return `nil` — they defer rather than fail, because the
 retraction-resurrection gate cannot run. A `nil` return means success to the
-drain loop, which would delete the row and lose the capture. Skipping the pass
-outright is what keeps the queued work alive until the operator repairs. See
+drain loop, which would delete the row and lose the capture. Not selecting those
+kinds at all is what keeps the queued work alive until the operator repairs.
+
+`relational` jobs keep draining while locked. They are an LLM merge into the
+fixed profile node and never read or write vectors, so the lock has nothing to
+protect there, and holding them would let their transcripts expire. See
 [Vector identity](vector-identity.md).
 
 ### Shutdown
