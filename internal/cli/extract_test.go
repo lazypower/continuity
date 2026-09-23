@@ -206,3 +206,32 @@ func TestValidateSessionIDForGlob(t *testing.T) {
 		})
 	}
 }
+
+// A relative --transcript is resolved against the CLI's directory before it is
+// sent: the daemon opens the path from its own working directory.
+func TestExtractCLISendsAbsoluteTranscriptPath(t *testing.T) {
+	db := extractTestServer(t)
+	db.InitSession("cli-rel", "proj")
+	path := writeDummyTranscript(t)
+	t.Chdir(filepath.Dir(path))
+
+	resetExtractFlags()
+	extractTranscript = filepath.Base(path)
+	extractForce = true
+
+	if _, err := captureStdout(t, func() error {
+		return runExtract(extractCmd, []string{"cli-rel"})
+	}); err != nil {
+		t.Fatalf("runExtract: %v", err)
+	}
+	job, err := db.NextExtraction(20)
+	if err != nil || job == nil {
+		t.Fatalf("no queued job: %v", err)
+	}
+	if !filepath.IsAbs(job.Payload) {
+		t.Fatalf("queued transcript path %q is relative", job.Payload)
+	}
+	if _, err := os.Stat(job.Payload); err != nil {
+		t.Fatalf("queued path does not resolve: %v", err)
+	}
+}

@@ -63,6 +63,7 @@ No parameters. Always returns `200` — including when the database ping fails, 
   "gc_mode": "off",
   "gc_reclaimable": 0,
   "pending_extractions": 11,
+  "parked_extractions": 0,
   "pid": 32221,
   "schema_current": 16,
   "schema_head": 16,
@@ -86,7 +87,8 @@ No parameters. Always returns `200` — including when the database ping fails, 
 | `api_version` | number | HTTP contract version of the running server. Compared against the client's build to detect a stale daemon after an upgrade. |
 | `schema_head` | number | Highest schema migration the running binary knows about. |
 | `schema_current` | number | Schema migration actually applied to the open database. Lower than `schema_head` means migrations have not run; `0` can also mean the version could not be read. |
-| `pending_extractions` | number | Jobs sitting in the durable extraction queue. A number that only grows means the worker is wedged or no LLM is configured. |
+| `pending_extractions` | number | Jobs in the durable extraction queue that the worker will still run. A number that only grows means the worker is wedged or no LLM is configured. |
+| `parked_extractions` | number | Jobs that exhausted their retries, or whose transcript does not exist. Kept in the queue for inspection, never retried automatically. |
 | `gc_mode` | string | Memory garbage collection: `"off"` (default), `"shadow"` (log candidates, delete nothing), or `"on"`. Always `"off"` when no engine is configured. **Advanced** |
 | `gc_reclaimable` | number | Memories GC would consider dead weight. Only measured when `gc_mode` is not `"off"`; otherwise `0`. **Advanced** |
 | `spent_observations` | number | Raw tool-use records that observation retention could reclaim. Cached from the last retention sweep (which runs at boot and then every 24h), not measured per request — so it can be a few hours stale. When retention is disabled it still reports what the *default* policy would reclaim, so the pile stays visible. Feed this into `POST /api/prune`. |

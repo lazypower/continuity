@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"os"
@@ -36,7 +37,6 @@ func (s *Server) StartExtractionWorker() {
 
 func (s *Server) extractionLoop() {
 	defer close(s.extractDone)
-	s.dropParkedWithoutTranscript()
 	ticker := time.NewTicker(extractionRetryInterval)
 	defer ticker.Stop()
 	for {
@@ -84,6 +84,15 @@ func (s *Server) drainExtractionQueue() {
 		}
 
 		if err := s.runJob(job); err != nil {
+			if errors.Is(err, errTranscriptGone) {
+				if parkErr := s.db.ParkExtraction(job.ID, maxExtractionAttempts); parkErr != nil {
+					log.Printf("extraction worker: %v", parkErr)
+					return
+				}
+				log.Printf("extraction worker: PARKING %s job for %s — %v; kept in queue, NOT captured",
+					job.Kind, job.SessionID, err)
+				continue // parking is not a failure of the pass; later jobs still run
+			}
 			attempts, bumpErr := s.db.BumpExtractionAttempts(job.ID)
 			if bumpErr != nil {
 				log.Printf("extraction worker: %v", bumpErr)
@@ -117,53 +126,29 @@ func (s *Server) drainExtractionQueue() {
 	}
 }
 
-// transcriptGone reports whether a transcript-backed job (session, relational)
-// points at a file that no longer exists. Claude Code deletes transcripts on
-// its own schedule, and some sessions reach Stop without ever writing one.
-// Retrying cannot bring the file back, so such a job is not deferred work.
-func transcriptGone(job *store.ExtractionJob) bool {
-	if job.Kind != "session" && job.Kind != "relational" {
-		return false
-	}
-	_, err := os.Stat(job.Payload)
-	return errors.Is(err, fs.ErrNotExist)
-}
+// errTranscriptGone marks a transcript-backed job (session, relational) whose
+// file does not exist. Retrying on a timer will not bring it back, so the worker
+// parks the job at once instead of spending maxExtractionAttempts on it. The
+// row is kept: the file may be on a volume that comes back, and a parked job
+// stays visible in health.
+var errTranscriptGone = errors.New("transcript does not exist")
 
-// dropParkedWithoutTranscript deletes parked jobs whose transcript is gone.
-// Parking keeps a job for retry once its cause is fixed; a deleted transcript
-// is a cause nothing can fix, and the row would otherwise sit in
-// /api/health's queue depth forever. Parked jobs whose source still exists
-// stay parked.
-func (s *Server) dropParkedWithoutTranscript() {
-	jobs, err := s.db.ParkedExtractions(maxExtractionAttempts)
-	if err != nil {
-		log.Printf("extraction worker: %v", err)
-		return
+// transcriptPresent returns errTranscriptGone when a transcript-backed job's
+// file does not exist. Any other stat error is left to the extractor, which
+// fails and retries as before.
+func transcriptPresent(job *store.ExtractionJob) error {
+	if _, err := os.Stat(job.Payload); errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %s", errTranscriptGone, job.Payload)
 	}
-	for i := range jobs {
-		job := &jobs[i]
-		if !transcriptGone(job) {
-			continue
-		}
-		if err := s.db.DeleteExtraction(job.ID); err != nil {
-			log.Printf("extraction worker: %v", err)
-			continue
-		}
-		log.Printf("extraction worker: dropped parked %s job for %s — transcript no longer exists (%s)",
-			job.Kind, job.SessionID, job.Payload)
-	}
+	return nil
 }
 
 func (s *Server) runExtractionJob(job *store.ExtractionJob) error {
-	// A missing transcript is terminal, not transient: dropping (nil ⇒ deleted)
-	// on the first attempt beats 20 retries that end parked.
-	if transcriptGone(job) {
-		log.Printf("extraction worker: dropping %s job for %s — transcript no longer exists (%s)",
-			job.Kind, job.SessionID, job.Payload)
-		return nil
-	}
 	switch job.Kind {
 	case "session":
+		if err := transcriptPresent(job); err != nil {
+			return err
+		}
 		if job.Force {
 			return s.engine.ExtractSessionForce(job.SessionID, job.Payload)
 		}
@@ -184,6 +169,9 @@ func (s *Server) runExtractionJob(job *store.ExtractionJob) error {
 		if !s.relationalAuto {
 			log.Printf("extraction worker: dropping queued relational job for %s — relational auto is disabled", job.SessionID)
 			return nil
+		}
+		if err := transcriptPresent(job); err != nil {
+			return err
 		}
 		return s.engine.ExtractRelational(job.SessionID, job.Payload)
 	default:

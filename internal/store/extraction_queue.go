@@ -61,31 +61,25 @@ func (db *DB) NextExtraction(maxAttempts int) (*ExtractionJob, error) {
 	return &j, nil
 }
 
-// ParkedExtractions returns the jobs that exhausted maxAttempts. NextExtraction
-// never selects them again; the worker inspects them at start to drop the ones
-// whose source can no longer exist.
-func (db *DB) ParkedExtractions(maxAttempts int) ([]ExtractionJob, error) {
-	rows, err := db.Query(
-		`SELECT id, session_id, kind, payload, force, attempts
-		 FROM extraction_queue WHERE attempts >= ? ORDER BY id ASC`,
-		maxAttempts,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("parked extractions: %w", err)
+// ParkExtraction parks a job immediately by raising its attempts to
+// maxAttempts, for a failure that retrying cannot fix. The row is kept, as with
+// any parked job: NextExtraction skips it and health reports it as parked.
+func (db *DB) ParkExtraction(id int64, maxAttempts int) error {
+	if _, err := db.Exec(`UPDATE extraction_queue SET attempts = MAX(attempts, ?) WHERE id = ?`, maxAttempts, id); err != nil {
+		return fmt.Errorf("park extraction %d: %w", id, err)
 	}
-	defer rows.Close()
+	return nil
+}
 
-	var jobs []ExtractionJob
-	for rows.Next() {
-		var j ExtractionJob
-		var force int
-		if err := rows.Scan(&j.ID, &j.SessionID, &j.Kind, &j.Payload, &force, &j.Attempts); err != nil {
-			return nil, fmt.Errorf("scan parked extraction: %w", err)
-		}
-		j.Force = force != 0
-		jobs = append(jobs, j)
+// ParkedExtractionCount returns how many queued jobs are parked (attempts at or
+// past maxAttempts). Health reports them apart from runnable work so a gauge of
+// jobs nothing will retry does not read as a backlog.
+func (db *DB) ParkedExtractionCount(maxAttempts int) (int, error) {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM extraction_queue WHERE attempts >= ?`, maxAttempts).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count parked extractions: %w", err)
 	}
-	return jobs, rows.Err()
+	return n, nil
 }
 
 // DeleteExtraction removes a job from the queue — called after it succeeds, or
