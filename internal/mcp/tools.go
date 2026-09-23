@@ -41,7 +41,7 @@ func (s *Server) registerTools() {
 				"summary":               strProp("L0 abstract — one sentence, max 200 chars"),
 				"body":                  strProp("L1 overview — max 2000 chars, compress detail aggressively"),
 				"detail":                strProp("L2 full content — max 40000 chars (optional)"),
-				"session_id":            strProp("Session id for provenance (optional; defaults to the session this server was started in)"),
+				"session_id":            strProp("Session id for provenance (optional; ignored when this server runs inside a Claude Code session, which supplies its own)"),
 				"acknowledge_retracted": boolProp("Proceed past a dedup match against a retracted memory (optional)"),
 			}, "category", "name", "summary", "body"),
 			handler: s.toolRemember,
@@ -129,7 +129,10 @@ func (s *Server) toolRemember(args json.RawMessage) (string, error) {
 	if in.Detail != "" {
 		payload["detail"] = in.Detail
 	}
-	if in.SessionID == "" {
+	// The harness session is authoritative when present: an agent-supplied id
+	// may be stale or invented, and a wrong one silently strips the memory's
+	// project affinity. The argument serves clients that run outside a harness.
+	if s.session != "" {
 		in.SessionID = s.session
 	}
 	if in.SessionID != "" {

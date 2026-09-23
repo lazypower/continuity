@@ -81,10 +81,25 @@ func TestHarnessSessionAttributesEveryCall(t *testing.T) {
 	}
 }
 
-// An explicit session_id on remember is the caller's statement of provenance
-// and wins over the ambient harness session.
-func TestExplicitSessionOverridesHarness(t *testing.T) {
+// Inside a harness, its session id wins over an agent-supplied session_id: the
+// agent's value may be stale or invented, and a wrong one strips affinity.
+func TestHarnessSessionOverridesArgument(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_SESSION_ID", "sess-harness")
+	client, rec := recordingDaemon(t)
+	args := map[string]any{"session_id": "sess-explicit"}
+	for k, v := range baseRemember {
+		args[k] = v
+	}
+	callTools(t, NewServer(client, "test"), args)
+
+	if rec.remember != "sess-harness" {
+		t.Fatalf("remember session = %q, want sess-harness", rec.remember)
+	}
+}
+
+// Outside a harness the argument is the only source, and it is used.
+func TestArgumentUsedOutsideHarness(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
 	client, rec := recordingDaemon(t)
 	args := map[string]any{"session_id": "sess-explicit"}
 	for k, v := range baseRemember {
