@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -341,5 +342,72 @@ func TestExtractionWorkerParksMissingTranscript(t *testing.T) {
 	}
 	if health["pending_extractions"] != float64(0) || health["parked_extractions"] != float64(1) {
 		t.Errorf("health pending=%v parked=%v, want 0 and 1", health["pending_extractions"], health["parked_extractions"])
+	}
+}
+
+// While the corpus vector identity is locked, session and signal jobs wait for
+// repair (their extractors defer by returning nil, which the drain would read as
+// done), but relational jobs never touch vectors and keep draining (#89).
+func TestExtractionWorkerDrainsRelationalWhileLocked(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	// A corpus embedded by a different model locks the identity on reconcile.
+	if err := db.CreateNode(&store.MemNode{URI: "mem://agent/patterns/old", NodeType: "leaf", Category: "patterns", L0Abstract: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := db.GetNodeByURI("mem://agent/patterns/old")
+	if err != nil || old == nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := db.SaveVector(old.ID, make([]float64, 8), "some-other-model"); err != nil {
+		t.Fatal(err)
+	}
+	eng := engine.New(db, nil)
+	emb, err := engine.NewHashEmbedder(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.SetEmbedder(emb)
+	if _, err := eng.ReconcileVectorIdentity(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if locked, _ := eng.VectorIdentityLocked(); !locked {
+		t.Fatal("setup: identity should be locked")
+	}
+
+	s := New(db, eng, "test")
+	for _, kind := range []string{"session", "signal", "relational"} {
+		if err := db.EnqueueExtraction("sess-"+kind, kind, "payload", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	var ran []string
+	s.runJob = func(j *store.ExtractionJob) error {
+		mu.Lock()
+		ran = append(ran, j.Kind)
+		mu.Unlock()
+		return nil
+	}
+
+	s.StartExtractionWorker()
+	s.wakeExtractionWorker()
+	waitForPending(t, db, 2, 3*time.Second)
+	s.StopExtractionWorker(2 * time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ran) != 1 || ran[0] != "relational" {
+		t.Fatalf("ran %v while locked, want only [relational]", ran)
+	}
+	for _, kind := range []string{"session", "signal"} {
+		job, err := db.NextExtraction(maxExtractionAttempts, kind)
+		if err != nil || job == nil || job.Attempts != 0 {
+			t.Errorf("%s job should wait untouched for repair, got %+v (err %v)", kind, job, err)
+		}
 	}
 }
