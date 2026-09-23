@@ -222,3 +222,37 @@ func TestComputeMetrics_UsesComeFromJournal(t *testing.T) {
 		t.Errorf("critical = %+v, want only the journaled use", m.Critical)
 	}
 }
+
+// A URI recreated after its node was deleted starts with no uses: journal rows
+// outlive the node, and only events since the current node's created_at count.
+func TestComputeMetrics_RecreatedURIDoesNotInheritUses(t *testing.T) {
+	db := testDB(t)
+	uri := "mem://user/patterns/reborn"
+	if err := db.CreateNode(&MemNode{URI: uri, NodeType: "leaf", Category: "patterns", L0Abstract: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixMilli()
+	// Uses journaled against a predecessor that lived at this URI a day ago.
+	for i := 0; i < 5; i++ {
+		if err := db.InsertEvent(MemEvent{NodeURI: uri, Event: "deepened", CreatedAt: now - 24*60*60*1000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE mem_nodes SET created_at=? WHERE uri=?`, now, uri); err != nil {
+		t.Fatal(err)
+	}
+
+	uses, err := db.UseCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uses[uri] != 0 {
+		t.Fatalf("recreated node inherited %d uses, want 0", uses[uri])
+	}
+	if err := db.InsertEvent(MemEvent{NodeURI: uri, Event: "deepened", CreatedAt: now + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if uses, _ := db.UseCounts(); uses[uri] != 1 {
+		t.Fatalf("uses = %d, want 1 (only the use since recreation)", uses[uri])
+	}
+}

@@ -110,10 +110,16 @@ func (db *DB) CountEvents(event string) (int, error) {
 // This is the authority the Memory Health dashboard reads for "retrieved";
 // mem_nodes.access_count froze when the journal took over and must not be
 // read as a use signal (#77). Nodes with no uses are absent from the map.
+//
+// The journal is keyed by URI and outlives the node: GC hard-deletes nodes and
+// keeps their events. Only events at or after the node's created_at count, so
+// a URI recreated after deletion does not inherit its predecessor's uses.
 func (db *DB) UseCounts() (map[string]int, error) {
 	rows, err := db.Query(`
-		SELECT node_uri, COUNT(*) FROM mem_events
-		WHERE event = 'deepened' GROUP BY node_uri
+		SELECT e.node_uri, COUNT(*) FROM mem_events e
+		JOIN mem_nodes n ON n.uri = e.node_uri
+		WHERE e.event = 'deepened' AND e.created_at >= n.created_at
+		GROUP BY e.node_uri
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("use counts: %w", err)
