@@ -71,15 +71,17 @@ func (db *DB) ParkExtraction(id int64, maxAttempts int) error {
 	return nil
 }
 
-// ParkedExtractionCount returns how many queued jobs are parked (attempts at or
-// past maxAttempts). Health reports them apart from runnable work so a gauge of
-// jobs nothing will retry does not read as a backlog.
-func (db *DB) ParkedExtractionCount(maxAttempts int) (int, error) {
-	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM extraction_queue WHERE attempts >= ?`, maxAttempts).Scan(&n); err != nil {
-		return 0, fmt.Errorf("count parked extractions: %w", err)
+// ExtractionQueueDepth splits the queue into runnable jobs (attempts below
+// maxAttempts) and parked ones, from one read so the pair is consistent. Health
+// reports them apart so jobs nothing will retry do not read as a backlog.
+func (db *DB) ExtractionQueueDepth(maxAttempts int) (pending, parked int, err error) {
+	if err := db.QueryRow(`
+		SELECT COALESCE(SUM(attempts < ?), 0), COALESCE(SUM(attempts >= ?), 0)
+		FROM extraction_queue
+	`, maxAttempts, maxAttempts).Scan(&pending, &parked); err != nil {
+		return 0, 0, fmt.Errorf("extraction queue depth: %w", err)
 	}
-	return n, nil
+	return pending, parked, nil
 }
 
 // DeleteExtraction removes a job from the queue — called after it succeeds, or

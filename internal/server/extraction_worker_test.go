@@ -326,7 +326,7 @@ func TestExtractionWorkerParksMissingTranscript(t *testing.T) {
 	if n, _ := s.db.PendingExtractions(); n != 1 {
 		t.Fatalf("queue rows = %d, want 1 (the parked job is kept)", n)
 	}
-	if parked, _ := s.db.ParkedExtractionCount(maxExtractionAttempts); parked != 1 {
+	if _, parked, _ := s.db.ExtractionQueueDepth(maxExtractionAttempts); parked != 1 {
 		t.Fatalf("parked = %d, want 1 after a single attempt", parked)
 	}
 	if job, _ := s.db.NextExtraction(maxExtractionAttempts); job != nil {

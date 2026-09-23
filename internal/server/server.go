@@ -199,9 +199,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// visible (accountability), not buried only in logs.
 	// Parked jobs are reported apart: nothing retries them, so counting them as
 	// pending would read as a backlog the worker is failing to drain.
-	queuedExtractions, _ := s.db.PendingExtractions()
-	parkedExtractions, _ := s.db.ParkedExtractionCount(maxExtractionAttempts)
-	pendingExtractions := queuedExtractions - parkedExtractions
+	pendingExtractions, parkedExtractions, _ := s.db.ExtractionQueueDepth(maxExtractionAttempts)
 
 	// os.Executable is best-effort; an empty string is acceptable for clients.
 	exe, _ := os.Executable()
