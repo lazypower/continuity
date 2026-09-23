@@ -138,7 +138,10 @@ func writeWorkerTranscript(t *testing.T) string {
 		t.Fatalf("create transcript: %v", err)
 	}
 	defer f.Close()
-	for _, e := range entries {
+	for i, e := range entries {
+		// Real transcripts give every entry a uuid; relational merges up to
+		// the last entry that has one (#83).
+		e["uuid"] = fmt.Sprintf("entry-%d", i)
 		data, _ := json.Marshal(e)
 		f.Write(data)
 		f.Write([]byte("\n"))

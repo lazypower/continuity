@@ -14,6 +14,7 @@ import (
 // Entry represents a single line in a Claude Code JSONL transcript.
 type Entry struct {
 	Type    string          `json:"type"` // "user", "assistant", "system"
+	UUID    string          `json:"uuid"`
 	Message json.RawMessage `json:"message"`
 }
 
@@ -34,6 +35,7 @@ type ParsedEntry struct {
 	Type string // "user", "assistant", "system"
 	Role string
 	Text string // extracted plain text
+	UUID string // the entry's id in the transcript; empty if the line had none
 }
 
 var systemReminderRe = regexp.MustCompile(`<system-reminder>[\s\S]*?</system-reminder>`)
@@ -153,6 +155,7 @@ func parseLine(line []byte) (*ParsedEntry, error) {
 		Type: entry.Type,
 		Role: msg.Role,
 		Text: text,
+		UUID: entry.UUID,
 	}, nil
 }
 

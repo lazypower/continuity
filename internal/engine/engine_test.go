@@ -35,7 +35,12 @@ func writeTranscript(t *testing.T, entries []map[string]any) string {
 	}
 	defer f.Close()
 
-	for _, entry := range entries {
+	for i, entry := range entries {
+		// Real transcripts give every entry a uuid; the relational
+		// high-water mark (#83) depends on it.
+		if _, ok := entry["uuid"]; !ok {
+			entry["uuid"] = fmt.Sprintf("entry-%d", i)
+		}
 		data, _ := json.Marshal(entry)
 		f.Write(data)
 		f.Write([]byte("\n"))
@@ -159,6 +164,9 @@ User trusts agent with code generation and architectural decisions.`
 
 	transcriptPath := makeTranscript(t)
 
+	if _, err := db.InitSession("test-session", "proj"); err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
 	err := extractRelational(db, mock, "test-session", transcriptPath)
 	if err != nil {
 		t.Fatalf("extractRelational: %v", err)
@@ -385,6 +393,9 @@ Trusts agent with code generation.`
 	transcriptPath := makeTranscript(t)
 	engine := New(db, multiMock)
 
+	if _, err := db.InitSession("full-test", "proj"); err != nil {
+		t.Fatalf("InitSession: %v", err)
+	}
 	err := engine.ExtractSession("full-test", transcriptPath)
 	if err != nil {
 		t.Fatalf("ExtractSession: %v", err)
@@ -871,6 +882,11 @@ func TestExtractSessionForceBypassesIdempotency(t *testing.T) {
 	}
 	if err := db.MarkExtracted("already-extracted"); err != nil {
 		t.Fatalf("MarkExtracted: %v", err)
+	}
+	// Relational evidence already merged to the end, so the only work left for
+	// the already-extracted path is none: this test is about memory extraction.
+	if err := db.SetRelationalMark("already-extracted", lastEntryUUID(t, makeTranscript(t))); err != nil {
+		t.Fatalf("SetRelationalMark: %v", err)
 	}
 
 	mock := &multiResponseMock{
