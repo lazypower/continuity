@@ -36,16 +36,17 @@ type HistBin struct {
 
 // MetricNode is a memory surfaced in a dashboard list, carrying the live
 // effective relevance (not the stored column) plus the signals a human needs to
-// decide whether it deserves attention.
+// decide whether it deserves attention. Uses counts journaled `deepened`
+// events (ADR-001 §5), the deliberate L1/L2 fetches.
 type MetricNode struct {
-	URI         string  `json:"uri"`
-	Category    string  `json:"category"`
-	L0Abstract  string  `json:"l0_abstract"`
-	Relevance   float64 `json:"relevance"` // live effective relevance, floored at 0.1
-	AccessCount int     `json:"access_count"`
-	LastAccess  *int64  `json:"last_access,omitempty"`
-	CreatedAt   int64   `json:"created_at"`
-	AgeDays     int     `json:"age_days"`
+	URI        string  `json:"uri"`
+	Category   string  `json:"category"`
+	L0Abstract string  `json:"l0_abstract"`
+	Relevance  float64 `json:"relevance"` // live effective relevance, floored at 0.1
+	Uses       int     `json:"uses"`
+	LastAccess *int64  `json:"last_access,omitempty"`
+	CreatedAt  int64   `json:"created_at"`
+	AgeDays    int     `json:"age_days"`
 }
 
 // CategoryShare is one category's slice of the active memory base. Sorted desc
@@ -106,6 +107,10 @@ func (db *DB) ComputeMetrics() (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	uses, err := db.UseCounts()
+	if err != nil {
+		return nil, err
+	}
 
 	now := time.Now().UnixMilli()
 	m := &Metrics{GeneratedAt: now}
@@ -123,7 +128,7 @@ func (db *DB) ComputeMetrics() (*Metrics, error) {
 				m.Summary.RecentRetractions++
 			}
 			if n.SupersededBy == "" {
-				m.NeedsAttention.OrphanedTombstones = append(m.NeedsAttention.OrphanedTombstones, toMetricNode(n, now))
+				m.NeedsAttention.OrphanedTombstones = append(m.NeedsAttention.OrphanedTombstones, toMetricNode(n, now, uses[n.URI]))
 			}
 			continue
 		}
@@ -132,7 +137,7 @@ func (db *DB) ComputeMetrics() (*Metrics, error) {
 		m.Summary.ActiveTotal++
 		catCounts[n.Category]++
 		eff := effectiveRelevance(n, now)
-		mn := toMetricNode(n, now)
+		mn := toMetricNode(n, now, uses[n.URI])
 		mn.Relevance = eff
 		active = append(active, mn)
 
@@ -158,7 +163,7 @@ func (db *DB) ComputeMetrics() (*Metrics, error) {
 			m.NeedsAttention.NearDecayCliff = append(m.NeedsAttention.NearDecayCliff, mn)
 		}
 
-		if n.AccessCount == 0 {
+		if mn.Uses == 0 {
 			m.Summary.NeverRetrieved++
 			if now-n.CreatedAt >= int64(neverRetrievedDays)*dayMs {
 				neverRetrieved = append(neverRetrieved, mn)
@@ -197,20 +202,21 @@ func (db *DB) ComputeMetrics() (*Metrics, error) {
 		m.Histogram[i] = HistBin{Lo: lo, Hi: lo + histogramWidth, Count: histCounts[i]}
 	}
 
-	// Critical: most-retrieved active memories, then by live relevance as tiebreak.
+	// Critical: most-retrieved active memories (at least one use), then by live
+	// relevance as tiebreak.
 	// Exclude session-injected categories (moments, session): they ride into every
-	// session, so their access_count measures injection frequency, not how
+	// session, so their fetches measure curiosity about the injection, not how
 	// load-bearing the knowledge is. Critical should surface working knowledge.
 	m.Critical = make([]MetricNode, 0, len(active))
 	for _, mn := range active {
-		if mn.Category == "moments" || mn.Category == "session" {
+		if mn.Category == "moments" || mn.Category == "session" || mn.Uses == 0 {
 			continue
 		}
 		m.Critical = append(m.Critical, mn)
 	}
 	sort.Slice(m.Critical, func(i, j int) bool {
-		if m.Critical[i].AccessCount != m.Critical[j].AccessCount {
-			return m.Critical[i].AccessCount > m.Critical[j].AccessCount
+		if m.Critical[i].Uses != m.Critical[j].Uses {
+			return m.Critical[i].Uses > m.Critical[j].Uses
 		}
 		return m.Critical[i].Relevance > m.Critical[j].Relevance
 	})
@@ -220,7 +226,7 @@ func (db *DB) ComputeMetrics() (*Metrics, error) {
 	// slice directly before assigning back.
 	na := &m.NeedsAttention
 	sort.Slice(na.StaleHighRetrieval, func(i, j int) bool {
-		return na.StaleHighRetrieval[i].AccessCount > na.StaleHighRetrieval[j].AccessCount
+		return na.StaleHighRetrieval[i].Uses > na.StaleHighRetrieval[j].Uses
 	})
 	sort.Slice(neverRetrieved, func(i, j int) bool {
 		return neverRetrieved[i].AgeDays > neverRetrieved[j].AgeDays
@@ -272,16 +278,16 @@ func effectiveRelevance(n *MemNode, now int64) float64 {
 	return v
 }
 
-func toMetricNode(n *MemNode, now int64) MetricNode {
+func toMetricNode(n *MemNode, now int64, uses int) MetricNode {
 	return MetricNode{
-		URI:         n.URI,
-		Category:    n.Category,
-		L0Abstract:  n.L0Abstract,
-		Relevance:   n.Relevance,
-		AccessCount: n.AccessCount,
-		LastAccess:  n.LastAccess,
-		CreatedAt:   n.CreatedAt,
-		AgeDays:     int((now - n.CreatedAt) / dayMs),
+		URI:        n.URI,
+		Category:   n.Category,
+		L0Abstract: n.L0Abstract,
+		Relevance:  n.Relevance,
+		Uses:       uses,
+		LastAccess: n.LastAccess,
+		CreatedAt:  n.CreatedAt,
+		AgeDays:    int((now - n.CreatedAt) / dayMs),
 	}
 }
 

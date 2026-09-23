@@ -107,7 +107,7 @@ export interface MetricNode {
   category: string;
   l0_abstract: string;
   relevance: number;
-  access_count: number;
+  uses: number;
   last_access?: number;
   created_at: number;
   age_days: number;

@@ -5,48 +5,58 @@ import (
 	"time"
 )
 
-// TestDailySeries_BaselineFromBeforeWindow proves the bounded snapshot read
-// still computes correct retrieval diffs: a snapshot OUTSIDE the window must
-// still seed the first in-window day's day-over-day diff.
-func TestDailySeries_BaselineFromBeforeWindow(t *testing.T) {
+// Retrievals are journaled `deepened` events per UTC day, read live like
+// captures: no snapshot is needed, and shown events and the frozen
+// access_count column never contribute (#77).
+func TestDailySeries_RetrievalsFromJournal(t *testing.T) {
 	db := testDB(t)
 	now := time.Now().UTC()
-
-	older := now.AddDate(0, 0, -5).Format("2006-01-02") // outside a 2-day window
-	today := now.Format("2006-01-02")
-	if _, err := db.Exec(`INSERT INTO metrics_daily (date, total_access, updated_at) VALUES (?, ?, ?)`,
-		older, 10, now.UnixMilli()); err != nil {
+	if err := db.CreateNode(&MemNode{URI: "mem://user/patterns/a", NodeType: "leaf", Category: "patterns", L0Abstract: "x"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO metrics_daily (date, total_access, updated_at) VALUES (?, ?, ?)`,
-		today, 18, now.UnixMilli()); err != nil {
+	if _, err := db.Exec(`UPDATE mem_nodes SET access_count=99 WHERE uri=?`, "mem://user/patterns/a"); err != nil {
 		t.Fatal(err)
 	}
 
-	series, err := db.BuildDailySeries(2) // window = [yesterday, today]; older row excluded
+	threeDaysAgo := now.AddDate(0, 0, -3)
+	events := []MemEvent{
+		{NodeURI: "mem://user/patterns/a", Event: "deepened", CreatedAt: now.UnixMilli()},
+		{NodeURI: "mem://user/patterns/a", Event: "deepened", CreatedAt: now.UnixMilli()},
+		{NodeURI: "mem://user/patterns/a", Event: "deepened", CreatedAt: threeDaysAgo.UnixMilli()},
+		{NodeURI: "mem://user/patterns/a", Event: "shown", Surface: "tray", CreatedAt: now.UnixMilli()},
+		// Outside a 7-day window.
+		{NodeURI: "mem://user/patterns/a", Event: "deepened", CreatedAt: now.AddDate(0, 0, -20).UnixMilli()},
+	}
+	for _, e := range events {
+		if err := db.InsertEvent(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	series, err := db.BuildDailySeries(7)
 	if err != nil {
 		t.Fatalf("BuildDailySeries: %v", err)
 	}
-	var todayPt *DailyPoint
-	for i := range series {
-		if series[i].Date == today {
-			todayPt = &series[i]
-		}
+	byDate := map[string]DailyPoint{}
+	total := 0
+	for _, p := range series {
+		byDate[p.Date] = p
+		total += p.Retrievals
 	}
-	if todayPt == nil {
-		t.Fatal("today not in 2-day window")
+	if got := byDate[now.Format("2006-01-02")].Retrievals; got != 2 {
+		t.Errorf("today retrievals = %d, want 2", got)
 	}
-	// 18 (today) − 10 (pre-window baseline) = 8, even though the older row is
-	// outside the window and never scanned by the main query.
-	if todayPt.Retrievals != 8 {
-		t.Errorf("today retrievals = %d, want 8 (18−10 via pre-window baseline)", todayPt.Retrievals)
+	if got := byDate[threeDaysAgo.Format("2006-01-02")].Retrievals; got != 1 {
+		t.Errorf("3-days-ago retrievals = %d, want 1", got)
+	}
+	if total != 3 {
+		t.Errorf("window retrievals = %d, want 3 (shown and out-of-window excluded)", total)
 	}
 }
 
 func TestRollupAndDailySeries(t *testing.T) {
 	db := testDB(t)
 	now := time.Now().UTC()
-	day := int64(24 * 60 * 60 * 1000)
 
 	mk := func(uri string) {
 		if err := db.CreateNode(&MemNode{URI: uri, NodeType: "leaf", Category: "patterns", L0Abstract: "x"}); err != nil {
@@ -78,7 +88,6 @@ func TestRollupAndDailySeries(t *testing.T) {
 	if totalCap != 3 {
 		t.Errorf("total captures = %d, want 3", totalCap)
 	}
-	// The backdated capture lands on its own UTC date.
 	wantDate := created5d.Format("2006-01-02")
 	var found bool
 	for _, p := range series {
@@ -90,36 +99,24 @@ func TestRollupAndDailySeries(t *testing.T) {
 		t.Errorf("backdated capture not found on %s", wantDate)
 	}
 
-	// Seed a prior-day snapshot, give a node access, roll up today → retrievals diff.
-	yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
-	if _, err := db.Exec(`INSERT INTO metrics_daily (date, total_access, updated_at) VALUES (?, ?, ?)`,
-		yesterday, 5, now.UnixMilli()-day); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`UPDATE mem_nodes SET access_count=8 WHERE uri=?`, "mem://user/patterns/a"); err != nil {
-		t.Fatal(err)
-	}
-
 	if err := db.RollupDailySnapshot(); err != nil {
 		t.Fatalf("RollupDailySnapshot: %v", err)
 	}
 
-	// Today's snapshot must exist with the live active total + cumulative access.
-	var active int
-	var totalAccess int64
+	// Today's snapshot must exist with the live active total and bucket counts.
+	var active, neverRetrieved int
 	today := now.Format("2006-01-02")
-	if err := db.QueryRow(`SELECT active_total, total_access FROM metrics_daily WHERE date=?`, today).
-		Scan(&active, &totalAccess); err != nil {
+	if err := db.QueryRow(`SELECT active_total, never_retrieved FROM metrics_daily WHERE date=?`, today).
+		Scan(&active, &neverRetrieved); err != nil {
 		t.Fatalf("read today snapshot: %v", err)
 	}
 	if active != 3 {
 		t.Errorf("snapshot active_total = %d, want 3", active)
 	}
-	if totalAccess != 8 {
-		t.Errorf("snapshot total_access = %d, want 8", totalAccess)
+	if neverRetrieved != 3 {
+		t.Errorf("snapshot never_retrieved = %d, want 3", neverRetrieved)
 	}
 
-	// Retrievals for today = today's total_access (8) − yesterday's (5) = 3.
 	series2, err := db.BuildDailySeries(30)
 	if err != nil {
 		t.Fatal(err)
@@ -133,10 +130,7 @@ func TestRollupAndDailySeries(t *testing.T) {
 	if todayPt == nil {
 		t.Fatal("today not in series")
 	}
-	if !todayPt.HasSnapshot {
-		t.Error("today should have a snapshot")
-	}
-	if todayPt.Retrievals != 3 {
-		t.Errorf("today retrievals = %d, want 3 (8−5)", todayPt.Retrievals)
+	if !todayPt.HasSnapshot || todayPt.ActiveTotal != 3 {
+		t.Errorf("today point = %+v, want snapshot with active_total 3", *todayPt)
 	}
 }

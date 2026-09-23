@@ -13,7 +13,7 @@ func TestComputeMetrics(t *testing.T) {
 	day := int64(24 * 60 * 60 * 1000)
 
 	// backdate forces created_at + last_access to ageDays in the past so decay is
-	// computed from a known reference time. setAccess overrides access_count.
+	// computed from a known reference time. setUses journals n deepened events.
 	mk := func(uri, category string) {
 		if err := db.CreateNode(&MemNode{URI: uri, NodeType: "leaf", Category: category, L0Abstract: "x"}); err != nil {
 			t.Fatalf("create %s: %v", uri, err)
@@ -25,9 +25,11 @@ func TestComputeMetrics(t *testing.T) {
 			t.Fatalf("backdate %s: %v", uri, err)
 		}
 	}
-	setAccess := func(uri string, n int) {
-		if _, err := db.Exec(`UPDATE mem_nodes SET access_count=? WHERE uri=?`, n, uri); err != nil {
-			t.Fatalf("setAccess %s: %v", uri, err)
+	setUses := func(uri string, n int) {
+		for i := 0; i < n; i++ {
+			if err := db.InsertEvent(MemEvent{NodeURI: uri, Event: "deepened"}); err != nil {
+				t.Fatalf("setUses %s: %v", uri, err)
+			}
 		}
 	}
 
@@ -41,12 +43,12 @@ func TestComputeMetrics(t *testing.T) {
 	// Load-bearing but decaying: retrieved a lot, ~0.40 effective → stale + stale_high_retrieval.
 	mk("mem://user/cases/load-bearing", "cases")
 	backdate("mem://user/cases/load-bearing", 120)
-	setAccess("mem://user/cases/load-bearing", 42)
+	setUses("mem://user/cases/load-bearing", 42)
 
 	// Near the decay cliff: 99 days → 0.5^1.1 ≈ 0.466, in [0.4,0.5). Retrieved once.
 	mk("mem://user/cases/cliff", "cases")
 	backdate("mem://user/cases/cliff", 99)
-	setAccess("mem://user/cases/cliff", 3)
+	setUses("mem://user/cases/cliff", 3)
 
 	// Moments are decay-exempt: old but stays fresh (stored relevance 1.0).
 	mk("mem://user/moments/exempt", "moments")
@@ -95,7 +97,7 @@ func TestComputeMetrics(t *testing.T) {
 		t.Errorf("fading = %d, want 1", m.Summary.Fading)
 	}
 
-	// Never retrieved: fresh, stale-orphan, cliff has access, load-bearing has access,
+	// Never retrieved: fresh, stale-orphan, cliff has uses, load-bearing has uses,
 	// moments never retrieved. → fresh, stale-orphan, moments = 3.
 	if m.Summary.NeverRetrieved != 3 {
 		t.Errorf("never_retrieved = %d, want 3", m.Summary.NeverRetrieved)
@@ -126,9 +128,9 @@ func TestComputeMetrics(t *testing.T) {
 		t.Error("superseded (has successor) should NOT be orphaned")
 	}
 
-	// Critical: most-retrieved first.
-	if len(m.Critical) == 0 || m.Critical[0].URI != "mem://user/cases/load-bearing" {
-		t.Errorf("critical[0] = %+v, want load-bearing on top", m.Critical)
+	// Critical: most-retrieved first, and only memories with at least one use.
+	if len(m.Critical) != 2 || m.Critical[0].URI != "mem://user/cases/load-bearing" || m.Critical[0].Uses != 42 {
+		t.Errorf("critical = %+v, want [load-bearing (42 uses), cliff]", m.Critical)
 	}
 
 	// Histogram bins cover every active memory exactly once.
@@ -187,4 +189,70 @@ func hasURI(xs []MetricNode, uri string) bool {
 		}
 	}
 	return false
+}
+
+// A frozen legacy access_count is not a use (#77). Only journaled `deepened`
+// events count toward retrieved, whatever the column says.
+func TestComputeMetrics_UsesComeFromJournal(t *testing.T) {
+	db := testDB(t)
+	for _, uri := range []string{"mem://user/patterns/legacy", "mem://user/patterns/used"} {
+		if err := db.CreateNode(&MemNode{URI: uri, NodeType: "leaf", Category: "patterns", L0Abstract: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE mem_nodes SET access_count=50 WHERE uri=?`, "mem://user/patterns/legacy"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertEvent(MemEvent{NodeURI: "mem://user/patterns/used", Event: "deepened"}); err != nil {
+		t.Fatal(err)
+	}
+	// Exposure is not use: a shown event must not count either.
+	if err := db.InsertEvent(MemEvent{NodeURI: "mem://user/patterns/legacy", Event: "shown", Surface: "tray"}); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := db.ComputeMetrics()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Summary.NeverRetrieved != 1 {
+		t.Errorf("never_retrieved = %d, want 1 (legacy access_count and shown are not uses)", m.Summary.NeverRetrieved)
+	}
+	if len(m.Critical) != 1 || m.Critical[0].URI != "mem://user/patterns/used" || m.Critical[0].Uses != 1 {
+		t.Errorf("critical = %+v, want only the journaled use", m.Critical)
+	}
+}
+
+// A URI recreated after its node was deleted starts with no uses: journal rows
+// outlive the node, and only events since the current node's created_at count.
+func TestComputeMetrics_RecreatedURIDoesNotInheritUses(t *testing.T) {
+	db := testDB(t)
+	uri := "mem://user/patterns/reborn"
+	if err := db.CreateNode(&MemNode{URI: uri, NodeType: "leaf", Category: "patterns", L0Abstract: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixMilli()
+	// Uses journaled against a predecessor that lived at this URI a day ago.
+	for i := 0; i < 5; i++ {
+		if err := db.InsertEvent(MemEvent{NodeURI: uri, Event: "deepened", CreatedAt: now - 24*60*60*1000}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE mem_nodes SET created_at=? WHERE uri=?`, now, uri); err != nil {
+		t.Fatal(err)
+	}
+
+	uses, err := db.UseCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uses[uri] != 0 {
+		t.Fatalf("recreated node inherited %d uses, want 0", uses[uri])
+	}
+	if err := db.InsertEvent(MemEvent{NodeURI: uri, Event: "deepened", CreatedAt: now + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if uses, _ := db.UseCounts(); uses[uri] != 1 {
+		t.Fatalf("uses = %d, want 1 (only the use since recreation)", uses[uri])
+	}
 }
