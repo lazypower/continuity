@@ -264,3 +264,64 @@ func TestExtractionWorkerReplaysExistingQueue(t *testing.T) {
 	waitForPending(t, s.db, 0, 3*time.Second)
 	s.StopExtractionWorker(2 * time.Second)
 }
+
+// A transcript-backed job whose file is gone is dropped on its first run: no
+// retry can bring the transcript back. Returning nil deletes the row.
+func TestRunExtractionJobDropsMissingTranscript(t *testing.T) {
+	s := workerTestServer(t) // nil engine: reaching the extractor would panic
+	missing := filepath.Join(t.TempDir(), "gone.jsonl")
+	for _, kind := range []string{"session", "relational"} {
+		if err := s.runExtractionJob(&store.ExtractionJob{Kind: kind, SessionID: "s", Payload: missing}); err != nil {
+			t.Errorf("%s: missing transcript should drop (nil), got %v", kind, err)
+		}
+	}
+}
+
+// At start the worker drops parked jobs whose transcript is gone and keeps
+// parked jobs whose transcript still exists, so they remain retryable.
+func TestExtractionWorkerDropsParkedWithoutTranscript(t *testing.T) {
+	s := workerTestServer(t)
+	present := writeWorkerTranscript(t)
+	missing := filepath.Join(t.TempDir(), "gone.jsonl")
+
+	park := func(kind, payload string) {
+		t.Helper()
+		if err := s.db.EnqueueExtraction("sess", kind, payload, false); err != nil {
+			t.Fatal(err)
+		}
+		job, err := s.db.NextExtraction(maxExtractionAttempts)
+		if err != nil || job == nil {
+			t.Fatalf("next: %v %v", job, err)
+		}
+		for i := 0; i < maxExtractionAttempts; i++ {
+			if _, err := s.db.BumpExtractionAttempts(job.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	park("relational", missing)
+	park("session", missing)
+	park("relational", present)
+	// A parked signal job carries prompt text, not a path: never swept.
+	park("signal", "remember this: prompts are not paths")
+
+	s.runJob = func(j *store.ExtractionJob) error {
+		t.Errorf("parked job %d must not run", j.ID)
+		return nil
+	}
+	s.StartExtractionWorker()
+	s.StopExtractionWorker(2 * time.Second)
+
+	parked, err := s.db.ParkedExtractions(maxExtractionAttempts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parked) != 2 {
+		t.Fatalf("parked = %+v, want the present-transcript relational job and the signal job", parked)
+	}
+	for _, j := range parked {
+		if j.Payload == missing {
+			t.Errorf("job %d with a missing transcript survived the sweep", j.ID)
+		}
+	}
+}

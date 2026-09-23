@@ -61,6 +61,33 @@ func (db *DB) NextExtraction(maxAttempts int) (*ExtractionJob, error) {
 	return &j, nil
 }
 
+// ParkedExtractions returns the jobs that exhausted maxAttempts. NextExtraction
+// never selects them again; the worker inspects them at start to drop the ones
+// whose source can no longer exist.
+func (db *DB) ParkedExtractions(maxAttempts int) ([]ExtractionJob, error) {
+	rows, err := db.Query(
+		`SELECT id, session_id, kind, payload, force, attempts
+		 FROM extraction_queue WHERE attempts >= ? ORDER BY id ASC`,
+		maxAttempts,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("parked extractions: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []ExtractionJob
+	for rows.Next() {
+		var j ExtractionJob
+		var force int
+		if err := rows.Scan(&j.ID, &j.SessionID, &j.Kind, &j.Payload, &force, &j.Attempts); err != nil {
+			return nil, fmt.Errorf("scan parked extraction: %w", err)
+		}
+		j.Force = force != 0
+		jobs = append(jobs, j)
+	}
+	return jobs, rows.Err()
+}
+
 // DeleteExtraction removes a job from the queue — called after it succeeds, or
 // after it is abandoned as poison (see BumpExtractionAttempts).
 func (db *DB) DeleteExtraction(id int64) error {

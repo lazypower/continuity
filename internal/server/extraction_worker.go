@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"log"
+	"os"
 	"time"
 
 	"github.com/lazypower/continuity/internal/store"
@@ -33,6 +36,7 @@ func (s *Server) StartExtractionWorker() {
 
 func (s *Server) extractionLoop() {
 	defer close(s.extractDone)
+	s.dropParkedWithoutTranscript()
 	ticker := time.NewTicker(extractionRetryInterval)
 	defer ticker.Stop()
 	for {
@@ -113,7 +117,51 @@ func (s *Server) drainExtractionQueue() {
 	}
 }
 
+// transcriptGone reports whether a transcript-backed job (session, relational)
+// points at a file that no longer exists. Claude Code deletes transcripts on
+// its own schedule, and some sessions reach Stop without ever writing one.
+// Retrying cannot bring the file back, so such a job is not deferred work.
+func transcriptGone(job *store.ExtractionJob) bool {
+	if job.Kind != "session" && job.Kind != "relational" {
+		return false
+	}
+	_, err := os.Stat(job.Payload)
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+// dropParkedWithoutTranscript deletes parked jobs whose transcript is gone.
+// Parking keeps a job for retry once its cause is fixed; a deleted transcript
+// is a cause nothing can fix, and the row would otherwise sit in
+// /api/health's queue depth forever. Parked jobs whose source still exists
+// stay parked.
+func (s *Server) dropParkedWithoutTranscript() {
+	jobs, err := s.db.ParkedExtractions(maxExtractionAttempts)
+	if err != nil {
+		log.Printf("extraction worker: %v", err)
+		return
+	}
+	for i := range jobs {
+		job := &jobs[i]
+		if !transcriptGone(job) {
+			continue
+		}
+		if err := s.db.DeleteExtraction(job.ID); err != nil {
+			log.Printf("extraction worker: %v", err)
+			continue
+		}
+		log.Printf("extraction worker: dropped parked %s job for %s — transcript no longer exists (%s)",
+			job.Kind, job.SessionID, job.Payload)
+	}
+}
+
 func (s *Server) runExtractionJob(job *store.ExtractionJob) error {
+	// A missing transcript is terminal, not transient: dropping (nil ⇒ deleted)
+	// on the first attempt beats 20 retries that end parked.
+	if transcriptGone(job) {
+		log.Printf("extraction worker: dropping %s job for %s — transcript no longer exists (%s)",
+			job.Kind, job.SessionID, job.Payload)
+		return nil
+	}
 	switch job.Kind {
 	case "session":
 		if job.Force {

@@ -95,6 +95,13 @@ not silently lost. It surfaces in `/api/health`'s `pending_extractions`, and it
 can be retried once the cause is fixed. The parking log line is explicit that
 the job was "kept in queue for inspection/retry, NOT captured".
 
+One cause cannot be fixed: a transcript that no longer exists. Claude Code
+deletes transcripts on its own schedule, and some sessions reach Stop without
+writing one. A `session` or `relational` job whose transcript file is missing
+is dropped on its first run, with a log line naming the path, instead of
+retrying toward parking. When the worker starts, it also drops parked jobs whose
+transcript is gone. Parked jobs whose transcript still exists stay parked.
+
 ### The locked-identity deferral
 
 Before draining anything, the worker checks whether the corpus vector identity
