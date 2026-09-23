@@ -274,8 +274,10 @@ inflate the denominator with results nobody saw. **Inspection surfaces**
 they are operator observability, outside the payload contract — counting UI browsing
 as use would inject exactly the noise the deepened-vs-attributed control exists to
 measure. Reducing them to L0+URI is a separate product decision, not folded here.
-**CLI events carry an empty session id** by design; session-level used-given-shown
-joins bucket them apart (per-node rates remain valid).
+**Events carry the harness session id when one exists** (`CLAUDE_CODE_SESSION_ID`, set
+by Claude Code on every child process, MCP server and CLI alike); a CLI run outside a
+session carries an empty id, and session-level used-given-shown joins bucket those apart
+(per-node rates remain valid).
 
 "Off the hot path" is a write contract, not just a schedule: search and the gate are
 synchronous surfaces, and SQLite is single-writer — a `shown` insert queued behind an

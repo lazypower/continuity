@@ -72,6 +72,9 @@ func runShow(cmd *cobra.Command, args []string) error {
 	if showIncludeRetracted {
 		params.Set("include_retracted", "true")
 	}
+	if sid := hooks.HarnessSessionID(); sid != "" {
+		params.Set("session_id", sid)
+	}
 	data, getErr := client.Get("/api/memories?" + params.Encode())
 
 	// hooks.Client.Get returns (body, err) for non-2xx responses so callers can

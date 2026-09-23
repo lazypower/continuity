@@ -254,7 +254,7 @@ Writes a memory directly, with no LLM involved.
 | `-s`, `--summary` | **required** | The summary tier. One sentence, 200 characters. |
 | `-b`, `--body` | **required** | The body tier. Up to 2,000 characters. |
 | `-d`, `--detail` | *(empty)* | The detail tier. Up to 40,000 characters. |
-| `--session <id>` | *(empty)* | Attribute the write to a session, for provenance. |
+| `--session <id>` | the agent session, if any | Attribute the write to a session, for provenance. Run from inside a Claude Code session, the write is attributed to that session automatically (`CLAUDE_CODE_SESSION_ID`), which gives the memory project affinity. |
 | `--acknowledge-retracted` | `false` | Proceed even though the write closely matches something you previously retracted. |
 
 **Changes data.** Depending on the category, the write may merge into an existing

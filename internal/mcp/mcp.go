@@ -35,13 +35,14 @@ const maxMessageBytes = 16 * 1024 * 1024
 type Server struct {
 	client  *hooks.Client
 	version string
+	session string // harness session id; attributes writes and journal events
 	tools   []toolDef
 	index   map[string]int
 }
 
 // NewServer builds a server that reaches the daemon through client.
 func NewServer(client *hooks.Client, version string) *Server {
-	s := &Server{client: client, version: version, index: map[string]int{}}
+	s := &Server{client: client, version: version, session: hooks.HarnessSessionID(), index: map[string]int{}}
 	s.registerTools()
 	return s
 }
