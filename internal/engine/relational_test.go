@@ -137,8 +137,8 @@ func TestRelationalMarkAdvancesOnlyOnDeliberateOutcome(t *testing.T) {
 	if err == nil {
 		t.Fatal("transport error must surface so the durable job retries")
 	}
-	if m, _, _ := db.RelationalMark("llm-down"); m.Valid {
-		t.Errorf("transport error advanced the mark to %q", m.String)
+	if got := markOf(t, db, "llm-down"); got != "" {
+		t.Errorf("transport error advanced the mark to %q", got)
 	}
 }
 
@@ -147,6 +147,10 @@ func TestRelationalMarkAdvancesOnlyOnDeliberateOutcome(t *testing.T) {
 func TestRelationalLegacySessionMarksWithoutReplay(t *testing.T) {
 	db := testDB(t)
 	relationalSession(t, db, "legacy")
+	// Sessions that predate migration 18 carry a NULL mark.
+	if _, err := db.Exec(`UPDATE sessions SET relational_mark = NULL WHERE session_id = ?`, "legacy"); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.UpsertNode(&store.MemNode{URI: relationalURI, NodeType: "leaf", Category: "profile",
 		L0Abstract: "profile", L1Overview: relationalProfileResp, SourceSession: "legacy"}); err != nil {
 		t.Fatal(err)
@@ -216,5 +220,63 @@ func TestExtractSessionAlreadyExtractedStillMergesRelational(t *testing.T) {
 	}
 	if n, _ := db.GetNodeByURI(relationalURI); n == nil {
 		t.Fatal("expected the relational profile to be written")
+	}
+}
+
+// A new session whose first merge wrote the profile but whose mark write failed
+// must not take the legacy branch: the retry merges from the start, including
+// turns added since, instead of marking to the end and skipping them.
+func TestRelationalFailedFirstMarkDoesNotSkipLaterTurns(t *testing.T) {
+	db := testDB(t)
+	relationalSession(t, db, "fresh")
+	initial, _, err := db.RelationalMark("fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock := &llm.MockClient{Response: &llm.Response{Content: relationalProfileResp}}
+	first := userTurns("FIRST", 0, 3)
+	if err := extractRelational(db, mock, "fresh", writeTranscript(t, first)); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the mark write having failed after the profile upsert: the
+	// session keeps the mark InitSession gave it.
+	if _, err := db.Exec(`UPDATE sessions SET relational_mark = ? WHERE session_id = ?`, initial, "fresh"); err != nil {
+		t.Fatal(err)
+	}
+	grown := writeTranscript(t, append(first, userTurns("AFTER", 6, 1)...))
+	if err := extractRelational(db, mock, "fresh", grown); err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.Calls) != 2 || !strings.Contains(mock.Calls[1], "AFTER user message") {
+		t.Fatalf("retry must merge the later turns; calls=%d", len(mock.Calls))
+	}
+}
+
+// Trailing entries without a uuid wait for a later entry that has one, rather
+// than being re-sent on every run.
+func TestRelationalUUIDlessTailWaits(t *testing.T) {
+	db := testDB(t)
+	relationalSession(t, db, "tail")
+	mock := &llm.MockClient{Response: &llm.Response{Content: relationalProfileResp}}
+	base := userTurns("BASE", 0, 3)
+	noID := map[string]any{"type": "user", "uuid": "", "message": map[string]any{"role": "user", "content": "TAIL message that has no uuid yet"}}
+	withTail := append(append([]map[string]any{}, base...), noID)
+
+	path := writeTranscript(t, withTail)
+	for i := 0; i < 2; i++ {
+		if err := extractRelational(db, mock, "tail", path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(mock.Calls) != 1 || strings.Contains(mock.Calls[0], "TAIL message") || markOf(t, db, "tail") != "u-5" {
+		t.Fatalf("calls=%d mark=%q: the uuid-less tail must wait, and only once", len(mock.Calls), markOf(t, db, "tail"))
+	}
+
+	later := writeTranscript(t, append(withTail, userTurns("NEXT", 6, 1)...))
+	if err := extractRelational(db, mock, "tail", later); err != nil {
+		t.Fatal(err)
+	}
+	if len(mock.Calls) != 2 || !strings.Contains(mock.Calls[1], "TAIL message") || !strings.Contains(mock.Calls[1], "NEXT user message") {
+		t.Fatalf("the waiting tail must merge with the next uuid'd entry; calls=%d", len(mock.Calls))
 	}
 }

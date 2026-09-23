@@ -158,8 +158,11 @@ long session keeps contributing as it grows and nothing is merged twice. The
 three-user-message gate applies to the whole session; after that, any new user
 message is enough to merge. The mark advances only on a deliberate outcome, so
 an LLM error leaves it for the retry. A mark that no longer appears in the
-transcript merges from the start. A session without a `sessions` row is skipped,
-because there is nowhere to record progress. `extract --force` re-runs memory
+transcript merges from the start. Trailing entries without a uuid wait for a
+later entry that has one. A session without a `sessions` row is skipped,
+because there is nowhere to record progress. Sessions that predate the mark
+(migration 18) start with none; if such a session already wrote the profile,
+its transcript is marked as merged instead of replayed. `extract --force` re-runs memory
 extraction but leaves the mark, so it does not re-merge relational evidence.
 
 **Post-LLM gates** in `extractMemories`:

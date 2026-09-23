@@ -57,8 +57,8 @@ func (db *DB) InitSession(sessionID, project string) (*Session, error) {
 
 	// Create new session
 	result, err := db.Exec(`
-		INSERT INTO sessions (session_id, project, started_at, status, last_active_at)
-		VALUES (?, ?, ?, 'active', ?)
+		INSERT INTO sessions (session_id, project, started_at, status, last_active_at, relational_mark)
+		VALUES (?, ?, ?, 'active', ?, '')
 	`, sessionID, project, now, now)
 	if err != nil {
 		return nil, fmt.Errorf("insert session: %w", err)
@@ -316,7 +316,8 @@ func (db *DB) IncrementToolCount(sessionID string) error {
 // RelationalMark returns the session's relational high-water mark (#83): the
 // uuid of the last transcript entry whose evidence the relational profile has
 // merged or deliberately rejected. found is false when the session has no row.
-// mark.Valid is false when no mark was ever recorded.
+// A new session starts with an empty mark (nothing merged yet); mark.Valid is
+// false only for sessions that predate the mark (migration 18).
 func (db *DB) RelationalMark(sessionID string) (mark sql.NullString, found bool, err error) {
 	err = db.QueryRow(`SELECT relational_mark FROM sessions WHERE session_id = ?`, sessionID).Scan(&mark)
 	if err == sql.ErrNoRows {

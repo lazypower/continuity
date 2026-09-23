@@ -67,16 +67,18 @@ func extractRelational(db *store.DB, client llm.Client, sessionID, transcriptPat
 	start := 0
 	switch {
 	case !mark.Valid:
-		// No mark recorded yet. A session that already wrote the profile
-		// before marks existed has had its transcript merged: record the end
-		// as merged rather than replay it.
+		// The session predates the mark, so its merge history is unknown. If it
+		// already wrote the profile, its transcript was merged: record the end
+		// rather than replay it. New sessions start at '' and never take this
+		// branch, so a failed mark write after their first merge cannot skip
+		// the turns that follow.
 		if node != nil && node.SourceSession == sessionID {
 			if last := lastUUID(entries); last != "" {
 				log.Printf("relational: %s already merged before marks existed — marking to end", sessionID)
 				return db.SetRelationalMark(sessionID, last)
 			}
 		}
-	default:
+	case mark.String != "":
 		if i := indexOfUUID(entries, mark.String); i >= 0 {
 			start = i + 1
 		} else {
@@ -84,11 +86,25 @@ func extractRelational(db *store.DB, client llm.Client, sessionID, transcriptPat
 		}
 	}
 
+	// The delta ends at the last entry with a uuid, the only kind of entry the
+	// mark can point at. Entries after it wait for a later entry that carries
+	// one, instead of being re-sent on every run.
 	delta := entries[start:]
+	end := -1
+	for i := len(delta) - 1; i >= 0; i-- {
+		if delta[i].UUID != "" {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return nil
+	}
+	delta = delta[:end+1]
 	if transcript.CountUserMessages(delta) == 0 {
 		return nil
 	}
-	newMark := lastUUID(delta)
+	newMark := delta[end].UUID
 	condensed := transcript.Condense(delta)
 
 	prompt := llm.RelationalPrompt(existing, condensed)
@@ -169,12 +185,8 @@ func extractRelational(db *store.DB, client llm.Client, sessionID, transcriptPat
 }
 
 // markMerged records that the session's evidence through mark has been merged
-// or deliberately rejected. Entries without a uuid leave nothing to mark
-// against; the next run then re-reads from the previous mark.
+// or deliberately rejected.
 func markMerged(db *store.DB, sessionID, mark string) error {
-	if mark == "" {
-		return nil
-	}
 	return db.SetRelationalMark(sessionID, mark)
 }
 
@@ -188,9 +200,11 @@ func lastUUID(entries []transcript.ParsedEntry) string {
 	return ""
 }
 
-// indexOfUUID returns the index of the entry with the given uuid, or -1.
+// indexOfUUID returns the index of the first entry with the given uuid, or -1.
+// Searching from the start means a reused uuid can only make a run re-merge
+// entries, never skip them.
 func indexOfUUID(entries []transcript.ParsedEntry, uuid string) int {
-	for i := len(entries) - 1; i >= 0; i-- {
+	for i := range entries {
 		if entries[i].UUID == uuid {
 			return i
 		}

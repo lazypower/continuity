@@ -409,10 +409,10 @@ CREATE INDEX idx_events_session ON mem_events(session_id, event);
 		// Additive column. The relational profile merges a session's evidence
 		// incrementally; the mark is the uuid of the last transcript entry whose
 		// evidence was merged or deliberately rejected, so each run sends only
-		// what came after it. NULL means no mark was ever recorded (every
-		// session that predates this migration, and new sessions until their
-		// first merge). The mark lives on the session row and shares its
-		// lifecycle: no new table, no new retention rule.
+		// what came after it. New sessions start at '' (nothing merged yet);
+		// NULL marks only the sessions that predate this migration, whose
+		// merge history is unknown. The mark lives on the session row and
+		// shares its lifecycle: no new table, no new retention rule.
 		SQL: `ALTER TABLE sessions ADD COLUMN relational_mark TEXT;`,
 	},
 }
