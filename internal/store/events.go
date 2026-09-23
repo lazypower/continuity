@@ -105,3 +105,29 @@ func (db *DB) CountEvents(event string) (int, error) {
 	}
 	return n, err
 }
+
+// UseCounts returns each node's journaled use count: its `deepened` events.
+// This is the authority the Memory Health dashboard reads for "retrieved";
+// mem_nodes.access_count froze when the journal took over and must not be
+// read as a use signal (#77). Nodes with no uses are absent from the map.
+func (db *DB) UseCounts() (map[string]int, error) {
+	rows, err := db.Query(`
+		SELECT node_uri, COUNT(*) FROM mem_events
+		WHERE event = 'deepened' GROUP BY node_uri
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("use counts: %w", err)
+	}
+	defer rows.Close()
+
+	uses := make(map[string]int)
+	for rows.Next() {
+		var uri string
+		var n int
+		if err := rows.Scan(&uri, &n); err != nil {
+			return nil, fmt.Errorf("scan use count: %w", err)
+		}
+		uses[uri] = n
+	}
+	return uses, rows.Err()
+}

@@ -172,7 +172,7 @@
         'Load-bearing & decaying',
         'retrieved often but no longer fresh — refresh these first',
         nn(data.needs_attention.stale_high_retrieval),
-        (n) => `${n.access_count}× · ${pct(n.relevance)}%`,
+        (n) => `${n.uses}× · ${pct(n.relevance)}%`,
       )}
       {@render attn(
         'Never retrieved & old',
@@ -209,7 +209,7 @@
               <span class="attn-slug" title={n.uri}>{slug(n.uri)}</span>
               <span class="attn-l0">{n.l0_abstract}</span>
               <div class="crit-relbar"><div style="width: {pct(n.relevance)}%; background: {bandColor(n.relevance)}"></div></div>
-              <span class="crit-count">{n.access_count}×</span>
+              <span class="crit-count">{n.uses}×</span>
             </div>
           {/each}
         </div>

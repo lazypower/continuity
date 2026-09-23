@@ -17,7 +17,7 @@
 
   const totalCaptures = $derived(daily.reduce((s, d) => s + d.captures, 0));
   const totalRetrievals = $derived(daily.reduce((s, d) => s + d.retrievals, 0));
-  const hasRetrievals = $derived(daily.some((d) => d.has_snapshot && d.retrievals > 0));
+  const hasRetrievals = $derived(daily.some((d) => d.retrievals > 0));
 
   // Shared y-axis: comparing capture vs retrieval volume is the whole point.
   const yMax = $derived(Math.max(1, max(daily, (d) => Math.max(d.captures, d.retrievals)) ?? 1));
@@ -68,7 +68,7 @@
   <div class="flex items-center gap-4 mb-1 text-[10px] font-mono">
     <span style="color: var(--color-patterns)">● {totalCaptures} captures</span>
     <span style="color: var(--color-accent)" class:dim={!hasRetrievals}>
-      ● {totalRetrievals} retrievals{hasRetrievals ? '' : ' (accruing)'}
+      ● {totalRetrievals} retrievals
     </span>
     <span class="ml-auto text-[var(--text-secondary)] opacity-50">last {daily.length}d</span>
   </div>
@@ -107,7 +107,7 @@
       <span class="tip-date">{hover.d.date}</span>
       <span style="color: var(--color-patterns)">{hover.d.captures} captured</span>
       <span style="color: var(--color-accent)">
-        {hover.d.has_snapshot ? `${hover.d.retrievals} retrieved` : 'no snapshot'}
+        {hover.d.retrievals} retrieved
       </span>
     </div>
   {/if}
