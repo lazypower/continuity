@@ -125,6 +125,9 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	if searchSmart {
 		params.Set("mode", "search")
 	}
+	if sid := hooks.HarnessSessionID(); sid != "" {
+		params.Set("session_id", sid)
+	}
 
 	data, err := client.Get("/api/search?" + params.Encode())
 	if err != nil {

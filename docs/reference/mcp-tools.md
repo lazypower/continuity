@@ -59,7 +59,7 @@ Stores a memory directly. No LLM involved.
 | `summary` | string | **yes** | — | L0 abstract. One sentence, **max 200 characters**. |
 | `body` | string | **yes** | — | L1 overview. **Max 2000 characters, minimum 20.** |
 | `detail` | string | no | omitted | L2 full content. **Max 40000 characters.** |
-| `session_id` | string | no | omitted | Provenance attribution. |
+| `session_id` | string | no | the server's session | Provenance attribution. Inside Claude Code the server records the session that started it (`CLAUDE_CODE_SESSION_ID`) and ignores this argument; the argument serves clients outside a harness. The session gives the memory project affinity. `show` and `search` attribute their journal events the same way. |
 | `acknowledge_retracted` | boolean | no | `false` | Proceed past a match against a retracted memory. |
 
 **The character limits truncate, they do not reject.** Content over the limit is cut at a word boundary and stored; the call still succeeds and the server logs the truncation. The one exception is `body` under 20 characters, which *is* rejected as a validation error. So a 5000-character `body` silently becomes a 2000-character body — compress before you write, do not rely on the ceiling.

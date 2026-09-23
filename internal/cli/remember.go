@@ -53,7 +53,7 @@ func init() {
 	rememberCmd.Flags().StringVarP(&rememberSummary, "summary", "s", "", "L0 abstract — one sentence, max 200 chars (required)")
 	rememberCmd.Flags().StringVarP(&rememberBody, "body", "b", "", "L1 overview — max 2000 chars, compress detail aggressively (required)")
 	rememberCmd.Flags().StringVarP(&rememberDetail, "detail", "d", "", "L2 full content — max 40000 chars (optional)")
-	rememberCmd.Flags().StringVar(&rememberSession, "session", "", "Session ID for provenance (optional)")
+	rememberCmd.Flags().StringVar(&rememberSession, "session", "", "Session ID for provenance, used outside an agent session (inside one, that session is recorded)")
 	rememberCmd.Flags().BoolVar(&rememberAcknowledgeRetracted, "acknowledge-retracted", false, "Proceed past a dedup match against retracted memory (use after inspecting with `show --include-retracted`)")
 
 	rememberCmd.MarkFlagRequired("category")
@@ -89,8 +89,14 @@ func runRemember(cmd *cobra.Command, args []string) error {
 	if rememberDetail != "" {
 		payload["detail"] = rememberDetail
 	}
-	if rememberSession != "" {
-		payload["session_id"] = rememberSession
+	// The harness session is authoritative when present; --session serves runs
+	// outside a harness.
+	session := hooks.HarnessSessionID()
+	if session == "" {
+		session = rememberSession
+	}
+	if session != "" {
+		payload["session_id"] = session
 	}
 	if rememberAcknowledgeRetracted {
 		payload["acknowledge_retracted"] = true
