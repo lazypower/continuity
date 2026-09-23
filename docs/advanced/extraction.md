@@ -91,9 +91,19 @@ abandoned. Losing a memory is worse than a lingering queue row.
 
 And "abandoned" does not mean deleted. A job past the limit is **parked**:
 `NextExtraction` excludes it, but the row stays in the table so the capture is
-not silently lost. It surfaces in `/api/health`'s `pending_extractions`, and it
+not silently lost. It surfaces in `/api/health`'s `parked_extractions`, and it
 can be retried once the cause is fixed. The parking log line is explicit that
 the job was "kept in queue for inspection/retry, NOT captured".
+
+A missing transcript skips the retries. Claude Code deletes transcripts on its
+own schedule, and some sessions reach Stop without writing one, so retrying on a
+timer will not bring the file back. A `session` or `relational` job whose
+transcript does not exist is **parked on its first attempt**, with a log line
+naming the path. The row is kept like any other parked job, because the file may
+be on a volume that comes back.
+
+`/api/health` reports parked jobs as `parked_extractions`, apart from
+`pending_extractions`, which counts only jobs the worker will still run.
 
 ### The locked-identity deferral
 

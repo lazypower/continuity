@@ -75,6 +75,10 @@ func runExtract(cmd *cobra.Command, args []string) error {
 	if _, err := os.Stat(transcriptPath); err != nil {
 		return fmt.Errorf("transcript not readable: %w", err)
 	}
+	// The daemon reads the file from its own working directory, not this one.
+	if abs, err := filepath.Abs(transcriptPath); err == nil {
+		transcriptPath = abs
+	}
 
 	body, _ := json.Marshal(map[string]any{
 		"transcript_path": transcriptPath,

@@ -197,7 +197,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	// Surface the durable extraction backlog so a wedged or parked queue is
 	// visible (accountability), not buried only in logs.
-	pendingExtractions, _ := s.db.PendingExtractions()
+	// Parked jobs are reported apart: nothing retries them, so counting them as
+	// pending would read as a backlog the worker is failing to drain.
+	pendingExtractions, parkedExtractions, _ := s.db.ExtractionQueueDepth(maxExtractionAttempts)
 
 	// os.Executable is best-effort; an empty string is acceptable for clients.
 	exe, _ := os.Executable()
@@ -239,6 +241,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"schema_head":         store.HeadSchemaVersion(),
 		"schema_current":      schemaCurrent,
 		"pending_extractions": pendingExtractions,
+		"parked_extractions":  parkedExtractions,
 		"gc_mode":             gcMode,
 		"gc_reclaimable":      gcReclaimable,
 		"spent_observations":  spentObservations,

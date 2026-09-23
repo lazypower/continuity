@@ -2,7 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io/fs"
 	"log"
+	"os"
 	"time"
 
 	"github.com/lazypower/continuity/internal/store"
@@ -80,6 +84,15 @@ func (s *Server) drainExtractionQueue() {
 		}
 
 		if err := s.runJob(job); err != nil {
+			if errors.Is(err, errTranscriptGone) {
+				if parkErr := s.db.ParkExtraction(job.ID, maxExtractionAttempts); parkErr != nil {
+					log.Printf("extraction worker: %v", parkErr)
+					return
+				}
+				log.Printf("extraction worker: PARKING %s job for %s — %v; kept in queue, NOT captured",
+					job.Kind, job.SessionID, err)
+				continue // parking is not a failure of the pass; later jobs still run
+			}
 			attempts, bumpErr := s.db.BumpExtractionAttempts(job.ID)
 			if bumpErr != nil {
 				log.Printf("extraction worker: %v", bumpErr)
@@ -113,9 +126,29 @@ func (s *Server) drainExtractionQueue() {
 	}
 }
 
+// errTranscriptGone marks a transcript-backed job (session, relational) whose
+// file does not exist. Retrying on a timer will not bring it back, so the worker
+// parks the job at once instead of spending maxExtractionAttempts on it. The
+// row is kept: the file may be on a volume that comes back, and a parked job
+// stays visible in health.
+var errTranscriptGone = errors.New("transcript does not exist")
+
+// transcriptPresent returns errTranscriptGone when a transcript-backed job's
+// file does not exist. Any other stat error is left to the extractor, which
+// fails and retries as before.
+func transcriptPresent(job *store.ExtractionJob) error {
+	if _, err := os.Stat(job.Payload); errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %s", errTranscriptGone, job.Payload)
+	}
+	return nil
+}
+
 func (s *Server) runExtractionJob(job *store.ExtractionJob) error {
 	switch job.Kind {
 	case "session":
+		if err := transcriptPresent(job); err != nil {
+			return err
+		}
 		if job.Force {
 			return s.engine.ExtractSessionForce(job.SessionID, job.Payload)
 		}
@@ -136,6 +169,9 @@ func (s *Server) runExtractionJob(job *store.ExtractionJob) error {
 		if !s.relationalAuto {
 			log.Printf("extraction worker: dropping queued relational job for %s — relational auto is disabled", job.SessionID)
 			return nil
+		}
+		if err := transcriptPresent(job); err != nil {
+			return err
 		}
 		return s.engine.ExtractRelational(job.SessionID, job.Payload)
 	default:
