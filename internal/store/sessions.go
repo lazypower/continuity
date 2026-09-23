@@ -312,3 +312,26 @@ func (db *DB) IncrementToolCount(sessionID string) error {
 	}
 	return nil
 }
+
+// RelationalMark returns the session's relational high-water mark (#83): the
+// uuid of the last transcript entry whose evidence the relational profile has
+// merged or deliberately rejected. found is false when the session has no row.
+// mark.Valid is false when no mark was ever recorded.
+func (db *DB) RelationalMark(sessionID string) (mark sql.NullString, found bool, err error) {
+	err = db.QueryRow(`SELECT relational_mark FROM sessions WHERE session_id = ?`, sessionID).Scan(&mark)
+	if err == sql.ErrNoRows {
+		return sql.NullString{}, false, nil
+	}
+	if err != nil {
+		return sql.NullString{}, false, fmt.Errorf("relational mark: %w", err)
+	}
+	return mark, true, nil
+}
+
+// SetRelationalMark records the session's relational high-water mark.
+func (db *DB) SetRelationalMark(sessionID, mark string) error {
+	if _, err := db.Exec(`UPDATE sessions SET relational_mark = ? WHERE session_id = ?`, mark, sessionID); err != nil {
+		return fmt.Errorf("set relational mark: %w", err)
+	}
+	return nil
+}

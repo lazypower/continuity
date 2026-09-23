@@ -714,7 +714,7 @@ func (e *Engine) ExtractSessionForce(sessionID, transcriptPath string) error {
 // "relational" queue jobs enqueued while autoExtract is off. It writes zero
 // memory nodes and does NOT mark the session extracted, so a later
 // `continuity extract --force` still runs the full pipeline; extractRelational's
-// source-session guard then prevents double-applying the same profile update.
+// high-water mark (#83) then merges nothing it has already merged.
 // The vector-identity lock is irrelevant here by construction: relational only
 // merges into the fixed system-owned URI and never passes the resurrection gate
 // (see the comment above extractRelational's UpsertNode call).
@@ -737,7 +737,12 @@ func (e *Engine) extractSession(sessionID, transcriptPath string, force bool) er
 			return fmt.Errorf("check session: %w", err)
 		}
 		if sess != nil && sess.ExtractedAt != nil {
-			log.Printf("extraction: skipping %s — already extracted", sessionID)
+			// Memory extraction ran once; relational profiling is incremental
+			// (#83) and still merges whatever the session said since.
+			log.Printf("extraction: skipping memory extraction for %s — already extracted", sessionID)
+			if err := extractRelational(e.DB, e.LLM, sessionID, transcriptPath); err != nil {
+				return fmt.Errorf("relational extraction: %w", err)
+			}
 			return nil
 		}
 	}

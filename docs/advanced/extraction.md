@@ -150,6 +150,18 @@ unless forced. `ExtractSessionForce` bypasses only this guard — the content
 gate still applies, so forcing extraction on a genuinely empty session is a
 no-op.
 
+**Relational profiling is incremental.** Each session row carries a
+`relational_mark`: the uuid of the last transcript entry whose evidence the
+profile merged or deliberately rejected (`NO_UPDATE`, a meta-description, a
+too-short answer). A run sends the merge only the entries after the mark, so a
+long session keeps contributing as it grows and nothing is merged twice. The
+three-user-message gate applies to the whole session; after that, any new user
+message is enough to merge. The mark advances only on a deliberate outcome, so
+an LLM error leaves it for the retry. A mark that no longer appears in the
+transcript merges from the start. A session without a `sessions` row is skipped,
+because there is nowhere to record progress. `extract --force` re-runs memory
+extraction but leaves the mark, so it does not re-merge relational evidence.
+
 **Post-LLM gates** in `extractMemories`:
 
 - LLM response shorter than **20 characters** → skip.
