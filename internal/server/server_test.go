@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lazypower/continuity/internal/buildinfo"
 	"github.com/lazypower/continuity/internal/store"
@@ -154,6 +155,24 @@ func TestBuildContextMomentsSection(t *testing.T) {
 	}
 	if momentCount == 0 {
 		t.Error("expected at least 1 moment in context")
+	}
+}
+
+// Moments never decay, so an injected moment must carry the date it was
+// asserted or a stale one reads as a present-tense fact.
+func TestBuildContextMomentsCarryAsOfDate(t *testing.T) {
+	srv := testServer(t)
+	node := &store.MemNode{
+		URI:        "mem://user/moments/dated",
+		NodeType:   "leaf",
+		Category:   "moments",
+		L0Abstract: "moment with a date",
+	}
+	srv.db.CreateNode(node)
+
+	want := "- moment with a date (as of " + time.UnixMilli(node.UpdatedAt).Format("2006-01-02") + ")\n"
+	if ctx := srv.buildContext(""); !strings.Contains(ctx, want) {
+		t.Errorf("moment line missing as-of date; want %q in:\n%s", want, ctx)
 	}
 }
 

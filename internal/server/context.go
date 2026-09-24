@@ -175,7 +175,7 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 			if len(l0) > maxItemContext {
 				l0 = truncateAtSentence(l0, maxItemContext)
 			}
-			line := fmt.Sprintf("- [%s] %s\n", p.Category, l0)
+			line := fmt.Sprintf("- [%s] %s%s\n", p.Category, l0, asOf(p.UpdatedAt))
 			if budget-len(section)-len(line) < 0 {
 				log.Printf("context: budget exhausted in pinned section after %d items", used)
 				break
@@ -216,7 +216,7 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 				if len(l0) > maxItemContext {
 					l0 = truncateAtSentence(l0, maxItemContext)
 				}
-				section += fmt.Sprintf("- %s\n", l0)
+				section += fmt.Sprintf("- %s%s\n", l0, asOf(m.UpdatedAt))
 				// Rotation bookkeeping only — last_access moves so the next
 				// session deprioritizes these; relevance and counters do NOT
 				// (exposure is not use, ADR-001 §2). Skipped in preview: a
@@ -271,7 +271,7 @@ func (s *Server) renderContext(currentSessionID, project string, preview bool) s
 					if len(l0) > maxItemContext {
 						l0 = truncateAtSentence(l0, maxItemContext)
 					}
-					line := fmt.Sprintf("- %s (%s)\n", l0, n.URI)
+					line := fmt.Sprintf("- %s (%s)%s\n", l0, n.URI, asOf(n.UpdatedAt))
 					// Skip, don't stop: one oversized line (a long URI) must
 					// not starve every shorter pointer behind it.
 					if len(section)+len(affineHeader)+len(lines)+len(line) > maxIndexContext {
@@ -395,6 +395,17 @@ func indexShapeLine(counts map[string]int) string {
 		parts = append(parts, fmt.Sprintf("%s %d", c, counts[c]))
 	}
 	return fmt.Sprintf("%d memories: %s\n", total, strings.Join(parts, ", "))
+}
+
+// asOf renders the date a pushed memory was last asserted — written, merged,
+// or pinned. Decay-exempt categories never age out, so without a date a stale
+// line reads as a present-tense fact; the date lets the agent weigh it as a
+// claim made then rather than one true now.
+func asOf(updatedAt int64) string {
+	if updatedAt == 0 {
+		return ""
+	}
+	return " (as of " + time.UnixMilli(updatedAt).Format("2006-01-02") + ")"
 }
 
 // truncateAtSentence truncates to maxLen, preferring sentence boundaries.
