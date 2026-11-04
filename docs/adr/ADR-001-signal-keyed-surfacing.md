@@ -9,7 +9,7 @@
   Round 2, 6 findings: 5 folded in (all-surfaces invariant, best-effort telemetry,
   contract decay exemption, gate boundary mechanics, inspection-noise calibration),
   1 rejected as framed (the relevance "staleness brake" was the amplifier; trade named
-  in §Consequences).
+  in §Consequences). §4 withdrawn 2026-11-04 (#92); see the note at §4.
 - **Date:** 2026-07-07
 - **Deciders:** Chuck (product), Claude (analysis + structure). Review: **Fiona**
   (pending — the τ gate, the `re-taught` signal, whether the index earns the tray).
@@ -192,6 +192,16 @@ recency, no ranking, no touch mechanics — the §2 invariants never applied to 
 still don't.
 
 ### 4. The prompt gate: threshold-gated JIT push at the first query
+
+> **Withdrawn 2026-11-04 (#92).** The gate ran in shadow mode and never injected.
+> A blind review of hits across similarity bands found that the share of hits that
+> tell the agent something the prompt does not already carry is flat at roughly 10%,
+> the same above τ=0.50 as in a 0.30–0.40 control band. Prompt-to-memory similarity
+> measures topicality, not usefulness, and no τ selects for the latter. Matching on
+> tool calls instead was also measured and floods: most tool calls name a repo, path,
+> or host that some memory mentions. The gate, its calibration log, and its config
+> are removed. Memory reaches the agent through the boot tray (§3) and agent-initiated
+> search. The design below is kept as the record of what was tried.
 
 `continuity hook submit` already runs on every prompt and already round-trips to the
 server (`submit.go:55-79`). Extend it:

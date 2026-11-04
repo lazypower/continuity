@@ -761,7 +761,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Optional caller-supplied session attribution for the §5 journal (the
-	// staged prompt gate will pass it; CLI searches leave it empty).
+	// MCP server passes it; CLI searches outside a session leave it empty).
 	sessionID := r.URL.Query().Get("session_id")
 
 	out := make([]resultJSON, len(results))

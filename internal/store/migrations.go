@@ -415,6 +415,18 @@ CREATE INDEX idx_events_session ON mem_events(session_id, event);
 		// shares its lifecycle: no new table, no new retention rule.
 		SQL: `ALTER TABLE sessions ADD COLUMN relational_mark TEXT;`,
 	},
+	{
+		Version:     19,
+		Description: "drop the prompt gate: gate_calibration and its session index (#92)",
+		// The prompt gate is removed: memory reaches the agent through the
+		// session-start tray and agent-initiated search only. Its shadow log
+		// and the mem_events(session_id, event) index that served its dedupe
+		// ledger have no remaining readers.
+		SQL: `
+DROP TABLE IF EXISTS gate_calibration;
+DROP INDEX IF EXISTS idx_events_session;
+`,
+	},
 }
 
 // headVersion is the highest schema version this binary knows how to apply.

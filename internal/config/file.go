@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -135,20 +134,6 @@ func applyKV(cfg *Config, section, key, val string) {
 	case "embedder":
 		if key == "backend" {
 			cfg.Embedder.Backend = val
-		}
-	case "gate":
-		switch key {
-		case "mode":
-			// Only the three canonical values are accepted; anything else keeps
-			// the shadow default. Injection cannot be enabled by a typo (#80).
-			cfg.Gate.Mode = NormalizedGateMode(strings.ToLower(val))
-		case "tau":
-			// Out-of-range or unparsable tau keeps the calibrated default —
-			// same silent-ignore posture as [server].port, and a garbage
-			// threshold must never widen the gate (#80).
-			if f, err := strconv.ParseFloat(val, 64); err == nil && f > 0 && f <= 1 {
-				cfg.Gate.Tau = f
-			}
 		}
 	}
 }
