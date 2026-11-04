@@ -16,9 +16,9 @@ const harnessSessionEnv = "CLAUDE_CODE_SESSION_ID"
 // Clients that write or read memory on the agent's behalf (the MCP server, CLI
 // verbs invoked from a session) attach it so memories carry source_session and
 // journal events carry session_id. Without it, agent-authored memories have no
-// project affinity: the tray's corpus index and the prompt gate scope episodic
-// nodes through source_session → sessions.project, so an unattributed memory
-// is invisible to both.
+// project affinity: the tray's corpus index scopes episodic nodes through
+// source_session → sessions.project, so an unattributed memory is invisible
+// to it.
 //
 // The value is fixed at process spawn. A long-lived MCP server that outlives a
 // /clear keeps the original session id; that session belongs to the same
