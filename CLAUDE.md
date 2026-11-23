@@ -44,7 +44,7 @@ Single binary. SQLite via `modernc.org/sqlite` (pure Go, no CGO). Embedded vecto
 
 ## Tech Stack
 
-- **Language**: Go 1.22+
+- **Language**: Go 1.27+ (`go.mod` is the version authority)
 - **Database**: SQLite via `modernc.org/sqlite` — pure Go, cross-compiles everywhere
 - **CLI**: `cobra` for commands
 - **HTTP**: `net/http` + `chi` router

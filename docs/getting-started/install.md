@@ -26,7 +26,7 @@ brew install lazypower/tap/continuity-dev
 # Arch Linux (AUR) — community maintained by @klrmngr
 yay -S continuity-bin
 
-# From source — needs Go 1.24+
+# From source — needs Go 1.27+
 git clone https://github.com/lazypower/continuity.git
 cd continuity && make build
 ```
