@@ -53,6 +53,28 @@ jobs:
       - name: Test
         run: go test ./... -v
 
+  # UI gate. svelte-check type-checks the Svelte/TS sources so a toolchain
+  # bump (TypeScript, Svelte, Vite) that breaks the UI fails here instead of
+  # passing on a build that never type-checks.
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Type-check UI
+        working-directory: ui
+        run: npm run check
+
   # e2e exercises subprocess tests with -tags noembed so this job never depends
   # on the npm/UI pipeline. It's the contract guard for tests that build their
   # own binary at runtime (internal/cli/retract_e2e_test.go etc.); if the

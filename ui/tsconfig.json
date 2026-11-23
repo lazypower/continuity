@@ -11,7 +11,9 @@
     "moduleDetection": "force",
     "skipLibCheck": true,
     "strict": true,
-    "verbatimModuleSyntax": true
+    "verbatimModuleSyntax": true,
+    "noUncheckedSideEffectImports": true,
+    "types": ["svelte", "vite/client"]
   },
   "include": ["src/**/*.ts", "src/**/*.svelte"]
 }
