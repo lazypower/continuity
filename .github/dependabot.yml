@@ -1,0 +1,47 @@
+# Dependency update policy.
+#
+# Minor and patch updates are grouped into one PR per ecosystem and merged
+# automatically once required checks pass (see dependabot-automerge.yml).
+# Major updates arrive one per PR and wait for a human.
+#
+# The cooldown holds a newly published version back for a few days before
+# proposing it, so a compromised or yanked release has time to be caught
+# upstream. Security updates ignore the cooldown and open immediately.
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      go-minor-patch:
+        update-types: [minor, patch]
+      go-security:
+        applies-to: security-updates
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /ui
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      ui-minor-patch:
+        update-types: [minor, patch]
+      ui-security:
+        applies-to: security-updates
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]

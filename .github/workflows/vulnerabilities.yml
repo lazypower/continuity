@@ -1,0 +1,46 @@
+name: Vulnerabilities
+
+# Fails when shipped code reaches a known vulnerability. Runs on every PR so it
+# can gate merges, and daily so a newly published advisory against main shows
+# up without waiting for the next change.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  # govulncheck reports only vulnerabilities whose affected symbols our code
+  # calls, including the standard library of the Go toolchain in use.
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -tags noembed ./...
+
+  # Audits devDependencies too: the svelte runtime is a devDependency but is
+  # compiled into the bundle the binary embeds.
+  npm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: npm audit
+        working-directory: ui
+        run: npm audit --audit-level=high
