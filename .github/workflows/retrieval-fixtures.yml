@@ -25,9 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
 
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh

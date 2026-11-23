@@ -1,8 +1,8 @@
 {
   "packages": [
-    "go@1.26",
+    "go@1.27",
     "sqlite@latest",
-    "nodejs@22"
+    "nodejs@26"
   ],
   "shell": {
     "init_hook": [
