@@ -1,0 +1,113 @@
+// Dependency update policy, owned by Renovate.
+//
+// Minor, patch and lockfile updates merge automatically through GitHub
+// auto-merge once every required check on main passes. Major updates wait
+// for a human. New releases sit out a 3-day cooldown so a compromised or
+// yanked publish can be caught upstream; security fixes skip it.
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['config:recommended'],
+  labels: ['dependencies'],
+
+  minimumReleaseAge: '3 days',
+  internalChecksFilter: 'strict',
+
+  platformAutomerge: true,
+  automergeType: 'pr',
+  automergeStrategy: 'merge-commit',
+
+  postUpdateOptions: ['gomodTidy', 'gomodUpdateImportPaths'],
+
+  // Refresh transitive npm and Go dependencies that no direct bump touches.
+  lockFileMaintenance: {
+    enabled: true,
+    automerge: true,
+  },
+
+  vulnerabilityAlerts: {
+    labels: ['security'],
+    automerge: true,
+  },
+  osvVulnerabilityAlerts: true,
+
+  packageRules: [
+    {
+      matchUpdateTypes: ['minor', 'patch', 'digest', 'pin', 'pinDigest'],
+      automerge: true,
+    },
+    {
+      matchUpdateTypes: ['major'],
+      automerge: false,
+      addLabels: ['needs-human'],
+    },
+
+    {
+      // config:recommended skips indirect modules; transitive CVEs land there.
+      matchManagers: ['gomod'],
+      matchDepTypes: ['indirect'],
+      enabled: true,
+    },
+    {
+      // A new major is a new module path; only the direct dependency that
+      // requires it can move an indirect module across one.
+      matchManagers: ['gomod'],
+      matchDepTypes: ['indirect'],
+      matchUpdateTypes: ['major'],
+      enabled: false,
+    },
+    {
+      matchManagers: ['gomod'],
+      matchUpdateTypes: ['minor', 'patch', 'digest'],
+      groupName: 'go modules',
+    },
+    {
+      matchManagers: ['npm'],
+      matchUpdateTypes: ['minor', 'patch'],
+      groupName: 'ui dependencies',
+    },
+    {
+      matchManagers: ['github-actions'],
+      matchUpdateTypes: ['minor', 'patch', 'digest'],
+      groupName: 'github actions',
+    },
+
+    // The Go and Node toolchains move as one change: go.mod's go directive
+    // (the Go authority for CI), ui/.nvmrc (the Node authority for CI), and
+    // the devbox pins that local development uses.
+    {
+      matchManagers: ['gomod'],
+      matchDepTypes: ['golang'],
+      matchDepNames: ['go'],
+      rangeStrategy: 'bump',
+    },
+    {
+      // devbox pins Node by major. Only even majors become LTS; skip the odd
+      // ones so devbox stays on the same line as .nvmrc.
+      matchManagers: ['devbox'],
+      matchDepNames: ['nodejs'],
+      allowedVersions: '/^\\d*[02468](\\.|$)/',
+    },
+    {
+      matchManagers: ['gomod', 'devbox'],
+      matchDepNames: ['go'],
+      groupName: 'go toolchain',
+    },
+    {
+      matchManagers: ['nvm', 'devbox'],
+      matchDepNames: ['node', 'nodejs'],
+      groupName: 'node toolchain',
+    },
+  ],
+
+  // Tools run as `go run <module>/cmd/<tool>@<version>` in workflows. Mark
+  // each with a `# renovate: datasource=go depName=<module>` comment.
+  customManagers: [
+    {
+      customType: 'regex',
+      managerFilePatterns: ['/^\\.github/workflows/[^/]+\\.ya?ml$/'],
+      matchStrings: [
+        '# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+run: go run \\S+@(?<currentValue>v[^\\s]+)',
+      ],
+    },
+  ],
+}

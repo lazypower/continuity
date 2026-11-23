@@ -26,6 +26,7 @@ jobs:
           go-version-file: go.mod
 
       - name: govulncheck
+        # renovate: datasource=go depName=golang.org/x/vuln
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -tags noembed ./...
 
   # Audits devDependencies too: the svelte runtime is a devDependency but is

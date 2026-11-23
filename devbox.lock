@@ -5,7 +5,7 @@
       "last_modified": "2026-07-17T09:58:13Z",
       "resolved": "github:NixOS/nixpkgs/a47c123a609287a012dfc44d281de2dd4ed13394?lastModified=1784282293"
     },
-    "go@1.27": {
+    "go@1.27.3": {
       "last_modified": "2026-11-22T18:15:35Z",
       "resolved": "github:NixOS/nixpkgs/619c39f6eac5d1ed6b8f073a9414baf7034b2356#go",
       "source": "devbox-search",
@@ -43,7 +43,7 @@
         }
       }
     },
-    "nodejs@26": {
+    "nodejs@26.13.1": {
       "last_modified": "2026-11-22T18:15:35Z",
       "plugin_version": "0.0.5",
       "resolved": "github:NixOS/nixpkgs/619c39f6eac5d1ed6b8f073a9414baf7034b2356#nodejs_26",
