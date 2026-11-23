@@ -14,7 +14,7 @@
     "svelte": "^5.59.1",
     "tailwindcss": "^4.3.5",
     "typescript": "^5.9.3",
-    "vite": "^6.4.6"
+    "vite": "^8.3.8"
   },
   "dependencies": {
     "@types/d3-array": "^3.2.2",
