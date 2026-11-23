@@ -91,7 +91,7 @@
         <div class="seg mt-1.5">
           {#each [['fresh', data.summary.fresh, 'var(--color-preferences)'], ['fading', data.summary.fading, 'var(--color-events)'], ['stale', data.summary.stale, 'var(--color-cases)']] as [, n, c]}
             {#if (n as number) > 0}
-              <div class="seg-part" style="flex: {n}; background: {c}" title="{n}"></div>
+              <div class="seg-part" style="flex: {n}; background: {c}" title={String(n)}></div>
             {/if}
           {/each}
         </div>

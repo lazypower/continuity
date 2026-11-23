@@ -53,6 +53,62 @@ jobs:
       - name: Test
         run: go test ./... -v
 
+  # UI gate. svelte-check type-checks the Svelte/TS sources so a toolchain
+  # bump (TypeScript, Svelte, Vite) that breaks the UI fails here instead of
+  # passing on a build that never type-checks. Playwright then drives the UI
+  # embedded in a real binary against an isolated, CLI-seeded data dir
+  # (ui/e2e/env.ts), so a bump that type-checks but breaks rendering fails too.
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Type-check UI
+        working-directory: ui
+        run: npm run check
+
+      - name: Build UI
+        run: |
+          cd ui && npm run build && cd ..
+          cp -r ui/dist cmd/continuity/ui
+
+      - name: Build binary
+        run: go build -o continuity ./cmd/continuity
+
+      - name: Install Playwright Chromium
+        working-directory: ui
+        run: npx playwright install --with-deps chromium
+
+      - name: End-to-end tests
+        working-directory: ui
+        env:
+          CONTINUITY_BIN: ${{ github.workspace }}/continuity
+        run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            ui/playwright-report/
+            ui/test-results/
+          retention-days: 14
+
   # e2e exercises subprocess tests with -tags noembed so this job never depends
   # on the npm/UI pipeline. It's the contract guard for tests that build their
   # own binary at runtime (internal/cli/retract_e2e_test.go etc.); if the
