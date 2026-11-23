@@ -21,6 +21,8 @@ Thumbs.db
 dist/
 ui/node_modules/
 ui/dist/
+ui/test-results/
+ui/playwright-report/
 cmd/continuity/ui/
 
 # Data (never commit user data)
