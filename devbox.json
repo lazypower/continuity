@@ -1,7 +1,7 @@
 {
   "packages": [
     "go@1.27.3",
-    "sqlite@latest",
+    "sqlite@3.54.0",
     "nodejs@26.13.1"
   ],
   "shell": {
